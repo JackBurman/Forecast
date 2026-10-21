@@ -4,7 +4,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-import forecast_engine # type: ignore
+import forecast_engine  # type: ignore
 
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
@@ -40,8 +40,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     # Clean and standardize column names
     sales.columns = [str(col).strip() for col in sales.columns]
 
-    # Some sales exports do not define headers consistently.
-    # Standardize the expected names before the rest of the logic runs.
     rename_map = {
         "Inv #": "Inv #",
         "Inv # ": "Inv #",
