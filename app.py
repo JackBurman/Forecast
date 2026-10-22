@@ -312,7 +312,13 @@ with data_tab:
         if sales_path.exists():
             df_sales_raw = load_csv(str(sales_path))
             df_sales_clean = clean_sales_data(df_sales_raw, df_options)
-
+    except FileNotFoundError:
+        st.warning(
+            "⚠️ 'options_data.csv' not found. "
+            "Please make sure your CSV file is in the Raw_data folder."
+        )
+    except Exception as e:
+        st.error(f"Something went wrong while loading the data: {e}")
 
 with forecast_tab:
     st.subheader("Forecast Planner")
