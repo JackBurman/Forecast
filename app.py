@@ -19,7 +19,6 @@ st.sidebar.markdown(
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
-
 csv_path = raw_data_path / "options_data.csv"
 
 @st.cache_data
@@ -313,30 +312,6 @@ with data_tab:
         if sales_path.exists():
             df_sales_raw = load_csv(str(sales_path))
             df_sales_clean = clean_sales_data(df_sales_raw, df_options)
-            st.subheader("Sales Sample Data Table:")
-            st.caption(
-                f"Showing {min(5000, len(df_sales_clean)):,} of {len(df_sales_clean):,} sales rows"
-            )
-            st.dataframe(
-                df_sales_clean.head(5000),
-                use_container_width=True,
-                column_config={"Date": st.column_config.DateColumn(format="DD-MM-YYYY")},
-            )
-            st.download_button(
-                "Download full sales data",
-                df_sales_clean.to_csv(index=False).encode("utf-8"),
-                file_name="sales_data.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("⚠️ 'sales_samp.csv' not found in the same folder as this app.")
-    except FileNotFoundError:
-        st.warning(
-            "⚠️ 'options_data.csv' not found. "
-            "Please make sure your CSV file is in the same folder as this app."
-        )
-    except Exception as e:
-        st.error(f"Something went wrong while loading the data: {e}")
 
 
 with forecast_tab:
