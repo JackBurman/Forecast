@@ -18,7 +18,10 @@ st.sidebar.markdown(
 
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
-raw_data_path = base_dir / "Raw_data"
+raw_data_path = base_dir / "raw_data"
+
+csv_path = raw_data_path / "options_data.csv"
+sales_path = raw_data_path / "sales_samp.csv"
 
 
 @st.cache_data
