@@ -9,10 +9,31 @@ import forecast_engine  # type: ignore
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 
+
+def _streamlit_version() -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in st.__version__.split(".")[:3]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+# Streamlit 1.51+ replaced use_container_width=True with width="stretch" and
+# shows a deprecation banner for the old argument. Older versions only know
+# the old argument. Pass **FULL_WIDTH to buttons, tables and charts.
+FULL_WIDTH = (
+    {"width": "stretch"}
+    if _streamlit_version() >= (1, 51)
+    else {"use_container_width": True}
+)
+
+MONTH_NUMBER_TO_NAME = dict(enumerate(forecast_engine.MONTHS, start=1))
+
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
 csv_path = raw_data_path / "options_data.csv"
+
 
 @st.cache_data
 def load_csv(path: str | Path) -> pd.DataFrame:
@@ -21,6 +42,61 @@ def load_csv(path: str | Path) -> pd.DataFrame:
         dtype={"SKU": "string", "Stock Code": "string", "Model": "string"},
         low_memory=False,
     )
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Coerce values like '1,234.50', '$1,234', '45%', '(12)' or blanks to floats.
+
+    Anything that is not numeric (including repeated header rows that survive a
+    multi-file merge) becomes NaN instead of raising.
+    """
+    text = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"[,$%\s]", "", regex=True)
+        .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    )
+    return pd.to_numeric(text, errors="coerce").astype(float)
+
+
+def parse_dates(series: pd.Series) -> pd.Series:
+    """Parse a Date column that may mix Excel serials, real datetimes and text.
+
+    Text dates are read day-first (23/10/2026), which is what Australian
+    exports produce; ISO dates (2026-10-23) are unaffected.
+    """
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
+    is_serial = series.map(
+        lambda value: (pd.api.types.is_integer(value) or pd.api.types.is_float(value))
+        and pd.notna(value)
+    ).astype(bool)
+    if is_serial.any():
+        days = series[is_serial].astype(float).astype(int)
+        result.loc[is_serial] = pd.to_datetime("1899-12-30") + pd.to_timedelta(
+            days, unit="D"
+        )
+
+    is_text = ~is_serial & series.notna()
+    if is_text.any():
+        result.loc[is_text] = pd.to_datetime(
+            series[is_text], dayfirst=True, errors="coerce", format="mixed"
+        )
+
+    return result
+
+
+def normalize_sku(value):
+    """Preserve numeric SKUs as integers and alphanumeric SKUs as text."""
+    if pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    if not text:
+        return pd.NA
+    integer_text = text[:-2] if text.endswith(".0") else text
+    if integer_text.isdigit():
+        return int(integer_text)
+    return text
 
 
 @st.cache_data
@@ -32,36 +108,32 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     sales.columns = [str(col).strip() for col in sales.columns]
 
     rename_map = {
-        "Inv #": "Inv #",
-        "Inv # ": "Inv #",
         "Inv#": "Inv #",
-        "Date": "Date",
-        "Stock Code": "Stock Code",
         "Stock code": "Stock Code",
-        "Description": "Description",
-        "Qty": "Qty",
-        "Total": "Total",
-        "Cost": "Cost",
-        "GP%": "GP%",
         "GP %": "GP%",
-        "GP $": "GP $",
-        "GP $ ": "GP $",
         "GP doller": "GP $",
     }
     sales = sales.rename(columns={k: v for k, v in rename_map.items() if k in sales.columns})
 
-    if "Inv #" not in sales.columns or "Date" not in sales.columns or "Stock Code" not in sales.columns:
-        sales.columns = [
-            "Inv #",
-            "Date",
-            "Stock Code",
-            "Description",
-            "Qty",
-            "Total",
-            "Cost",
-            "GP%",
-            "GP $",
-        ]
+    expected_columns = [
+        "Inv #",
+        "Date",
+        "Stock Code",
+        "Description",
+        "Qty",
+        "Total",
+        "Cost",
+        "GP%",
+        "GP $",
+    ]
+    if not {"Inv #", "Date", "Stock Code"}.issubset(sales.columns):
+        data_columns = [col for col in sales.columns if col != "_SourceFile"]
+        if len(data_columns) != len(expected_columns):
+            raise ValueError(
+                "Sales export columns were not recognised: "
+                + ", ".join(map(str, sales.columns))
+            )
+        sales = sales.rename(columns=dict(zip(data_columns, expected_columns)))
 
     sales = sales.dropna(how="all").reset_index(drop=True)
 
@@ -73,25 +145,13 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     sales.loc[location_mask, "Location"] = (
         sales.loc[location_mask, "Inv #"]
         .astype(str)
-        .str.replace("LOCATION:", "", regex=False)
+        .str.replace("LOCATION:", "", regex=False, case=False)
         .str.strip()
     )
     if "_SourceFile" in sales.columns:
         sales["Location"] = sales.groupby("_SourceFile", sort=False)["Location"].ffill()
     else:
         sales["Location"] = sales["Location"].ffill()
-
-    # Preserve numeric SKUs as integers and alphanumeric SKUs as text.
-    def normalize_sku(value):
-        if pd.isna(value):
-            return pd.NA
-        text = str(value).strip()
-        if not text:
-            return pd.NA
-        integer_text = text[:-2] if text.endswith(".0") else text
-        if integer_text.isdigit():
-            return int(integer_text)
-        return text
 
     sales["SKU"] = sales["Stock Code"].map(normalize_sku)
 
@@ -100,23 +160,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     )
     sales = sales.loc[sales["GP%"].notna() & ~grand_total_mask].copy()
 
-    def parse_date(value):
-        if pd.isna(value):
-            return pd.NaT
-        if isinstance(value, (int, float)):
-            try:
-                return pd.to_datetime("1899-12-30") + pd.to_timedelta(int(value), unit="D")
-            except Exception:
-                return pd.NaT
-        txt = str(value).strip()
-        if txt == "":
-            return pd.NaT
-        try:
-            return pd.to_datetime(txt, errors="raise")
-        except Exception:
-            return pd.NaT
-
-    sales["Date"] = sales["Date"].apply(parse_date)
+    sales["Date"] = parse_dates(sales["Date"])
     sales["Stock Code"] = (
         sales["Stock Code"].astype(str).str.strip().str.replace("\r", "")
     )
@@ -124,61 +168,51 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     # Enrich sales rows with product metadata.
     options_lookup = df_options.copy()
     options_lookup["SKU"] = options_lookup["Stock Code"].map(normalize_sku)
-    options_lookup = options_lookup[["SKU", "Supplier", "Class", "Fourth Product Group"]].drop_duplicates()
+    options_lookup = options_lookup[
+        ["SKU", "Supplier", "Class", "Fourth Product Group"]
+    ].drop_duplicates(subset=["SKU"])
 
-    sales = sales.merge(
-        options_lookup,
-        on="SKU",
-        how="left",
-        suffixes=("", "_Options")
+    sales = sales.merge(options_lookup, on="SKU", how="left", suffixes=("", "_Options"))
+    sales = sales.rename(
+        columns={
+            "Supplier": "OptionsData.Supplier",
+            "Class": "OptionsData.Class",
+            "Fourth Product Group": "OptionsData.Fourth Product Group",
+        }
     )
-    sales = sales.rename(columns={
-        "Supplier": "OptionsData.Supplier",
-        "Class": "OptionsData.Class",
-        "Fourth Product Group": "OptionsData.Fourth Product Group",
-    })
 
-    city_map = {
-        "Perth": "Perth",
-        "Sydney": "Sydney",
-        "Brisbane": "Brisbane",
-        "Melbourne": "Melbourne",
-        "Adelaide": "Adelaide",
-        "Oxford St": "Oxford St",
-    }
+    city_suffixes = ["Perth", "Sydney", "Brisbane", "Melbourne", "Adelaide", "Oxford St"]
 
-    def get_city(location):
-        loc = str(location or "").strip()
-        for suffix, city in city_map.items():
-            if loc.endswith(suffix):
+    def location_text(value) -> str:
+        return "" if pd.isna(value) else str(value).strip()
+
+    def get_city(location: str) -> str:
+        for city in city_suffixes:
+            if location.endswith(city):
                 return city
         return "Other"
 
-    sales["City"] = sales["Location"].apply(get_city)
-    sales["Sales Channel"] = sales.apply(
-        lambda row: (
-            row["Location"]
-            if row["City"] == "Other"
-            else str(row["Location"]).replace(row["City"], "").strip()
-        ),
-        axis=1,
-    )
+    locations = [location_text(value) for value in sales["Location"]]
+    cities = [get_city(location) for location in locations]
+    sales["City"] = cities
+    sales["Sales Channel"] = [
+        location if city == "Other" else location.replace(city, "").strip()
+        for location, city in zip(locations, cities)
+    ]
 
     sales["Month"] = sales["Date"].dt.month_name()
     sales["Year"] = sales["Date"].dt.year
 
+    # Convert every numeric column once, before any filtering relies on it.
     sales = sales.rename(columns={"Total": "Sale"})
-    positive_sales = sales["Qty"].astype(float).gt(0)
-    positive_margin = (
-        sales["GP $"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .astype(float)
-        .gt(0)
-    )
-    sales = sales.loc[positive_sales & positive_margin].copy()
+    for column in ["Qty", "Sale", "Cost", "GP%", "GP $"]:
+        if column in sales.columns:
+            sales[column] = to_number(sales[column])
+    sales["Inv #"] = pd.to_numeric(sales["Inv #"], errors="coerce")
 
-    def sales_channel_net(value):
+    sales = sales.loc[sales["Qty"].gt(0) & sales["GP $"].gt(0)].copy()
+
+    def sales_channel_net(value) -> str:
         text = str(value or "").upper()
         if "A&D" in text:
             return "Retail"
@@ -200,20 +234,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
             return "Contract"
         return "Other"
 
-    sales["Sales Channel Net"] = sales["Sales Channel"].apply(sales_channel_net)
-
-    sales["Inv #"] = pd.to_numeric(sales["Inv #"], errors="coerce")
-    sales["Sale"] = pd.to_numeric(
-        sales["Sale"].astype(str).str.replace(",", "", regex=False), errors="coerce"
-    )
-    sales["Cost"] = pd.to_numeric(
-        sales["Cost"].astype(str).str.replace(",", "", regex=False), errors="coerce"
-    )
-    sales["Qty"] = pd.to_numeric(sales["Qty"], errors="coerce")
-    sales["GP%"] = pd.to_numeric(sales["GP%"], errors="coerce")
-    sales["GP $"] = pd.to_numeric(
-        sales["GP $"].astype(str).str.replace(",", "", regex=False), errors="coerce"
-    )
+    sales["Sales Channel Net"] = sales["Sales Channel"].map(sales_channel_net)
 
     sales = sales.drop_duplicates(subset=["Inv #", "SKU", "Sale"]).copy()
 
@@ -279,6 +300,36 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
+def ensure_date_column(frame: pd.DataFrame | None) -> pd.DataFrame:
+    """Return a copy of a forecast frame with a real datetime 'Date' column."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["Date", "Forecast"])
+    frame = frame.copy()
+    if "Date" not in frame.columns:
+        frame = frame.reset_index()
+        first = frame.columns[0]
+        if first == "index" or pd.api.types.is_datetime64_any_dtype(frame[first]):
+            frame = frame.rename(columns={first: "Date"})
+    if "Date" in frame.columns:
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    return frame.reset_index(drop=True)
+
+
+def keep_forecast_year(frame: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Keep only the twelve months of the requested year.
+
+    The engine can return more than twelve months from the start date; without
+    this the 2026 and 2027 forecasts overlap, drawing the same series twice and
+    breaking the summary table pivot.
+    """
+    if frame.empty or "Date" not in frame.columns:
+        return frame
+    in_year = frame.loc[frame["Date"].dt.year == year]
+    if in_year.empty:
+        in_year = frame.head(12)
+    return in_year.reset_index(drop=True)
+
+
 # Top-right manual refresh button container
 top_left, top_right = st.columns([8, 2])
 with top_left:
@@ -286,27 +337,32 @@ with top_left:
     st.subheader("Options Data Integration")
 with top_right:
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
-    if st.button("🔄 Refresh data", use_container_width=True):
+    if st.button("🔄 Refresh data", **FULL_WIDTH):
         load_csv.clear()
         load_raw_folder_data.clear()
         st.rerun()
 
 st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
+    "<div style='text-align: center; margin-top: -60px;'>"
+    "<img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'>"
+    "</div>",
     unsafe_allow_html=True,
 )
 st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
+
 
 @st.fragment(run_every="1h")
 def automatic_source_refresh():
     current_time = pd.Timestamp.now()
     last_refresh_date = st.session_state.get("_last_auto_refresh_date")
-    
-    if current_time.hour >= 7 and (last_refresh_date is None or last_refresh_date != current_time.date()):
+    if current_time.hour >= 7 and (
+        last_refresh_date is None or last_refresh_date != current_time.date()
+    ):
         st.session_state["_last_auto_refresh_date"] = current_time.date()
         load_csv.clear()
         load_raw_folder_data.clear()
         st.rerun(scope="app")
+
 
 automatic_source_refresh()
 
@@ -335,7 +391,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
                 )
                 if selected_values:
                     filtered = filtered[
-                        filtered[column].astype("string").isin(selected_values)
+                        filtered[column].astype("string").str.strip().isin(selected_values)
                     ]
             else:
                 search_value = st.text_input(
@@ -350,6 +406,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
                     ]
 
     return filtered
+
 
 # Tab-style navigation.
 selected_tab = st.radio(
@@ -378,7 +435,7 @@ if selected_tab == "Options Data":
         st.data_editor(
             df_options_filtered.head(1000),
             num_rows="dynamic",
-            use_container_width=True,
+            **FULL_WIDTH,
         )
 
         st.download_button(
@@ -413,9 +470,15 @@ elif selected_tab == "Forecast":
         try:
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
-            latest_source_time = pd.Timestamp(
-                max((raw_data_path / name).stat().st_mtime for name in source_names),
-                unit="s",
+            source_times = [
+                (raw_data_path / name).stat().st_mtime
+                for name in source_names
+                if (raw_data_path / name).exists()
+            ]
+            latest_source_label = (
+                f"{pd.Timestamp(max(source_times), unit='s'):%d-%m-%Y %H:%M}"
+                if source_times
+                else "n/a"
             )
             planner_col, source_col = st.columns([2, 1])
             with planner_col:
@@ -424,7 +487,7 @@ elif selected_tab == "Forecast":
                 st.caption(
                     f"Loaded {len(source_names)} source files · "
                     f"{len(sales_data):,} formatted sales rows · "
-                    f"latest source: {latest_source_time:%d-%m-%Y %H:%M}"
+                    f"latest source: {latest_source_label}"
                 )
 
             def choices_for(series: pd.Series) -> list[str]:
@@ -452,9 +515,7 @@ elif selected_tab == "Forecast":
             with st.sidebar:
                 st.header("Forecast filters")
                 st.subheader("Sales")
-                selected_location = filter_selectbox(
-                    "Location", sales_data["City"]
-                )
+                selected_location = filter_selectbox("Location", sales_data["City"])
                 selected_channel = filter_selectbox(
                     "Sales channel", sales_data["Sales Channel Net"]
                 )
@@ -466,23 +527,13 @@ elif selected_tab == "Forecast":
                 selected_supplier = filter_selectbox(
                     "Supplier", sales_data["Supplier Brand"]
                 )
-                selected_class = filter_selectbox(
-                    "Class", sales_data["OptionsData.Class"]
-                )
-                selected_model = filter_selectbox(
-                    "Model", sales_data["Model"]
-                )
-                selected_sku = filter_selectbox(
-                    "SKU", sales_data["SKU Key"]
-                )
+                selected_class = filter_selectbox("Class", sales_data["OptionsData.Class"])
+                selected_model = filter_selectbox("Model", sales_data["Model"])
+                selected_sku = filter_selectbox("SKU", sales_data["SKU Key"])
 
                 st.subheader("Forecast settings")
                 metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
-                metric = st.selectbox(
-                    "View",
-                    metric_options,
-                    index=0,
-                )
+                metric = st.selectbox("View", metric_options, index=0)
                 forecast_year = st.number_input(
                     "Forecast from Year",
                     min_value=2000,
@@ -492,12 +543,16 @@ elif selected_tab == "Forecast":
                 )
                 forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
                 bias = st.number_input(
-                    "Forecast bias", min_value=0.0, max_value=5.0,
+                    "Forecast bias",
+                    min_value=0.0,
+                    max_value=5.0,
                     value=1.0,
                     step=0.05,
                 )
                 confidence_alpha = st.number_input(
-                    "Confidence alpha", min_value=0.05, max_value=0.9,
+                    "Confidence alpha",
+                    min_value=0.05,
+                    max_value=0.9,
                     value=0.35,
                     step=0.05,
                 )
@@ -511,93 +566,91 @@ elif selected_tab == "Forecast":
                 "Model": selected_model,
                 "SKU": selected_sku,
             }
-            selected_sales = forecast_engine.filter_sales(sales_data, filters)
-            
-            if metric == "GP%" and not selected_sales.empty:
-                if "GP%" in selected_sales.columns:
-                    mean_gp = selected_sales["GP%"].mean()
-                    selected_sales["GP%"] = mean_gp
+            selected_sales = forecast_engine.filter_sales(sales_data, filters).copy()
+            if metric == "GP%" and not selected_sales.empty and "GP%" in selected_sales.columns:
+                selected_sales["GP%"] = selected_sales["GP%"].mean()
 
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
-            historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
-
-            target_data = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
-
-            # Separate Forecast calculations for 2026 and 2027 with guaranteed Date reset
-            actual_26, forecast_2026, mape_26 = forecast_engine.calculate_forecast(
-                target_data,
-                metric,
-                pd.Timestamp("2026-01-01"),
-                bias,
-                confidence_alpha,
+            historical_sales_for_mape = selected_sales.loc[
+                selected_sales["Date"] < current_month_start
+            ]
+            target_data = (
+                historical_sales_for_mape
+                if not historical_sales_for_mape.empty
+                else selected_sales
             )
-            if not forecast_2026.empty:
-                if "Date" not in forecast_2026.columns:
-                    forecast_2026 = forecast_2026.reset_index()
-                if "Date" not in forecast_2026.columns and "index" in forecast_2026.columns:
-                    forecast_2026 = forecast_2026.rename(columns={"index": "Date"})
+
+            # Separate forecast runs for 2026 and 2027, each trimmed to its own year.
+            actual_26, forecast_2026, mape_26 = forecast_engine.calculate_forecast(
+                target_data, metric, pd.Timestamp("2026-01-01"), bias, confidence_alpha
+            )
+            forecast_2026 = keep_forecast_year(ensure_date_column(forecast_2026), 2026)
 
             actual_27, forecast_2027, mape_27 = forecast_engine.calculate_forecast(
-                target_data,
-                metric,
-                pd.Timestamp("2027-01-01"),
-                bias,
-                confidence_alpha,
+                target_data, metric, pd.Timestamp("2027-01-01"), bias, confidence_alpha
             )
-            if not forecast_2027.empty:
-                if "Date" not in forecast_2027.columns:
-                    forecast_2027 = forecast_2027.reset_index()
-                if "Date" not in forecast_2027.columns and "index" in forecast_2027.columns:
-                    forecast_2027 = forecast_2027.rename(columns={"index": "Date"})
+            forecast_2027 = keep_forecast_year(ensure_date_column(forecast_2027), 2027)
 
             mape = mape_27 if mape_27 is not None else mape_26
             actual = actual_27 if not actual_27.empty else actual_26
 
-            # Apply separate 2026 vs 2027 logic with safe fallback to 2026 forecast
+            # Year-on-year overrides, with a safe fallback to the 2026 forecast.
             if not selected_sales.empty and metric != "GP%":
-                monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
-                
-                # 2026 Forecast logic
+                monthly_actuals = selected_sales.pivot_table(
+                    index=selected_sales["Date"].dt.month,
+                    columns="Year",
+                    values=metric,
+                    aggfunc="sum",
+                )
+
+                def actual_for(month: int, year: int):
+                    if month in monthly_actuals.index and year in monthly_actuals.columns:
+                        return monthly_actuals.loc[month, year]
+                    return pd.NA
+
+                # 2026: last year's actual scaled by last year's growth.
                 for idx, row in forecast_2026.iterrows():
                     m_num = row["Date"].month
-                    if m_num in monthly_actuals.index and 2025 in monthly_actuals.columns and 2024 in monthly_actuals.columns:
-                        act_2025 = monthly_actuals.loc[m_num, 2025]
-                        act_2024 = monthly_actuals.loc[m_num, 2024]
-                        if pd.notna(act_2025) and pd.notna(act_2024) and act_2024 > 0:
-                            forecast_2026.loc[idx, "Forecast"] = act_2025 * (act_2025 / act_2024)
+                    act_2025 = actual_for(m_num, 2025)
+                    act_2024 = actual_for(m_num, 2024)
+                    if pd.notna(act_2025) and pd.notna(act_2024) and act_2024 > 0:
+                        forecast_2026.loc[idx, "Forecast"] = act_2025 * (act_2025 / act_2024)
 
-                # 2027 Forecast logic: based on 2026 actual sales, falling back to 2026 forecast if empty
+                # 2027: 2026 actuals where they exist, otherwise the 2026 forecast.
                 for idx, row in forecast_2027.iterrows():
                     m_num = row["Date"].month
-                    match_26 = forecast_2026.loc[forecast_2026["Date"].dt.month == m_num, "Forecast"]
+                    match_26 = forecast_2026.loc[
+                        forecast_2026["Date"].dt.month == m_num, "Forecast"
+                    ]
                     base_val = match_26.iloc[0] if not match_26.empty else row["Forecast"]
 
-                    if m_num in monthly_actuals.index and 2026 in monthly_actuals.columns:
-                        act_2026_val = monthly_actuals.loc[m_num, 2026]
-                        if pd.notna(act_2026_val) and act_2026_val > 0:
-                            act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else act_2026_val
-                            yoy_rate = (act_2026_val / act_2025) if (pd.notna(act_2025) and act_2025 > 0) else 1.05
-                            forecast_2027.loc[idx, "Forecast"] = act_2026_val * min(yoy_rate, 1.2)
-                        else:
-                            forecast_2027.loc[idx, "Forecast"] = base_val
+                    act_2026_val = actual_for(m_num, 2026)
+                    if pd.notna(act_2026_val) and act_2026_val > 0:
+                        act_2025 = actual_for(m_num, 2025)
+                        yoy_rate = (
+                            act_2026_val / act_2025
+                            if pd.notna(act_2025) and act_2025 > 0
+                            else 1.05
+                        )
+                        forecast_2027.loc[idx, "Forecast"] = act_2026_val * min(yoy_rate, 1.2)
                     else:
                         forecast_2027.loc[idx, "Forecast"] = base_val
 
-            if forecast_year == 2026:
-                forecast = forecast_2026
-            else:
-                forecast = forecast_2027
+            forecast = forecast_2026 if forecast_year == 2026 else forecast_2027
 
             if metric == "GP%" and not forecast.empty:
-                avg_forecast_val = forecast["Forecast"].mean()
-                forecast["Forecast"] = avg_forecast_val
+                forecast["Forecast"] = forecast["Forecast"].mean()
                 if "Lower" in forecast.columns:
                     forecast["Lower"] = forecast["Lower"].mean()
                 if "Upper" in forecast.columns:
                     forecast["Upper"] = forecast["Upper"].mean()
 
-            purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
-            on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
+            purchase_months = forecast_engine.monthly_purchase_orders(
+                sheets["Purchase Orders"], filters
+            )
+            on_hand, free_stock = forecast_engine.inventory_totals(
+                sheets["Current Inventory"], filters
+            )
 
             if actual.empty:
                 st.warning("No dated sales match these selections and forecast start date.")
@@ -610,22 +663,34 @@ elif selected_tab == "Forecast":
                 )
                 displayed_forecast["Open PO Qty"] = (
                     displayed_forecast["Date"].map(po_by_month).fillna(0)
+                    if not displayed_forecast.empty
+                    else 0.0
                 )
-                
-                if metric == "GP%":
-                    total_forecast = float(displayed_forecast["Forecast"].mean()) if not displayed_forecast.empty else 0.0
+                if displayed_forecast.empty:
+                    total_forecast = 0.0
+                elif metric == "GP%":
+                    total_forecast = float(displayed_forecast["Forecast"].mean())
                 else:
                     total_forecast = float(displayed_forecast["Forecast"].sum())
-                    
-                total_po = float(displayed_forecast["Open PO Qty"].sum())
+                total_po = (
+                    float(displayed_forecast["Open PO Qty"].sum())
+                    if not displayed_forecast.empty
+                    else 0.0
+                )
                 summary = st.columns(5)
-                
                 forecast_label_prefix = "$" if metric in ["Sale", "Cost", "GP $"] else ""
-                summary[0].metric("12-month forecast", f"{forecast_label_prefix}{total_forecast:,.0f}" if metric != "GP%" else f"{total_forecast:.1f}%")
+                summary[0].metric(
+                    "12-month forecast",
+                    f"{forecast_label_prefix}{total_forecast:,.0f}"
+                    if metric != "GP%"
+                    else f"{total_forecast:.1f}%",
+                )
                 summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
                 summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
                 summary[3].metric("Open PO quantity", f"{total_po:,.0f}")
-                summary[4].metric("Historical MAPE", f"{mape:.1%}" if mape is not None else "n/a")
+                summary[4].metric(
+                    "Historical MAPE", f"{mape:.1%}" if mape is not None else "n/a"
+                )
 
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
@@ -633,37 +698,51 @@ elif selected_tab == "Forecast":
                     metric,
                     forecast_from,
                 )
-                
                 if metric == "GP%" and not annual_profile.empty:
                     numeric_cols = [c for c in annual_profile.columns if c != "Month"]
                     for col in numeric_cols:
                         annual_profile[col] = annual_profile[col].mean()
 
-                year_columns = [column for column in annual_profile.columns if column != "Month"]
-                st.subheader("Monthly comparison by year")
-                actual_chart_data = (
-                    annual_profile.melt(
-                        id_vars="Month", var_name="Year", value_name=metric
-                    )
-                    .dropna(subset=[metric])
+                # Year columns can come back as ints or strings; keep the
+                # originals for lookups and use strings for everything drawn.
+                year_columns = sorted(
+                    (column for column in annual_profile.columns if column != "Month"),
+                    key=lambda value: int(value),
                 )
+                year_labels = [str(column) for column in year_columns]
 
-                forecast_chart_data = pd.concat(
-                    [forecast_2026, forecast_2027],
-                    ignore_index=True,
-                )
-                forecast_chart_data["Year"] = forecast_chart_data["Date"].dt.year.astype(str)
-                forecast_chart_data["Month"] = (
-                    forecast_chart_data["Date"]
-                    .dt.month.map(dict(enumerate(forecast_engine.MONTHS, start=1)))
-                )
-                actual_chart_data["Series"] = actual_chart_data["Year"]
+                st.subheader("Monthly comparison by year")
+                actual_chart_data = annual_profile.melt(
+                    id_vars="Month", var_name="Year", value_name="Value"
+                ).dropna(subset=["Value"])
+                actual_chart_data["Series"] = actual_chart_data["Year"].astype(str)
                 actual_chart_data["Line Type"] = "Actual"
-                actual_chart_data = actual_chart_data.rename(columns={metric: "Value"})
-                forecast_plot_data = forecast_chart_data.assign(
-                    Series="Forecast " + forecast_chart_data["Year"],
-                    **{"Line Type": "Forecast", "Value": forecast_chart_data["Forecast"]},
-                )[["Month", "Series", "Line Type", "Value"]]
+
+                forecast_frames = [
+                    frame
+                    for frame in (forecast_2026, forecast_2027)
+                    if not frame.empty and "Date" in frame.columns
+                ]
+                if forecast_frames:
+                    forecast_chart_data = pd.concat(forecast_frames, ignore_index=True)
+                    forecast_chart_data["Year"] = (
+                        forecast_chart_data["Date"].dt.year.astype(str)
+                    )
+                    forecast_chart_data["Month"] = (
+                        forecast_chart_data["Date"].dt.month.map(MONTH_NUMBER_TO_NAME)
+                    )
+                else:
+                    forecast_chart_data = pd.DataFrame(
+                        columns=["Date", "Forecast", "Year", "Month"]
+                    )
+                forecast_plot_data = pd.DataFrame(
+                    {
+                        "Month": forecast_chart_data["Month"],
+                        "Series": "Forecast " + forecast_chart_data["Year"].astype(str),
+                        "Line Type": "Forecast",
+                        "Value": forecast_chart_data["Forecast"],
+                    }
+                )
                 chart_data = pd.concat(
                     [
                         actual_chart_data[["Month", "Series", "Line Type", "Value"]],
@@ -675,14 +754,21 @@ elif selected_tab == "Forecast":
                     forecast_plot_data["Series"].unique(),
                     key=lambda series: int(series.removeprefix("Forecast ")),
                 )
-                series_order = sorted(year_columns, key=int) + forecast_series
-                series_colors = [
+                series_order = list(dict.fromkeys(year_labels + forecast_series))
+                palette = [
                     "#0072b2",
                     "#e69f00",
                     "#009e73",
                     "#d55e00",
                     "#cc79a7",
+                    "#56b4e9",
+                    "#f0e442",
+                    "#000000",
                 ]
+                series_colors = [
+                    palette[index % len(palette)] for index in range(len(series_order))
+                ]
+                value_format = ",.0f" if metric != "GP%" else ".1f"
                 legend_selection = alt.selection_point(
                     name="series_legend",
                     fields=["Series"],
@@ -699,10 +785,7 @@ elif selected_tab == "Forecast":
                         color=alt.Color(
                             "Series:N",
                             sort=series_order,
-                            scale=alt.Scale(
-                                domain=series_order,
-                                range=series_colors[: len(series_order)],
-                            ),
+                            scale=alt.Scale(domain=series_order, range=series_colors),
                             title="Year",
                         ),
                         strokeDash=alt.StrokeDash(
@@ -718,7 +801,7 @@ elif selected_tab == "Forecast":
                         tooltip=[
                             alt.Tooltip("Series:N", title="Series"),
                             alt.Tooltip("Month:N", title="Month"),
-                            alt.Tooltip("Value:Q", title=metric, format=",.0f" if metric != "GP%" else ".1f"),
+                            alt.Tooltip("Value:Q", title=metric, format=value_format),
                         ],
                     )
                     .add_params(legend_selection)
@@ -735,7 +818,7 @@ elif selected_tab == "Forecast":
                             field = f"year_{year}"
                             tooltip_row[field] = float(value)
                             tooltip_fields.append(
-                                alt.Tooltip(f"{field}:Q", title=year, format=",.0f" if metric != "GP%" else ".1f")
+                                alt.Tooltip(f"{field}:Q", title=str(year), format=value_format)
                             )
                     month_forecasts = forecast_chart_data.loc[
                         forecast_chart_data["Month"].eq(month)
@@ -744,11 +827,13 @@ elif selected_tab == "Forecast":
                         forecast_value = month_forecasts.loc[
                             month_forecasts["Year"].eq(year), "Forecast"
                         ]
+                        if forecast_value.empty or pd.isna(forecast_value.iloc[0]):
+                            continue
                         field = f"forecast_{year}"
                         tooltip_row[field] = float(forecast_value.iloc[0])
                         tooltip_fields.append(
                             alt.Tooltip(
-                                f"{field}:Q", title=f"Forecast {year}", format=",.0f" if metric != "GP%" else ".1f"
+                                f"{field}:Q", title=f"Forecast {year}", format=value_format
                             )
                         )
                     if tooltip_fields:
@@ -773,34 +858,37 @@ elif selected_tab == "Forecast":
                             )
                             .add_params(month_hover_selection)
                         )
-                st.altair_chart(
-                    alt.layer(yearly_chart, *month_hover_charts),
-                    use_container_width=True,
-                )
+                st.altair_chart(alt.layer(yearly_chart, *month_hover_charts), **FULL_WIDTH)
                 st.caption("Solid lines: actual by year · Dashed line: forecast")
 
                 graph_table = (
-                    chart_data.pivot(index="Series", columns="Month", values="Value")
+                    chart_data.drop_duplicates(subset=["Series", "Month"], keep="last")
+                    .pivot(index="Series", columns="Month", values="Value")
                     .reindex(index=series_order, columns=forecast_engine.MONTHS)
                     .reset_index()
                 )
                 graph_table.columns.name = None
-                
                 formatted_graph_table = graph_table.copy()
                 for col in forecast_engine.MONTHS:
                     if col in formatted_graph_table.columns:
                         if metric in ["Sale", "Cost", "GP $"]:
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(
+                                lambda x: f"${x:,.0f}" if pd.notna(x) else ""
+                            )
                         elif metric == "GP%":
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(
+                                lambda x: f"{x:.1f}%" if pd.notna(x) else ""
+                            )
                         else:
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(
+                                lambda x: f"{x:,.0f}" if pd.notna(x) else ""
+                            )
 
                 st.dataframe(
                     formatted_graph_table,
-                    use_container_width=True,
                     hide_index=True,
                     height=220,
+                    **FULL_WIDTH,
                 )
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
@@ -825,7 +913,7 @@ elif selected_tab == "Formatted Data":
         st.data_editor(
             df_sheet.head(1000),
             num_rows="dynamic",
-            use_container_width=True,
+            **FULL_WIDTH,
         )
 
         st.download_button(
