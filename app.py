@@ -12,6 +12,8 @@ st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 st.title("📦 Inventory & Purchasing System Migration")
 st.subheader("Options Data Integration")
 
+st.sidebar.caption("Source data refreshes automatically every 1 hour.")
+
 st.sidebar.markdown(
     "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
     unsafe_allow_html=True,
@@ -285,6 +287,27 @@ def load_raw_folder_data(
         "Sales Data": formatted_sales,
     }
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
+
+
+# Automatic source-data refresh.
+# The fragment wakes every 15 minutes. On the scheduled wake-up it clears the
+# cached source data and reruns the full app so changed files are picked up.
+@st.fragment(run_every="1h")
+def automatic_source_refresh():
+    if st.session_state.get("_auto_refresh_pending", False):
+        st.session_state["_auto_refresh_pending"] = False
+        return
+
+    if "_auto_refresh_started" not in st.session_state:
+        st.session_state["_auto_refresh_started"] = True
+        return
+
+    st.session_state["_auto_refresh_pending"] = True
+    load_raw_folder_data.clear()
+    st.rerun(scope="app")
+
+
+automatic_source_refresh()
 
 
 def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
