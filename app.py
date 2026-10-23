@@ -290,14 +290,11 @@ with top_right:
         load_csv.clear()
         load_raw_folder_data.clear()
         st.rerun()
-
-st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
-
 st.sidebar.markdown(
     "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
     unsafe_allow_html=True,
 )
-
+st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
 
 @st.fragment(run_every="1h")
 def automatic_source_refresh():
