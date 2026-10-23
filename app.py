@@ -513,18 +513,27 @@ elif selected_tab == "Forecast":
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
+            # Ensure 'Date' column is present and converted properly
+            if not selected_sales.empty and "Date" not in selected_sales.columns:
+                if "Invoice Date" in selected_sales.columns:
+                    selected_sales["Date"] = pd.to_datetime(selected_sales["Invoice Date"], errors="coerce")
+            if not selected_sales.empty and "Date" in selected_sales.columns:
+                selected_sales["Date"] = pd.to_datetime(selected_sales["Date"], errors="coerce")
+                selected_sales["Year"] = selected_sales["Date"].dt.year
+                selected_sales["Month"] = selected_sales["Date"].dt.month_name()
+
             if metric == "GP%" and not selected_sales.empty:
                 if "GP%" in selected_sales.columns:
                     mean_gp = selected_sales["GP%"].mean()
                     selected_sales["GP%"] = mean_gp
 
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
-            historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
+            historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start] if "Date" in selected_sales.columns else selected_sales
             if historical_sales_for_mape.empty:
                 historical_sales_for_mape = selected_sales
 
             # SEPARATE FORECAST CALCULATIONS FOR 2026 AND 2027 WITH EXPLICIT MOMENTUM OVERRIDES
-            data_for_2026 = selected_sales.loc[selected_sales["Year"] < 2026]
+            data_for_2026 = selected_sales.loc[selected_sales["Year"] < 2026] if "Year" in selected_sales.columns else selected_sales
             if data_for_2026.empty:
                 data_for_2026 = selected_sales
 
@@ -546,7 +555,7 @@ elif selected_tab == "Forecast":
             )
 
             # Apply direct momentum scaling so July 2026 locks to ~154 and July 2027 locks to ~180 (matching actual upward sales velocity)
-            if not selected_sales.empty and metric != "GP%":
+            if not selected_sales.empty and metric != "GP%" and "Date" in selected_sales.columns:
                 monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
                 
                 # Scale Forecast 2026
