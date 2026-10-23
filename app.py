@@ -817,10 +817,18 @@ if selected_tab == "Forecast":
 
                 fmt_str = lambda x: f"{x:.1f}%" if metric == "GP%" else f"{forecast_label_prefix}{x:,.0f}"
 
+                # Delta with formatted comma numbers
+                if metric == "GP%":
+                    ytd_delta_str = f"{ytd_diff:+,.1f}% ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a"
+                    fy_delta_str = f"{fy_diff:+,.1f}% vs Baseline ({fy_pct:+.1f}%)" if pd.notna(fy_diff) else "n/a"
+                else:
+                    ytd_delta_str = f"{forecast_label_prefix}{ytd_diff:+,.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a"
+                    fy_delta_str = f"{forecast_label_prefix}{fy_diff:+,.0f} vs Baseline ({fy_pct:+.1f}%)" if pd.notna(fy_diff) else "n/a"
+
                 o_col1.metric(
                     "YTD Actual vs Forecast",
                     fmt_str(ytd_act),
-                    delta=f"{ytd_diff:+.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a",
+                    delta=ytd_delta_str,
                     help=f"Actuals from Jan {this_year} to {last_complete.strftime('%b %Y')} vs blended forecast.",
                 )
                 o_col2.metric(
@@ -831,7 +839,7 @@ if selected_tab == "Forecast":
                 o_col3.metric(
                     "Full Year Outlook (Actual + Forecast)",
                     fmt_str(fy_act_fc),
-                    delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
+                    delta=fy_delta_str,
                     help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
                 )
                 o_col4.metric(
@@ -861,10 +869,17 @@ if selected_tab == "Forecast":
                 st.markdown(f"### 📈 Performance: {this_year} vs {prior_year}")
                 p_col1, p_col2, p_col3, p_col4 = st.columns(4)
 
+                if metric == "GP%":
+                    py_ytd_delta_str = f"{py_ytd_diff:+,.1f}% vs {prior_year} ({py_ytd_pct:+.1f}%)" if pd.notna(py_ytd_diff) else "n/a"
+                    py_fy_delta_str = f"{py_fy_diff:+,.1f}% vs {prior_year} Total ({py_fy_pct:+.1f}%)" if pd.notna(py_fy_diff) else "n/a"
+                else:
+                    py_ytd_delta_str = f"{forecast_label_prefix}{py_ytd_diff:+,.0f} vs {prior_year} ({py_ytd_pct:+.1f}%)" if pd.notna(py_ytd_diff) else "n/a"
+                    py_fy_delta_str = f"{forecast_label_prefix}{py_fy_diff:+,.0f} vs {prior_year} Total ({py_fy_pct:+.1f}%)" if pd.notna(py_fy_diff) else "n/a"
+
                 p_col1.metric(
                     f"{this_year} YTD Actuals",
                     fmt_str(ytd_act),
-                    delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_year}" if pd.notna(py_ytd_diff) else "n/a",
+                    delta=py_ytd_delta_str,
                     help=f"Actual performance through {last_complete.strftime('%b %Y')} compared to same period in {prior_year}.",
                 )
                 p_col2.metric(
@@ -875,7 +890,7 @@ if selected_tab == "Forecast":
                 p_col3.metric(
                     f"{this_year} Full Year Outlook",
                     fmt_str(fy_act_fc),
-                    delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_year} Total" if pd.notna(py_fy_diff) else "n/a",
+                    delta=py_fy_delta_str,
                     help=f"Full year {this_year} projected outlook vs total actual performance in {prior_year}.",
                 )
                 p_col4.metric(
