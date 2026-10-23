@@ -1049,7 +1049,11 @@ if selected_tab == "Forecast":
                             )
                             .add_params(month_hover_selection)
                         )
-                st.altair_chart(alt.layer(yearly_chart, *month_hover_charts), **FULL_WIDTH)
+                st.altair_chart(
+                    alt.layer(yearly_chart, *month_hover_charts),
+                    key="forecast_monthly_chart",
+                    **FULL_WIDTH,
+                )
                 st.caption(
                     f"Solid lines: actual by year · Dashed lines: forecast · "
                     f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
