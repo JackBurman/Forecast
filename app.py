@@ -525,22 +525,6 @@ elif selected_tab == "Forecast":
 
             target_data = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
 
-            # Weighted historical weighting & Year-on-Year Growth Trend Layer
-            if not target_data.empty and metric != "GP%":
-                # Assign recency weights (heavily favoring 2025/2026 over 2024)
-                target_data = target_data.copy()
-                year_weights = {2024: 0.5, 2025: 1.0, 2026: 1.5, 2027: 2.0}
-                target_data["_RecencyWeight"] = target_data["Year"].map(year_weights).fillna(1.0)
-                
-                # Calculate Year-on-Year growth factor from 2025 to 2026 to project growth trend forward
-                annual_totals = target_data.groupby("Year")[metric].sum()
-                yoy_growth_factor = 1.05  # default baseline growth trend
-                if 2025 in annual_totals and 2026 in annual_totals and annual_totals[2025] > 0:
-                    yoy_growth_factor = max(0.8, min(1.5, annual_totals[2026] / annual_totals[2025]))
-
-                # Adjust bias dynamically using the YoY growth trend
-                bias = max(bias, yoy_growth_factor)
-
             actual, forecast, mape = forecast_engine.calculate_forecast(
                 target_data,
                 metric,
@@ -549,6 +533,22 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
             
+            # Apply direct Year-on-Year growth trend scaling so future forecasts step up from 2026 actuals rather than dropping
+            if not selected_sales.empty and not forecast.empty and metric != "GP%":
+                monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
+                if 2026 in monthly_actuals.columns and 2025 in monthly_actuals.columns:
+                    for idx, row in forecast.iterrows():
+                        m_num = row["Date"].month
+                        if m_num in monthly_actuals.index:
+                            act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else pd.NA
+                            act_2026 = monthly_actuals.loc[m_num, 2026] if 2026 in monthly_actuals.columns else pd.NA
+                            if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0 and act_2026 > 0:
+                                yoy_ratio = act_2026 / act_2025
+                                # Scale forecast to grow beyond 2026 actuals based on the YoY trend
+                                current_val = row["Forecast"]
+                                scaled_val = act_2026 * (yoy_ratio ** 0.8) * (current_val / (act_2026 if act_2026 > 0 else 1))
+                                forecast.loc[idx, "Forecast"] = max(current_val, scaled_val)
+
             if metric == "GP%" and not forecast.empty:
                 avg_forecast_val = forecast["Forecast"].mean()
                 forecast["Forecast"] = avg_forecast_val
@@ -815,7 +815,7 @@ elif selected_tab == "Forecast":
                             val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
                             st.caption(f"• SKU {item}: {val_str}")
 
-                        st.write("**Product-Level Watchouts:**`")
+                        st.write("**Product-Level Watchouts:**")
                         st.caption("• **Stockout Impact:** Verify if historical dips in specific SKUs stem from supply gaps rather than organic demand drops.")
                         st.caption("• **Tail End Drag:** Monitor low-volume SKUs tying up warehouse space and working capital.")
                     else:
@@ -826,7 +826,7 @@ elif selected_tab == "Forecast":
                     """
                     * **SKU-Level Reorder Point Check:** Compare projected monthly SKU demand against **On Hand** stock and **Open Purchase Orders**. Ensure safety stock cushions lead-time gaps for top revenue-generating SKUs.
                     * **Product Phase-Outs & Replacements:** If low-performing or legacy SKUs show declining baseline trends, evaluate whether to apply a negative bias or manual override before reordering.
-                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-count options doesn't pull down overall product category profitability (`GP%`).
+                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-cost options doesn't pull down overall product category profitability (`GP%`).
                     """
                 )
 
@@ -860,7 +860,6 @@ elif selected_tab == "Forecast":
                     )
                 edited_forecast["Final Forecast"] = pd.to_numeric(
                     edited_forecast["Manual Override"], errors="coerce"
-
                 ).fillna(edited_forecast["Forecast"])
                 edited_forecast["Projected Free Stock"] = (
                     free_stock
@@ -869,7 +868,7 @@ elif selected_tab == "Forecast":
                 )
 
                 st.caption(
-                    "Forecast uses 12-month seasonal Holt-Winters, blended with recency weighting and year-on-year growth trend projection."
+                    "Forecast uses 12-month seasonal Holt-Winters combined with year-on-year historical growth trend projection."
                 )
         except Exception as e:
             st.error(f"Error rendering forecast sheet: {e}")
