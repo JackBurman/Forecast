@@ -524,6 +524,43 @@ def build_forecasts(
     }
 
 
+def get_yearly_monthly_profile_custom(
+    selected_sales: pd.DataFrame,
+    metric: str,
+    forecast_from: pd.Timestamp,
+    is_financial_year: bool = False
+) -> pd.DataFrame:
+    """Build a monthly pivot table by year, correctly grouped for Calendar or Financial Year."""
+    if selected_sales.empty or "Date" not in selected_sales.columns or metric not in selected_sales.columns:
+        return pd.DataFrame(columns=["Month"])
+
+    df = selected_sales.dropna(subset=["Date"]).copy()
+    df = df[df["Date"] >= forecast_from]
+    if df.empty:
+        return pd.DataFrame(columns=["Month"])
+
+    df["Month_Name"] = df["Date"].dt.month_name()
+
+    if is_financial_year:
+        # Financial year starts in July (Month >= 7) -> FY starts in current calendar year
+        df["Year_Label"] = df["Date"].apply(
+            lambda d: f"FY{d.year + 1}" if d.month >= 7 else f"FY{d.year}"
+        )
+        months_order = FY_MONTHS
+    else:
+        df["Year_Label"] = df["Date"].dt.year.astype(str)
+        months_order = forecast_engine.MONTHS
+
+    if metric == "GP%":
+        pivot = df.groupby(["Month_Name", "Year_Label"])[metric].mean().unstack("Year_Label")
+    else:
+        pivot = df.groupby(["Month_Name", "Year_Label"])[metric].sum().unstack("Year_Label")
+
+    pivot = pivot.reindex(months_order).reset_index()
+    pivot = pivot.rename(columns={"index": "Month", "Month_Name": "Month"})
+    return pivot
+
+
 def window_label(window: pd.PeriodIndex) -> str:
     return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
 
@@ -642,6 +679,7 @@ if selected_tab == "Forecast":
                     index=0,
                     key="year_type_view_select"
                 )
+            is_fy = "Financial Year" in year_view
 
             def choices_for(series: pd.Series) -> list[str]:
                 values = sorted(
@@ -817,7 +855,6 @@ if selected_tab == "Forecast":
 
                 fmt_str = lambda x: f"{x:.1f}%" if metric == "GP%" else f"{forecast_label_prefix}{x:,.0f}"
 
-                # Delta with formatted comma numbers
                 if metric == "GP%":
                     ytd_delta_str = f"{ytd_diff:+,.1f}% ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a"
                     fy_delta_str = f"{fy_diff:+,.1f}% vs Baseline ({fy_pct:+.1f}%)" if pd.notna(fy_diff) else "n/a"
@@ -900,25 +937,26 @@ if selected_tab == "Forecast":
                 )
                 # --------------------------------------------------------------
 
-                annual_profile = forecast_engine.yearly_monthly_profile(
+                annual_profile = get_yearly_monthly_profile_custom(
                     selected_sales,
-                    pd.DataFrame(columns=["Date", "Forecast"]),
                     metric,
                     forecast_from,
+                    is_financial_year=is_fy
                 )
+                
                 if metric == "GP%" and not annual_profile.empty:
                     numeric_cols = [c for c in annual_profile.columns if c != "Month"]
                     for col in numeric_cols:
                         annual_profile[col] = annual_profile[col].mean()
 
                 year_columns = sorted(
-                    (column for column in annual_profile.columns if column != "Month"),
-                    key=lambda value: int(value),
+                    [c for c in annual_profile.columns if c != "Month"],
+                    key=str
                 )
                 year_labels = [str(column) for column in year_columns]
 
-                month_sort_order = FY_MONTHS if "Financial Year" in year_view else forecast_engine.MONTHS
-                st.subheader(f"Monthly comparison by year ({'FY Jul-Jun' if 'Financial Year' in year_view else 'Calendar Jan-Dec'})")
+                month_sort_order = FY_MONTHS if is_fy else forecast_engine.MONTHS
+                st.subheader(f"Monthly comparison by year ({'FY Jul-Jun' if is_fy else 'Calendar Jan-Dec'})")
 
                 actual_chart_data = annual_profile.melt(
                     id_vars="Month", var_name="Year", value_name="Value"
@@ -934,9 +972,13 @@ if selected_tab == "Forecast":
                 forecast_frames = [frame for frame in forecast_frames if not frame.empty]
                 if forecast_frames:
                     forecast_chart_data = pd.concat(forecast_frames, ignore_index=True)
-                    forecast_chart_data["Year"] = (
-                        forecast_chart_data["Date"].dt.year.astype(str)
-                    )
+                    if is_fy:
+                        forecast_chart_data["Year"] = forecast_chart_data["Date"].apply(
+                            lambda d: f"FY{d.year + 1}" if d.month >= 7 else f"FY{d.year}"
+                        )
+                    else:
+                        forecast_chart_data["Year"] = forecast_chart_data["Date"].dt.year.astype(str)
+                        
                     forecast_chart_data["Month"] = (
                         forecast_chart_data["Date"].dt.month.map(MONTH_NUMBER_TO_NAME)
                     )
@@ -961,7 +1003,7 @@ if selected_tab == "Forecast":
                 )
                 forecast_series = sorted(
                     forecast_plot_data["Series"].unique(),
-                    key=lambda series: int(series.removeprefix("Forecast ")),
+                    key=str
                 )
                 series_order = list(dict.fromkeys(year_labels + forecast_series))
                 palette = [
