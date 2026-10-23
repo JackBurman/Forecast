@@ -761,49 +761,57 @@ elif selected_tab == "Forecast":
                     height=220,
                 )
 
-                # In-depth Sales Uplift, Downward Pressure & Forecast Analysis Section
+                # Product-Level Performance & Forecast Intelligence Section
                 st.markdown("---")
-                st.subheader("📊 Sales Performance & Forecast Intelligence")
+                st.subheader("📦 Product-Level Performance & Forecast Intelligence")
 
                 col_up, col_down = st.columns(2)
 
                 with col_up:
-                    st.markdown("#### 🟢 Drivers of Uplift")
+                    st.markdown("#### 🟢 Product Drivers of Uplift")
                     if not selected_sales.empty:
-                        top_channels = selected_sales.groupby("Sales Channel Net")[metric].sum().nlargest(3)
-                        top_suppliers = selected_sales.groupby("OptionsData.Supplier" if "OptionsData.Supplier" in selected_sales.columns else "City")[metric].sum().nlargest(3)
-                        
-                        st.write("**Top Performing Channels:**")
-                        for ch, val in top_channels.items():
-                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• {ch}: {val_str}")
+                        # Highest contributing SKUs / Models
+                        sku_col = "SKU Key" if "SKU Key" in selected_sales.columns else "SKU"
+                        model_col = "Model" if "Model" in selected_sales.columns else "Description"
+                        class_col = "OptionsData.Fourth Product Group" if "OptionsData.Fourth Product Group" in selected_sales.columns else "OptionsData.Class"
 
-                        st.write("**Key Contributing Suppliers/Locations:**")
-                        for sup, val in top_suppliers.items():
+                        top_skus = selected_sales.groupby(sku_col)[metric].sum().nlargest(3)
+                        top_models = selected_sales.groupby(model_col)[metric].sum().nlargest(3)
+
+                        st.write("**Top Performing SKUs / Items:**")
+                        for item, val in top_skus.items():
                             val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• {sup}: {val_str}")
+                            st.caption(f"• SKU {item}: {val_str}")
+
+                        st.write("**Key Contributing Product Models:**")
+                        for mdl, val in top_models.items():
+                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
+                            st.caption(f"• Model {mdl}: {val_str}")
                     else:
-                        st.caption("No data available for uplift breakdown.")
+                        st.caption("No product data available for uplift breakdown.")
 
                 with col_down:
-                    st.markdown("#### 🔴 Downward Pressure")
+                    st.markdown("#### 🔴 Product Downward Pressure")
                     if not selected_sales.empty:
-                        low_channels = selected_sales.groupby("Sales Channel Net")[metric].sum().nsmallest(3)
-                        st.write("**Underperforming or Niche Channels:**")
-                        for ch, val in low_channels.items():
-                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• {ch}: {val_str}")
+                        low_skus = selected_sales.groupby(sku_col)[metric].sum().nsmallest(3)
                         
-                        st.caption("• **Lagging Periods:** Check months displaying flat or dipping historical trendlines relative to prior years.")
-                    else:
-                        st.caption("No data available for downward pressure breakdown.")
+                        st.write("**Lowest Performing / Slow-Moving SKUs:**")
+                        for item, val in low_skus.items():
+                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
+                            st.caption(f"• SKU {item}: {val_str}")
 
-                st.markdown("#### 🔍 Upcoming Forecast Analysis & Focus Areas")
+                        st.write("**Product-Level Watchouts:**")
+                        st.caption("• **Stockout Impact:** Verify if historical dips in specific SKUs stem from supply gaps rather than organic demand drops.")
+                        st.caption("• **Tail End Drag:** Monitor low-volume SKUs tying up warehouse space and working capital.")
+                    else:
+                        st.caption("No product data available for downward pressure breakdown.")
+
+                st.markdown("#### 🔍 Product-Focused Forecast Strategy & Action Items")
                 st.markdown(
                     """
-                    * **Stock Cover & Free Stock Alignment:** Compare the 12-month rolling forecast against your current **Free Stock** and incoming **Open PO Quantities**. If projected free stock dips below safety thresholds during peak seasonal months, trigger purchase orders early.
-                    * **Seasonality & Trend Divergence:** Look closely at the dashed forecast line compared to previous years' solid lines. If the model anticipates a sharper surge or drop than historical norms, investigate whether recent marketing pushes or supply constraints explain the anomaly.
-                    * **Margin vs. Volume Trade-offs:** If viewing gross profit percentage (`GP%`), ensure that volume increases (Qty/Sale) aren't eroding margins. Look for SKUs or categories where high turnover coincides with dipping profit percentages.
+                    * **SKU-Level Reorder Point Check:** Compare projected monthly SKU demand against **On Hand** stock and **Open Purchase Orders**. Ensure safety stock cushions lead-time gaps for top revenue-generating SKUs.
+                    * **Product Phase-Outs & Replacements:** If low-performing or legacy SKUs show declining baseline trends, evaluate whether to apply a negative bias or manual override before reordering.
+                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-cost options doesn't pull down overall product category profitability (`GP%`).
                     """
                 )
 
