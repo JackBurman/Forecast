@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 import altair as alt
@@ -286,19 +287,75 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
-data_tab, forecast_tab, formatted_tab = st.tabs(
-    ["Options Data", "Forecast", "Formatted Data"]
+def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Render Options Data filters and return the filtered dataframe."""
+    filtered = df.copy()
+
+    with st.sidebar.expander("Options Data Filters", expanded=True):
+        st.caption("Leave a filter empty to include all values.")
+
+        for index, column in enumerate(df.columns):
+            key_base = f"options_filter_{index}"
+            non_null = df[column].dropna()
+            unique_values = sorted(
+                {str(value).strip() for value in non_null if str(value).strip()},
+                key=str.casefold,
+            )
+
+            if len(unique_values) <= 100:
+                selected_values = st.multiselect(
+                    column,
+                    unique_values,
+                    default=[],
+                    key=f"{key_base}_select",
+                )
+                if selected_values:
+                    filtered = filtered[
+                        filtered[column].astype("string").isin(selected_values)
+                    ]
+            else:
+                search_value = st.text_input(
+                    f"{column} contains",
+                    key=f"{key_base}_text",
+                ).strip()
+                if search_value:
+                    filtered = filtered[
+                        filtered[column]
+                        .astype("string")
+                        .str.contains(search_value, case=False, na=False, regex=False)
+                    ]
+
+    return filtered
+
+# Tab-style navigation.
+# Streamlit's st.tabs() renders all tab code on each run and does not expose
+# the active tab to Python, so a horizontal radio control is used here to
+# allow the sidebar to change with the selected view.
+selected_tab = st.radio(
+    "View",
+    ["Options Data", "Forecast", "Formatted Data"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-with data_tab:
+prepared_data = None
+source_names = []
+
+if selected_tab == "Options Data":
     try:
         df_options = load_csv(str(csv_path))
         st.success(f"Options data loaded successfully from {csv_path.name}!")
 
+        df_options_filtered = filter_options_data(df_options)
+
         st.subheader("Options Data Table:")
-        st.caption(f"Showing 1,000 of {len(df_options):,} options")
+        st.caption(
+            f"Showing {min(1000, len(df_options_filtered)):,} of "
+            f"{len(df_options_filtered):,} filtered rows "
+            f"({len(df_options):,} total options)"
+        )
         st.data_editor(
-            df_options.head(1000),
+            df_options_filtered.head(1000),
             num_rows="dynamic",
             use_container_width=True,
         )
@@ -318,11 +375,8 @@ with data_tab:
     except Exception as e:
         st.error(f"Something went wrong while loading the data: {e}")
 
-
-with forecast_tab:
+elif selected_tab == "Forecast":
     st.subheader("Forecast Planner")
-    prepared_data = None
-    source_names = []
     try:
         prepared_data, source_names = load_raw_folder_data(
             str(raw_data_path), raw_folder_manifest(raw_data_path)
@@ -674,7 +728,16 @@ with forecast_tab:
             st.error(f"Could not build the forecast view: {e}")
 
 
-with formatted_tab:
+
+elif selected_tab == "Formatted Data":
+    if prepared_data is None:
+        try:
+            prepared_data, source_names = load_raw_folder_data(
+                str(raw_data_path), raw_folder_manifest(raw_data_path)
+            )
+        except Exception as e:
+            st.error(f"Could not load files from Raw_data: {e}")
+
     st.subheader("Formatted Data Files")
     if st.button("Refresh from folder", key="refresh_raw_data"):
         load_raw_folder_data.clear()
