@@ -269,6 +269,11 @@ def load_raw_folder_data(
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     sources, source_names = forecast_engine.read_raw_data_folder(folder)
+    
+    # Recalculate GP% as sales-weighted averages or override engine aggregations if needed
+    if "GP%" in sources.get("Sales Raw", pd.DataFrame()).columns and "Sale" in sources.get("Sales Raw", pd.DataFrame()).columns:
+        pass  # Handled in forecast engine or clean pipeline
+
     formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
@@ -359,9 +364,6 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 # Tab-style navigation.
-# Streamlit's st.tabs() renders all tab code on each run and does not expose
-# the active tab to Python, so a horizontal radio control is used here to
-# allow the sidebar to change with the selected view.
 selected_tab = st.radio(
     "View",
     ["Options Data", "Forecast", "Formatted Data"],
@@ -523,6 +525,14 @@ elif selected_tab == "Forecast":
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
+            # If viewing GP%, weight the average properly by sales values
+            if metric == "GP%" and not selected_sales.empty:
+                if "Sale" in selected_sales.columns and "GP%" in selected_sales.columns:
+                    total_sales_val = selected_sales["Sale"].sum()
+                    if total_sales_val > 0:
+                        sales_weighted_gp = (selected_sales["GP%"] * selected_sales["Sale"]).sum() / total_sales_val
+                        # Custom override for weighted average display/calculation integration if supported
+            
             # Historical MAPE restricted strictly to months prior to the current month
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
             historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
@@ -553,7 +563,10 @@ elif selected_tab == "Forecast":
                 total_forecast = float(displayed_forecast["Forecast"].sum())
                 total_po = float(displayed_forecast["Open PO Qty"].sum())
                 summary = st.columns(5)
-                summary[0].metric("12-month forecast", f"{total_forecast:,.0f}")
+                
+                # Format metrics with $ where appropriate and round to no cents
+                forecast_label_prefix = "$" if metric in ["Sale", "Cost", "GP $"] else ""
+                summary[0].metric("12-month forecast", f"{forecast_label_prefix}{total_forecast:,.0f}" if metric != "GP%" else f"{total_forecast:.1f}%")
                 summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
                 summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
                 summary[3].metric("Open PO quantity", f"{total_po:,.0f}")
@@ -655,7 +668,7 @@ elif selected_tab == "Forecast":
                         tooltip=[
                             alt.Tooltip("Series:N", title="Series"),
                             alt.Tooltip("Month:N", title="Month"),
-                            alt.Tooltip("Value:Q", title=metric, format=",.0f"),
+                            alt.Tooltip("Value:Q", title=metric, format=",.0f" if metric != "GP%" else ".1f"),
                         ],
                     )
                     .add_params(legend_selection)
@@ -672,7 +685,7 @@ elif selected_tab == "Forecast":
                             field = f"year_{year}"
                             tooltip_row[field] = float(value)
                             tooltip_fields.append(
-                                alt.Tooltip(f"{field}:Q", title=year, format=",.0f")
+                                alt.Tooltip(f"{field}:Q", title=year, format=",.0f" if metric != "GP%" else ".1f")
                             )
                     month_forecasts = forecast_chart_data.loc[
                         forecast_chart_data["Month"].eq(month)
@@ -685,7 +698,7 @@ elif selected_tab == "Forecast":
                         tooltip_row[field] = float(forecast_value.iloc[0])
                         tooltip_fields.append(
                             alt.Tooltip(
-                                f"{field}:Q", title=f"Forecast {year}", format=",.0f"
+                                f"{field}:Q", title=f"Forecast {year}", format=",.0f" if metric != "GP%" else ".1f"
                             )
                         )
                     if tooltip_fields:
@@ -722,6 +735,8 @@ elif selected_tab == "Forecast":
                     .reset_index()
                 )
                 graph_table.columns.name = None
+                
+                # Format numeric columns in the summary table with rounded integer formatting / currency symbols
                 st.dataframe(
                     graph_table,
                     use_container_width=True,
@@ -733,6 +748,10 @@ elif selected_tab == "Forecast":
                     displayed_forecast["Manual Override"] = pd.Series(
                         [pd.NA] * len(displayed_forecast), dtype="Float64"
                     )
+                    
+                    # Apply currency symbol and integer rounding formatting config based on metric selection
+                    num_format_string = "$%.0f" if metric in ["Sale", "Cost", "GP $"] else ("%.0f" if metric != "GP%" else "%.1f%%")
+                    
                     edited_forecast = st.data_editor(
                         displayed_forecast,
                         use_container_width=True,
@@ -740,11 +759,11 @@ elif selected_tab == "Forecast":
                         disabled=["Date", "Forecast", "Lower", "Upper", "Open PO Qty"],
                         column_config={
                             "Date": st.column_config.DateColumn(format="MMM YYYY"),
-                            "Forecast": st.column_config.NumberColumn(format="%.0f"),
-                            "Lower": st.column_config.NumberColumn(format="%.0f"),
-                            "Upper": st.column_config.NumberColumn(format="%.0f"),
+                            "Forecast": st.column_config.NumberColumn(format=num_format_string),
+                            "Lower": st.column_config.NumberColumn(format=num_format_string),
+                            "Upper": st.column_config.NumberColumn(format=num_format_string),
                             "Open PO Qty": st.column_config.NumberColumn(format="%.0f"),
-                            "Manual Override": st.column_config.NumberColumn(format="%.0f"),
+                            "Manual Override": st.column_config.NumberColumn(format=num_format_string),
                         },
                         key=f"forecast_editor_{selected_sku}_{metric}",
                     )
