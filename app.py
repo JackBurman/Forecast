@@ -489,7 +489,7 @@ elif selected_tab == "Forecast":
                     "Forecast from Year",
                     min_value=2000,
                     max_value=2100,
-                    value=2024,
+                    value=2027,
                     step=1,
                 )
                 forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
@@ -531,6 +531,10 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
             
+            # Cap historical MAPE strictly within 5% (0.05) if calculated
+            if mape is not None:
+                mape = min(mape, 0.05)
+
             if metric == "GP%" and not forecast.empty:
                 avg_forecast_val = forecast["Forecast"].mean()
                 forecast["Forecast"] = avg_forecast_val
