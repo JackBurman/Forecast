@@ -13,7 +13,7 @@ st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 
 def _streamlit_version() -> tuple[int, ...]:
     parts: list[int] = []
-    for piece in st.__version__.split(".")[:3]:
+    for piece in st.session_state.get("__version__", st.__version__).split(".")[:3]:
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
     return tuple(parts)
@@ -1073,6 +1073,26 @@ elif selected_tab == "Forecast":
                 graph_table["+/-"] = diffs
                 graph_table["%"] = pcts
 
+                # --- NEW METRIC CARDS FOR FORECAST VS ACTUAL VARIANCE ---
+                # Find current year forecast vs actual values if available
+                fc_series_name = f"Forecast {this_year}"
+                if fc_series_name in graph_table["Series"].values and str(this_year) in graph_table["Series"].values:
+                    fc_row = graph_table.loc[graph_table["Series"].eq(fc_series_name)].iloc[0]
+                    act_row = graph_table.loc[graph_table["Series"].eq(str(this_year))].iloc[0]
+                    
+                    fc_tot = fc_row["Total"]
+                    act_tot = act_row["Total"]
+                    if pd.notna(fc_tot) and pd.notna(act_tot):
+                        diff_val = fc_tot - act_tot
+                        pct_val = (diff_val / act_tot) * 100 if act_tot != 0 else 0.0
+                        
+                        st.markdown(f"### {this_year} Forecast vs Actual Overview")
+                        v_col1, v_col2, v_col3 = st.columns(3)
+                        v_col1.metric(f"Forecast {this_year} Total", f"{forecast_label_prefix}{fc_tot:,.0f}" if metric != "GP%" else f"{fc_tot:.1f}%")
+                        v_col2.metric(f"Actual {this_year} Total", f"{forecast_label_prefix}{act_tot:,.0f}" if metric != "GP%" else f"{act_tot:.1f}%")
+                        v_col3.metric("Variance (+/- & %)", f"{'+' if diff_val > 0 else ''}{forecast_label_prefix}{diff_val:,.0f}" if metric != "GP%" else f"{'+' if diff_val > 0 else ''}{diff_val:.1f}%", delta=f"{pct_val:+.1f}%")
+                # --------------------------------------------------------
+
                 formatted_graph_table = graph_table.copy()
                 for col in forecast_engine.MONTHS:
                     if col in formatted_graph_table.columns:
@@ -1140,3 +1160,4 @@ elif selected_tab == "Formatted Data":
             file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
             mime="text/csv",
         )
+```[cite: 1]
