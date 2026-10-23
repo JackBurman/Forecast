@@ -527,6 +527,17 @@ elif selected_tab == "Forecast":
             )
             purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
             on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
+            # Filter sales strictly to months prior to the current month for historical MAPE evaluation
+            current_month_start = pd.Timestamp.today().normalize().replace(day=1)
+            historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
+
+            actual, forecast, mape = forecast_engine.calculate_forecast(
+                historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales,
+                metric,
+                pd.Timestamp(forecast_from),
+                bias,
+                confidence_alpha,
+            )
 
             if actual.empty:
                 st.warning("No dated sales match these selections and forecast start date.")
