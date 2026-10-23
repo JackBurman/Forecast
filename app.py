@@ -10,12 +10,12 @@ import forecast_engine  # type: ignore
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 
-# Reduce default top padding and header spacing
+# Reduce default top padding to pull everything higher up the page
 st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 1.3rem; /* Adjust this value (e.g., 1rem or 0rem) to pull everything higher */
+            padding-top: 1rem;
             padding-bottom: 0rem;
         }
     </style>
@@ -26,7 +26,7 @@ st.markdown(
 
 def _streamlit_version() -> tuple[int, ...]:
     parts: list[int] = []
-    for piece in st.session_state.get("__version__", st.__version__).split(".")[:3]:
+    for piece in st.session_state.get("__version__", st.session_state.get("__version__", st.__version__)).split(".")[:3]:
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
     return tuple(parts)
@@ -681,25 +681,10 @@ if selected_tab == "Forecast":
         try:
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
-            source_times = [
-                (raw_data_path / name).stat().st_mtime
-                for name in source_names
-                if (raw_data_path / name).exists()
-            ]
-            latest_source_label = (
-                f"{pd.Timestamp(max(source_times), unit='s'):%d-%m-%Y %H:%M}"
-                if source_times
-                else "n/a"
-            )
+            
             planner_col, source_col = st.columns([2, 1])
             with planner_col:
                 st.subheader("Forecast Planner")
-            with source_col:
-                st.caption(
-                    f"Loaded {len(source_names)} source files · "
-                    f"{len(sales_data):,} formatted sales rows · "
-                    f"latest source: {latest_source_label}"
-                )
 
             def choices_for(series: pd.Series) -> list[str]:
                 values = sorted(
