@@ -1043,6 +1043,36 @@ elif selected_tab == "Forecast":
                     .reset_index()
                 )
                 graph_table.columns.name = None
+
+                # Calculate Total and Forecast vs Actual Variance (+/- and %)
+                if metric == "GP%":
+                    graph_table["Total"] = graph_table[forecast_engine.MONTHS].mean(axis=1)
+                else:
+                    graph_table["Total"] = graph_table[forecast_engine.MONTHS].sum(axis=1)
+
+                diffs = []
+                pcts = []
+                for idx, row in graph_table.iterrows():
+                    series_name = str(row["Series"])
+                    if series_name.startswith("Forecast "):
+                        target_year = series_name.removeprefix("Forecast ")
+                        if target_year in graph_table["Series"].values:
+                            actual_row = graph_table.loc[graph_table["Series"].eq(target_year)]
+                            if not actual_row.empty:
+                                fc_val = row["Total"]
+                                act_val = actual_row.iloc[0]["Total"]
+                                if pd.notna(fc_val) and pd.notna(act_val) and act_val != 0:
+                                    diff = fc_val - act_val
+                                    pct = (diff / act_val) * 100
+                                    diffs.append(diff)
+                                    pcts.append(pct)
+                                    continue
+                    diffs.append(np.nan)
+                    pcts.append(np.nan)
+
+                graph_table["+/-"] = diffs
+                graph_table["%"] = pcts
+
                 formatted_graph_table = graph_table.copy()
                 for col in forecast_engine.MONTHS:
                     if col in formatted_graph_table.columns:
@@ -1058,6 +1088,19 @@ elif selected_tab == "Forecast":
                             formatted_graph_table[col] = formatted_graph_table[col].apply(
                                 lambda x: f"{x:,.0f}" if pd.notna(x) else ""
                             )
+
+                if "Total" in formatted_graph_table.columns:
+                    formatted_graph_table["Total"] = formatted_graph_table["Total"].apply(
+                        lambda x: (f"{x:.1f}%" if metric == "GP%" else (f"${x:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{x:,.0f}")) if pd.notna(x) else ""
+                    )
+                if "+/-" in formatted_graph_table.columns:
+                    formatted_graph_table["+/-"] = formatted_graph_table["+/-"].apply(
+                        lambda x: f"{'+' if x > 0 else ''}{x:,.0f}" if pd.notna(x) else ""
+                    )
+                if "%" in formatted_graph_table.columns:
+                    formatted_graph_table["%"] = formatted_graph_table["%"].apply(
+                        lambda x: f"{'+' if x > 0 else ''}{x:.1f}%" if pd.notna(x) else ""
+                    )
 
                 st.dataframe(
                     formatted_graph_table,
