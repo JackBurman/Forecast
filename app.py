@@ -8,7 +8,7 @@ import streamlit as st
 import forecast_engine  # type: ignore
 
 # App setup
-st.set_page_config(page_title="Inventory & Purchasing System texrt", layout="wide")
+st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 
 # Reduce default top padding to pull everything higher up the page
 st.markdown(
@@ -578,7 +578,7 @@ def window_label(window: pd.PeriodIndex) -> str:
 # Top-right manual refresh button container
 top_left, top_right = st.columns([8, 2])
 with top_left:
-    st.title("📦 Forcasting & Purchasing System")
+    st.title("📦 Forecasting & Purchasing System")
 with top_right:
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
     if st.button("🔄 Refresh data", **FULL_WIDTH):
