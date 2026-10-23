@@ -1002,7 +1002,6 @@ if selected_tab == "Forecast":
                         ],
                     )
                     .add_params(legend_selection)
-                    .configure(transition={"duration": 300})
                 )
 
                 month_hover_charts = []
