@@ -302,6 +302,7 @@ with data_tab:
             num_rows="dynamic",
             use_container_width=True,
         )
+
         st.download_button(
             "Download full options data",
             df_options.to_csv(index=False).encode("utf-8"),
@@ -309,9 +310,6 @@ with data_tab:
             mime="text/csv",
         )
 
-        if sales_path.exists():
-            df_sales_raw = load_csv(str(sales_path))
-            df_sales_clean = clean_sales_data(df_sales_raw, df_options)
     except FileNotFoundError:
         st.warning(
             "⚠️ 'options_data.csv' not found. "
@@ -320,6 +318,8 @@ with data_tab:
     except Exception as e:
         st.error(f"Something went wrong while loading the data: {e}")
 
+
+with forecast_tab:
 with forecast_tab:
     st.subheader("Forecast Planner")
     prepared_data = None
