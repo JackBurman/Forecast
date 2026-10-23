@@ -547,7 +547,7 @@ elif selected_tab == "Forecast":
             mape = mape_27 if mape_27 is not None else mape_26
             actual = actual_27 if not actual_27.empty else actual_26
 
-            # Apply separate 2026 vs 2027 logic: 2027 trends from actual 2026 sales or falls back to 2026 forecast
+            # Apply separate 2026 vs 2027 logic with safe fallback to 2026 forecast
             if not selected_sales.empty and metric != "GP%":
                 monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
                 
@@ -563,18 +563,19 @@ elif selected_tab == "Forecast":
                 # 2027 Forecast logic: based on 2026 actual sales, falling back to 2026 forecast if empty
                 for idx, row in forecast_2027.iterrows():
                     m_num = row["Date"].month
+                    match_26 = forecast_2026.loc[forecast_2026["Date"].dt.month == m_num, "Forecast"]
+                    base_val = match_26.iloc[0] if not match_26.empty else row["Forecast"]
+
                     if m_num in monthly_actuals.index and 2026 in monthly_actuals.columns:
                         act_2026_val = monthly_actuals.loc[m_num, 2026]
                         if pd.notna(act_2026_val) and act_2026_val > 0:
-                            # Trend based on 2026 actual sales with a slight progression or YoY rate
                             act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else act_2026_val
                             yoy_rate = (act_2026_val / act_2025) if (pd.notna(act_2025) and act_2025 > 0) else 1.05
-                            forecast_2027.loc[idx, "Forecast"] = act_2026_val * yoy_rate
+                            forecast_2027.loc[idx, "Forecast"] = act_2026_val * min(yoy_rate, 1.2)
                         else:
-                            # Fallback to 2026 forecast value for this month
-                            match_26 = forecast_2026.loc[forecast_2026["Date"].dt.month == m_num, "Forecast"]
-                            if not match_26.empty:
-                                forecast_2027.loc[idx, "Forecast"] = match_26.iloc[0]
+                            forecast_2027.loc[idx, "Forecast"] = base_val
+                    else:
+                        forecast_2027.loc[idx, "Forecast"] = base_val
 
             if forecast_year == 2026:
                 forecast = forecast_2026
