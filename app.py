@@ -493,10 +493,14 @@ elif selected_tab == "Forecast":
                     metric_options,
                     index=0,
                 )
-                forecast_from = st.date_input(
-                    "Forecast from",
-                    value=pd.Timestamp("2024-01-01").date(),
+                forecast_year = st.number_input(
+                    "Forecast from Year",
+                    min_value=2000,
+                    max_value=2100,
+                    value=2024,
+                    step=1,
                 )
+                forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
                 bias = st.number_input(
                     "Forecast bias", min_value=0.0, max_value=5.0,
                     value=1.0,
@@ -518,26 +522,20 @@ elif selected_tab == "Forecast":
                 "SKU": selected_sku,
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
-            actual, forecast, mape = forecast_engine.calculate_forecast(
-                selected_sales,
-                metric,
-                pd.Timestamp(forecast_from),
-                bias,
-                confidence_alpha,
-            )
-            purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
-            on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
-            # Filter sales strictly to months prior to the current month for historical MAPE evaluation
+            
+            # Historical MAPE restricted strictly to months prior to the current month
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
             historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
 
             actual, forecast, mape = forecast_engine.calculate_forecast(
                 historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales,
                 metric,
-                pd.Timestamp(forecast_from),
+                forecast_from,
                 bias,
                 confidence_alpha,
             )
+            purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
+            on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
 
             if actual.empty:
                 st.warning("No dated sales match these selections and forecast start date.")
@@ -565,7 +563,7 @@ elif selected_tab == "Forecast":
                     selected_sales,
                     forecast.iloc[0:0],
                     metric,
-                    pd.Timestamp(forecast_from),
+                    forecast_from,
                 )
                 year_columns = [column for column in annual_profile.columns if column != "Month"]
                 st.subheader("Monthly comparison by year")
@@ -575,18 +573,18 @@ elif selected_tab == "Forecast":
                     )
                     .dropna(subset=[metric])
                 )
-                forecast_year = pd.Timestamp.today().year
+                forecast_year_num = pd.Timestamp.today().year
                 full_year_forecast = forecast_engine.forecast_calendar_year(
                     selected_sales,
                     metric,
-                    forecast_year,
-                    pd.Timestamp(forecast_from),
+                    forecast_year_num,
+                    forecast_from,
                     bias,
                     confidence_alpha,
                 )
                 forecast_chart_data = pd.concat(
                     [
-                        forecast.loc[forecast["Date"].dt.year.gt(forecast_year)],
+                        forecast.loc[forecast["Date"].dt.year.gt(forecast_year_num)],
                         full_year_forecast,
                     ],
                     ignore_index=True,
