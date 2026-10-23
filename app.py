@@ -9,11 +9,11 @@ import forecast_engine  # type: ignore
 
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
-st.title("📦 Forcast and Data System")
+st.title("📦 Inventory & Purchasing System Migration")
 st.subheader("Options Data Integration")
 
 st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
+    "<div style='text-align: center; margin-top: +12px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
     unsafe_allow_html=True,
 )
 
@@ -376,7 +376,6 @@ if selected_tab == "Options Data":
         st.error(f"Something went wrong while loading the data: {e}")
 
 elif selected_tab == "Forecast":
-    st.subheader("Forecast Planner")
     try:
         prepared_data, source_names = load_raw_folder_data(
             str(raw_data_path), raw_folder_manifest(raw_data_path)
@@ -397,11 +396,15 @@ elif selected_tab == "Forecast":
                 max((raw_data_path / name).stat().st_mtime for name in source_names),
                 unit="s",
             )
-            st.caption(
-                f"Loaded {len(source_names)} source files · "
-                f"{len(sales_data):,} formatted sales rows · "
-                f"latest source: {latest_source_time:%d-%m-%Y %H:%M}"
-            )
+            planner_col, source_col = st.columns([2, 1])
+            with planner_col:
+                st.subheader("Forecast Planner")
+            with source_col:
+                st.caption(
+                    f"Loaded {len(source_names)} source files · "
+                    f"{len(sales_data):,} formatted sales rows · "
+                    f"latest source: {latest_source_time:%d-%m-%Y %H:%M}"
+                )
 
             def choices_for(series: pd.Series) -> list[str]:
                 values = sorted(
@@ -497,6 +500,25 @@ elif selected_tab == "Forecast":
             if actual.empty:
                 st.warning("No dated sales match these selections and forecast start date.")
             else:
+                # Summary statistics are shown above the monthly comparison chart.
+                displayed_forecast = forecast.head(12).copy()
+                po_by_month = (
+                    purchase_months.set_index("Date")["Open PO Qty"]
+                    if not purchase_months.empty
+                    else pd.Series(dtype=float)
+                )
+                displayed_forecast["Open PO Qty"] = (
+                    displayed_forecast["Date"].map(po_by_month).fillna(0)
+                )
+                total_forecast = float(displayed_forecast["Forecast"].sum())
+                total_po = float(displayed_forecast["Open PO Qty"].sum())
+                summary = st.columns(5)
+                summary[0].metric("12-month forecast", f"{total_forecast:,.0f}")
+                summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
+                summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
+                summary[3].metric("Open PO quantity", f"{total_po:,.0f}")
+                summary[4].metric("Historical MAPE", f"{mape:.1%}" if mape is not None else "n/a")
+
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
                     forecast.iloc[0:0],
@@ -668,15 +690,6 @@ elif selected_tab == "Forecast":
                 )
 
                 with st.expander("Forward forecast and overrides"):
-                    displayed_forecast = forecast.head(12).copy()
-                    po_by_month = (
-                        purchase_months.set_index("Date")["Open PO Qty"]
-                        if not purchase_months.empty
-                        else pd.Series(dtype=float)
-                    )
-                    displayed_forecast["Open PO Qty"] = (
-                        displayed_forecast["Date"].map(po_by_month).fillna(0)
-                    )
                     displayed_forecast["Manual Override"] = pd.Series(
                         [pd.NA] * len(displayed_forecast), dtype="Float64"
                     )
@@ -709,15 +722,6 @@ elif selected_tab == "Forecast":
                     + edited_forecast["Open PO Qty"].cumsum()
                     - edited_forecast["Final Forecast"].cumsum()
                 )
-
-                total_forecast = float(edited_forecast["Final Forecast"].sum())
-                total_po = float(edited_forecast["Open PO Qty"].sum())
-                summary = st.columns(5)
-                summary[0].metric("12-month forecast", f"{total_forecast:,.0f}")
-                summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
-                summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
-                summary[3].metric("Open PO quantity", f"{total_po:,.0f}")
-                summary[4].metric("Historical MAPE", f"{mape:.1%}" if mape is not None else "n/a")
 
                 st.caption(
                     "Forecast uses 12-month seasonal Holt-Winters, blended 70/30 with recent monthly average, "
