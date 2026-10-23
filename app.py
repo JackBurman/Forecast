@@ -794,10 +794,35 @@ elif selected_tab == "Forecast":
                     hide_index=True,
                     height=220,
                 )
+        except Exception as e:
+            st.error(f"Something went wrong while rendering the forecast: {e}")
 
-                st.markdown("---")
-                st.subheader("📦 Product-Level Performance & Forecast Intelligence")
+elif selected_tab == "Formatted Data":
+    try:
+        prepared_data, source_names = load_raw_folder_data(
+            str(raw_data_path), raw_folder_manifest(raw_data_path)
+        )
+    except Exception as e:
+        st.error(f"Could not load files from Raw_data: {e}")
 
-                col_up, col_down = st.columns(2)
+    if prepared_data is None:
+        st.info("Add required source files under Raw_data to view formatted tables.")
+    else:
+        st.subheader("Formatted Data Tables")
+        sheet_names = list(prepared_data.keys())
+        selected_sheet = st.selectbox("Select table", sheet_names)
+        df_sheet = prepared_data[selected_sheet]
 
-                sku_col = sales_data.columns[0]
+        st.caption(f"Showing {min(1000, len(df_sheet)):,} of {len(df_sheet):,} rows")
+        st.data_editor(
+            df_sheet.head(1000),
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+
+        st.download_button(
+            f"Download {selected_sheet} CSV",
+            df_sheet.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
