@@ -554,6 +554,7 @@ def build_forecasts(
         "rolling_total": rolling_total,
         "mape": mape,
         "mape_window": mape_window,
+        "last_complete": last_complete,
     }
 
 
@@ -809,6 +810,8 @@ elif selected_tab == "Forecast":
             forecast_this_year = result["forecast_this"]
             forecast_next_year = result["forecast_next"]
             rolling_window = result["rolling_window"]
+            actual_series = result["actual"]
+            last_complete = result["last_complete"]
 
             purchase_months = forecast_engine.monthly_purchase_orders(
                 sheets["Purchase Orders"], filters
@@ -859,6 +862,65 @@ elif selected_tab == "Forecast":
                     f"{mape:.1%}" if mape is not None else "n/a",
                     help=f"Rolling previous 12 months (Weighted) · {window_label(result['mape_window'])}",
                 )
+
+                # --- 2026 FORECAST VS ACTUAL OVERVIEW (YTD, YTG, FULL YEAR) ---
+                this_year_periods = pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
+                ytd_periods = [p for p in this_year_periods if p <= last_complete]
+                ytg_periods = [p for p in this_year_periods if p > last_complete]
+
+                # Map forecasts into a indexed Series for calculation
+                fc_this_series = pd.Series(
+                    forecast_this_year["Forecast"].values,
+                    index=pd.to_datetime(forecast_this_year["Date"]).dt.to_period("M")
+                ) if not forecast_this_year.empty else pd.Series(dtype=float)
+
+                if metric == "GP%":
+                    ytd_act = float(actual_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
+                    ytd_fc = float(fc_this_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
+                    ytg_fc = float(fc_this_series.reindex(ytg_periods).mean()) if ytg_periods else np.nan
+                    fy_act_fc = float(pd.concat([actual_series.reindex(ytd_periods), fc_this_series.reindex(ytg_periods)]).mean())
+                    fy_fc = float(fc_this_series.reindex(this_year_periods).mean())
+                else:
+                    ytd_act = float(actual_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
+                    ytd_fc = float(fc_this_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
+                    ytg_fc = float(fc_this_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
+                    fy_act_fc = ytd_act + ytg_fc
+                    fy_fc = float(fc_this_series.reindex(this_year_periods).sum())
+
+                ytd_diff = ytd_act - ytd_fc if pd.notna(ytd_act) and pd.notna(ytd_fc) else np.nan
+                ytd_pct = (ytd_diff / ytd_fc * 100) if pd.notna(ytd_diff) and ytd_fc != 0 else np.nan
+
+                fy_diff = fy_act_fc - fy_fc if pd.notna(fy_act_fc) and pd.notna(fy_fc) else np.nan
+                fy_pct = (fy_diff / fy_fc * 100) if pd.notna(fy_diff) and fy_fc != 0 else np.nan
+
+                st.markdown(f"### 📊 {this_year} Forecast vs Actual Overview")
+                o_col1, o_col2, o_col3, o_col4 = st.columns(4)
+
+                fmt_str = lambda x: f"{x:.1f}%" if metric == "GP%" else f"{forecast_label_prefix}{x:,.0f}"
+
+                o_col1.metric(
+                    "YTD Actual vs Forecast",
+                    fmt_str(ytd_act),
+                    delta=f"{ytd_diff:+.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a",
+                    help=f"Actuals from Jan {this_year} to {last_complete.strftime('%b %Y')} vs blended forecast.",
+                )
+                o_col2.metric(
+                    "YTG Forecast Remaining",
+                    fmt_str(ytg_fc),
+                    help=f"Blended forecast for remaining months of {this_year}.",
+                )
+                o_col3.metric(
+                    "Full Year Outlook (Actual + Forecast)",
+                    fmt_str(fy_act_fc),
+                    delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Full Year Baseline FC" if pd.notna(fy_diff) else "n/a",
+                    help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
+                )
+                o_col4.metric(
+                    "Full Year Baseline Forecast",
+                    fmt_str(fy_fc),
+                    help=f"Original full-year blended forecast for {this_year}.",
+                )
+                # --------------------------------------------------------------
 
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
@@ -1044,54 +1106,11 @@ elif selected_tab == "Forecast":
                 )
                 graph_table.columns.name = None
 
-                # Calculate Total and Forecast vs Actual Variance (+/- and %)
+                # Calculate Total for each series
                 if metric == "GP%":
                     graph_table["Total"] = graph_table[forecast_engine.MONTHS].mean(axis=1)
                 else:
                     graph_table["Total"] = graph_table[forecast_engine.MONTHS].sum(axis=1)
-
-                diffs = []
-                pcts = []
-                for idx, row in graph_table.iterrows():
-                    series_name = str(row["Series"])
-                    if series_name.startswith("Forecast "):
-                        target_year = series_name.removeprefix("Forecast ")
-                        if target_year in graph_table["Series"].values:
-                            actual_row = graph_table.loc[graph_table["Series"].eq(target_year)]
-                            if not actual_row.empty:
-                                fc_val = row["Total"]
-                                act_val = actual_row.iloc[0]["Total"]
-                                if pd.notna(fc_val) and pd.notna(act_val) and act_val != 0:
-                                    diff = fc_val - act_val
-                                    pct = (diff / act_val) * 100
-                                    diffs.append(diff)
-                                    pcts.append(pct)
-                                    continue
-                    diffs.append(np.nan)
-                    pcts.append(np.nan)
-
-                graph_table["+/-"] = diffs
-                graph_table["%"] = pcts
-
-                # --- NEW METRIC CARDS FOR FORECAST VS ACTUAL VARIANCE ---
-                # Find current year forecast vs actual values if available
-                fc_series_name = f"Forecast {this_year}"
-                if fc_series_name in graph_table["Series"].values and str(this_year) in graph_table["Series"].values:
-                    fc_row = graph_table.loc[graph_table["Series"].eq(fc_series_name)].iloc[0]
-                    act_row = graph_table.loc[graph_table["Series"].eq(str(this_year))].iloc[0]
-                    
-                    fc_tot = fc_row["Total"]
-                    act_tot = act_row["Total"]
-                    if pd.notna(fc_tot) and pd.notna(act_tot):
-                        diff_val = fc_tot - act_tot
-                        pct_val = (diff_val / act_tot) * 100 if act_tot != 0 else 0.0
-                        
-                        st.markdown(f"### {this_year} Forecast vs Actual Overview")
-                        v_col1, v_col2, v_col3 = st.columns(3)
-                        v_col1.metric(f"Forecast {this_year} Total", f"{forecast_label_prefix}{fc_tot:,.0f}" if metric != "GP%" else f"{fc_tot:.1f}%")
-                        v_col2.metric(f"Actual {this_year} Total", f"{forecast_label_prefix}{act_tot:,.0f}" if metric != "GP%" else f"{act_tot:.1f}%")
-                        v_col3.metric("Variance (+/- & %)", f"{'+' if diff_val > 0 else ''}{forecast_label_prefix}{diff_val:,.0f}" if metric != "GP%" else f"{'+' if diff_val > 0 else ''}{diff_val:.1f}%", delta=f"{pct_val:+.1f}%")
-                # --------------------------------------------------------
 
                 formatted_graph_table = graph_table.copy()
                 for col in forecast_engine.MONTHS:
@@ -1112,14 +1131,6 @@ elif selected_tab == "Forecast":
                 if "Total" in formatted_graph_table.columns:
                     formatted_graph_table["Total"] = formatted_graph_table["Total"].apply(
                         lambda x: (f"{x:.1f}%" if metric == "GP%" else (f"${x:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{x:,.0f}")) if pd.notna(x) else ""
-                    )
-                if "+/-" in formatted_graph_table.columns:
-                    formatted_graph_table["+/-"] = formatted_graph_table["+/-"].apply(
-                        lambda x: f"{'+' if x > 0 else ''}{x:,.0f}" if pd.notna(x) else ""
-                    )
-                if "%" in formatted_graph_table.columns:
-                    formatted_graph_table["%"] = formatted_graph_table["%"].apply(
-                        lambda x: f"{'+' if x > 0 else ''}{x:.1f}%" if pd.notna(x) else ""
                     )
 
                 st.dataframe(
