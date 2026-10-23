@@ -320,7 +320,6 @@ with data_tab:
 
 
 with forecast_tab:
-with forecast_tab:
     st.subheader("Forecast Planner")
     prepared_data = None
     source_names = []
