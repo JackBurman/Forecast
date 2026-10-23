@@ -32,9 +32,6 @@ def _streamlit_version() -> tuple[int, ...]:
     return tuple(parts)
 
 
-# Streamlit 1.51+ replaced use_container_width=True with width="stretch" and
-# shows a deprecation banner for the old argument. Older versions only know
-# the old argument. Pass **FULL_WIDTH to buttons, tables and charts.
 FULL_WIDTH = (
     {"width": "stretch"}
     if _streamlit_version() >= (1, 51)
@@ -42,6 +39,10 @@ FULL_WIDTH = (
 )
 
 MONTH_NUMBER_TO_NAME = dict(enumerate(forecast_engine.MONTHS, start=1))
+FY_MONTHS = [
+    "July", "August", "September", "October", "November", "December",
+    "January", "February", "March", "April", "May", "June"
+]
 
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
@@ -59,11 +60,6 @@ def load_csv(path: str | Path) -> pd.DataFrame:
 
 
 def to_number(series: pd.Series) -> pd.Series:
-    """Coerce values like '1,234.50', '$1,234', '45%', '(12)' or blanks to floats.
-
-    Anything that is not numeric (including repeated header rows that survive a
-    multi-file merge) becomes NaN instead of raising.
-    """
     text = (
         series.astype(str)
         .str.strip()
@@ -74,11 +70,6 @@ def to_number(series: pd.Series) -> pd.Series:
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
-    """Parse a Date column that may mix Excel serials, real datetimes and text.
-
-    Text dates are read day-first (23/10/2026), which is what Australian
-    exports produce; ISO dates (2026-10-23) are unaffected.
-    """
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
     is_serial = series.map(
@@ -101,7 +92,6 @@ def parse_dates(series: pd.Series) -> pd.Series:
 
 
 def normalize_sku(value):
-    """Preserve numeric SKUs as integers and alphanumeric SKUs as text."""
     if pd.isna(value):
         return pd.NA
     text = str(value).strip()
@@ -115,10 +105,7 @@ def normalize_sku(value):
 
 @st.cache_data
 def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.DataFrame:
-    """Apply the Power Query-style transformation to the sales sample file."""
     sales = df_sales.copy()
-
-    # Clean and standardize column names
     sales.columns = [str(col).strip() for col in sales.columns]
 
     rename_map = {
@@ -151,7 +138,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
     sales = sales.dropna(how="all").reset_index(drop=True)
 
-    # Carry location labels down the sales export.
     sales["Location"] = pd.NA
     location_mask = (
         sales["Inv #"].astype(str).str.upper().str.startswith("LOCATION:", na=False)
@@ -179,7 +165,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
         sales["Stock Code"].astype(str).str.strip().str.replace("\r", "")
     )
 
-    # Enrich sales rows with product metadata.
     options_lookup = df_options.copy()
     options_lookup["SKU"] = options_lookup["Stock Code"].map(normalize_sku)
     options_lookup = options_lookup[
@@ -217,7 +202,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     sales["Month"] = sales["Date"].dt.month_name()
     sales["Year"] = sales["Date"].dt.year
 
-    # Convert every numeric column once, before any filtering relies on it.
     sales = sales.rename(columns={"Total": "Sale"})
     for column in ["Qty", "Sale", "Cost", "GP%", "GP $"]:
         if column in sales.columns:
@@ -249,7 +233,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
         return "Other"
 
     sales["Sales Channel Net"] = sales["Sales Channel"].map(sales_channel_net)
-
     sales = sales.drop_duplicates(subset=["Inv #", "SKU", "Sale"]).copy()
 
     final_columns = [
@@ -314,26 +297,12 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
-# ---------------------------------------------------------------------------
-# Forecasting
-#
-# This-year forecast  : additive Holt-Winters (ETS) fitted to monthly history
-#                       before 1 January, blended with a year-on-year trend
-#                       projection (same month last year × last year's growth).
-# Next-year forecast  : this year's actual month × this year's growth where a
-#                       complete month exists, otherwise this year's forecast.
-# Rolling 12 months   : the 12 months after the current month, summed.
-# Historical wMAPE    : the same method back-tested as a weighted MAPE on
-#                       the previous 12 complete months.
-# ---------------------------------------------------------------------------
-
 SEASON = 12
 GROWTH_FLOOR, GROWTH_CAP = 0.5, 1.2
-DEFAULT_GROWTH = 1.05  # used for next year when there is no prior-year base
+DEFAULT_GROWTH = 1.05
 
 
 def monthly_series(sales: pd.DataFrame, metric: str, before: pd.Timestamp | None = None) -> pd.Series:
-    """Aggregate dated sales into a gap-free monthly series (PeriodIndex)."""
     if metric not in sales.columns or "Date" not in sales.columns:
         return pd.Series(dtype=float)
     dated = sales.dropna(subset=["Date"])
@@ -350,7 +319,6 @@ def monthly_series(sales: pd.DataFrame, metric: str, before: pd.Timestamp | None
 
 
 def _holt_winters_run(y: list[float], alpha: float, beta: float, gamma: float, phi: float, horizon: int):
-    """One pass of additive Holt-Winters with a damped trend; returns (forecast, SSE)."""
     n = len(y)
     level = sum(y[:SEASON]) / SEASON
     trend = (sum(y[SEASON : 2 * SEASON]) / SEASON - level) / SEASON
@@ -360,7 +328,7 @@ def _holt_winters_run(y: list[float], alpha: float, beta: float, gamma: float, p
         index = t % SEASON
         s = seasonal[index]
         predicted = level + phi * trend + s
-        if t >= SEASON:  # skip the initialisation season
+        if t >= SEASON:
             error = y[t] - predicted
             sse += error * error
         new_level = alpha * (y[t] - s) + (1 - alpha) * (level + phi * trend)
@@ -377,12 +345,6 @@ def _holt_winters_run(y: list[float], alpha: float, beta: float, gamma: float, p
 
 @st.cache_data(show_spinner=False)
 def holt_winters(values: tuple[float, ...], horizon: int) -> tuple[float, ...]:
-    """ETS forecast `horizon` months past the end of `values`.
-
-    Smoothing parameters are chosen by grid search on one-step-ahead error.
-    With fewer than two seasons of history it falls back to seasonal naive,
-    and with less than one season to the mean.
-    """
     y = [float(value) for value in values]
     n = len(y)
     if n == 0:
@@ -410,7 +372,6 @@ def clamp_growth(ratio: float) -> float:
 
 
 def yoy_growth(history: pd.Series) -> float | None:
-    """Last 12 months over the 12 before, clamped; None without two full years."""
     if len(history) < 2 * SEASON:
         return None
     recent = float(history.iloc[-SEASON:].sum())
@@ -428,11 +389,6 @@ def blended_forecast(
     bias: float,
     clip_at_zero: bool,
 ) -> pd.Series:
-    """ETS forecast from `start`, blended with the YoY trend projection.
-
-    forecast[m] = (1 - w) × ETS[m] + w × (actual[m - 12 months] × growth),
-    using the ETS value alone where no prior-year month exists.
-    """
     periods = pd.period_range(start, periods=horizon, freq="M")
     history = history[history.index < start]
     if history.empty:
@@ -466,7 +422,6 @@ def next_year_forecast(
     last_complete: pd.Period,
     bias: float,
 ) -> pd.Series:
-    """Next year by month: this year's complete actual × growth, else this year's forecast."""
     this_year_months = [
         period
         for period in pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
@@ -502,7 +457,6 @@ def next_year_forecast(
 def rolling_wmape(
     actual: pd.Series, last_complete: pd.Period, yoy_weight: float, bias: float, clip_at_zero: bool
 ) -> tuple[float | None, pd.PeriodIndex]:
-    """Back-test using Weighted MAPE (wMAPE) over the previous 12 complete months."""
     window = pd.period_range(last_complete - (SEASON - 1), periods=SEASON, freq="M")
     predicted = blended_forecast(actual, window[0], SEASON, yoy_weight, bias, clip_at_zero)
     observed = actual.reindex(window)
@@ -526,7 +480,6 @@ def build_forecasts(
     bias: float,
     today: pd.Timestamp | None = None,
 ) -> dict:
-    """Everything the Forecast tab needs, computed from the filtered sales."""
     today = (today or pd.Timestamp.today()).normalize()
     current_period = today.to_period("M")
     current_month_start = current_period.to_timestamp()
@@ -612,7 +565,6 @@ automatic_source_refresh()
 
 
 def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Render Options Data filters and return the filtered dataframe."""
     filtered = df.copy()
 
     with st.sidebar.expander("Options Data Filters", expanded=True):
@@ -652,7 +604,6 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-# Tab-style navigation (Forecast positioned at the beginning).
 selected_tab = st.radio(
     "View",
     ["Forecast", "Options Data", "Formatted Data"],
@@ -681,9 +632,16 @@ if selected_tab == "Forecast":
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
             
-            planner_col, source_col = st.columns([2, 1])
+            planner_col, year_type_col = st.columns([2, 1])
             with planner_col:
                 st.subheader("Forecast Planner")
+            with year_type_col:
+                year_view = st.selectbox(
+                    "Year Type View",
+                    ["Calendar Year (Jan-Dec)", "Financial Year (Jul-Jun)"],
+                    index=0,
+                    key="year_type_view_select"
+                )
 
             def choices_for(series: pd.Series) -> list[str]:
                 values = sorted(
@@ -786,7 +744,6 @@ if selected_tab == "Forecast":
             if result["actual"].empty:
                 st.warning("No completed months of dated sales match these selections.")
             else:
-                # Open POs due by the end of the rolling window, including overdue ones.
                 total_po = 0.0
                 if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
                     purchase_months.columns
@@ -882,6 +839,50 @@ if selected_tab == "Forecast":
                     fmt_str(fy_fc),
                     help=f"Original full-year blended forecast for {this_year}.",
                 )
+
+                # --- THIS YEAR VS PREVIOUS YEAR PERFORMANCE ---
+                prior_year = this_year - 1
+                prior_year_periods = pd.period_range(f"{prior_year}-01", periods=SEASON, freq="M")
+                prior_ytd_periods = [p - SEASON for p in ytd_periods]
+
+                if metric == "GP%":
+                    prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).mean()) if prior_ytd_periods else np.nan
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).mean()) if prior_year_periods else np.nan
+                else:
+                    prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if prior_year_periods else 0.0
+
+                py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
+                py_ytd_pct = (py_ytd_diff / prior_ytd_act * 100) if pd.notna(py_ytd_diff) and prior_ytd_act != 0 else np.nan
+
+                py_fy_diff = fy_act_fc - prior_fy_act if pd.notna(fy_act_fc) and pd.notna(prior_fy_act) else np.nan
+                py_fy_pct = (py_fy_diff / prior_fy_act * 100) if pd.notna(py_fy_diff) and prior_fy_act != 0 else np.nan
+
+                st.markdown(f"### 📈 Performance: {this_year} vs {prior_year}")
+                p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+
+                p_col1.metric(
+                    f"{this_year} YTD Actuals",
+                    fmt_str(ytd_act),
+                    delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_year}" if pd.notna(py_ytd_diff) else "n/a",
+                    help=f"Actual performance through {last_complete.strftime('%b %Y')} compared to same period in {prior_year}.",
+                )
+                p_col2.metric(
+                    f"{prior_year} Same-Period YTD",
+                    fmt_str(prior_ytd_act),
+                    help=f"Actuals from Jan {prior_year} through {last_complete.strftime('%b')} {prior_year}.",
+                )
+                p_col3.metric(
+                    f"{this_year} Full Year Outlook",
+                    fmt_str(fy_act_fc),
+                    delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_year} Total" if pd.notna(py_fy_diff) else "n/a",
+                    help=f"Full year {this_year} projected outlook vs total actual performance in {prior_year}.",
+                )
+                p_col4.metric(
+                    f"{prior_year} Full Year Actuals",
+                    fmt_str(prior_fy_act),
+                    help=f"Total actual performance across all 12 months of {prior_year}.",
+                )
                 # --------------------------------------------------------------
 
                 annual_profile = forecast_engine.yearly_monthly_profile(
@@ -901,7 +902,9 @@ if selected_tab == "Forecast":
                 )
                 year_labels = [str(column) for column in year_columns]
 
-                st.subheader("Monthly comparison by year")
+                month_sort_order = FY_MONTHS if "Financial Year" in year_view else forecast_engine.MONTHS
+                st.subheader(f"Monthly comparison by year ({'FY Jul-Jun' if 'Financial Year' in year_view else 'Calendar Jan-Dec'})")
+
                 actual_chart_data = annual_profile.melt(
                     id_vars="Month", var_name="Year", value_name="Value"
                 ).dropna(subset=["Value"])
@@ -961,7 +964,6 @@ if selected_tab == "Forecast":
                 ]
                 value_format = ",.0f" if metric != "GP%" else ".1f"
                 
-                # Use st.session_state to store legend selections persistently across filter changes
                 if "legend_selection_state" not in st.session_state:
                     st.session_state["legend_selection_state"] = None
 
@@ -977,7 +979,7 @@ if selected_tab == "Forecast":
                     alt.Chart(chart_data)
                     .mark_line(point=True)
                     .encode(
-                        x=alt.X("Month:N", sort=forecast_engine.MONTHS, title="Month"),
+                        x=alt.X("Month:N", sort=month_sort_order, title="Month"),
                         y=alt.Y("Value:Q", title=metric, scale=alt.Scale(zero=False)),
                         color=alt.Color(
                             "Series:N",
@@ -1005,7 +1007,7 @@ if selected_tab == "Forecast":
                 )
 
                 month_hover_charts = []
-                for month in forecast_engine.MONTHS:
+                for month in month_sort_order:
                     rows = annual_profile.loc[annual_profile["Month"].eq(month)]
                     tooltip_row = {"Month": month}
                     tooltip_fields = []
@@ -1044,7 +1046,7 @@ if selected_tab == "Forecast":
                             alt.Chart(pd.DataFrame([tooltip_row]))
                             .mark_rule(color="#667085", strokeWidth=12)
                             .encode(
-                                x=alt.X("Month:N", sort=forecast_engine.MONTHS),
+                                x=alt.X("Month:N", sort=month_sort_order),
                                 opacity=alt.condition(
                                     month_hover_selection,
                                     alt.value(0.18),
@@ -1056,7 +1058,6 @@ if selected_tab == "Forecast":
                             .add_params(month_hover_selection)
                         )
                 
-                # Capture chart selection events to persist legend state and prevent resets on filter change
                 chart_event = st.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts),
                     key="forecast_monthly_chart",
@@ -1077,19 +1078,18 @@ if selected_tab == "Forecast":
                 graph_table = (
                     chart_data.drop_duplicates(subset=["Series", "Month"], keep="last")
                     .pivot(index="Series", columns="Month", values="Value")
-                    .reindex(index=series_order, columns=forecast_engine.MONTHS)
+                    .reindex(index=series_order, columns=month_sort_order)
                     .reset_index()
                 )
                 graph_table.columns.name = None
 
-                # Calculate Total for each series
                 if metric == "GP%":
-                    graph_table["Total"] = graph_table[forecast_engine.MONTHS].mean(axis=1)
+                    graph_table["Total"] = graph_table[month_sort_order].mean(axis=1)
                 else:
-                    graph_table["Total"] = graph_table[forecast_engine.MONTHS].sum(axis=1)
+                    graph_table["Total"] = graph_table[month_sort_order].sum(axis=1)
 
                 formatted_graph_table = graph_table.copy()
-                for col in forecast_engine.MONTHS:
+                for col in month_sort_order:
                     if col in formatted_graph_table.columns:
                         if metric in ["Sale", "Cost", "GP $"]:
                             formatted_graph_table[col] = formatted_graph_table[col].apply(
