@@ -523,31 +523,63 @@ elif selected_tab == "Forecast":
 
             target_data = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
 
-            actual, forecast, mape = forecast_engine.calculate_forecast(
+            # Separate Forecast calculations for 2026 and 2027
+            actual_26, forecast_2026, mape_26 = forecast_engine.calculate_forecast(
                 target_data,
                 metric,
-                forecast_from,
+                pd.Timestamp("2026-01-01"),
                 bias,
                 confidence_alpha,
             )
-            
-            # Ensure forecast has 'Date' column as a regular column
-            if not forecast.empty and "Date" not in forecast.columns:
-                forecast = forecast.reset_index()
+            if not forecast_2026.empty and "Date" not in forecast_2026.columns:
+                forecast_2026 = forecast_2026.reset_index()
 
-            # Compound multi-year growth scaling so future projections project past the 2026 mirror
-            if not selected_sales.empty and not forecast.empty and metric != "GP%":
+            actual_27, forecast_2027, mape_27 = forecast_engine.calculate_forecast(
+                target_data,
+                metric,
+                pd.Timestamp("2027-01-01"),
+                bias,
+                confidence_alpha,
+            )
+            if not forecast_2027.empty and "Date" not in forecast_2027.columns:
+                forecast_2027 = forecast_2027.reset_index()
+
+            mape = mape_27 if mape_27 is not None else mape_26
+            actual = actual_27 if not actual_27.empty else actual_26
+
+            # Apply separate 2026 vs 2027 logic: 2027 trends from actual 2026 sales or falls back to 2026 forecast
+            if not selected_sales.empty and metric != "GP%":
                 monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
-                for idx, row in forecast.iterrows():
+                
+                # 2026 Forecast logic
+                for idx, row in forecast_2026.iterrows():
                     m_num = row["Date"].month
-                    row_year = row["Date"].year
-                    if m_num in monthly_actuals.index:
-                        act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else pd.NA
-                        act_2026 = monthly_actuals.loc[m_num, 2026] if 2026 in monthly_actuals.columns else pd.NA
-                        if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0:
-                            yoy_growth_rate = act_2026 / act_2025
-                            years_ahead = max(1, row_year - 2026) if row_year > 2026 else 1
-                            forecast.loc[idx, "Forecast"] = act_2026 * (yoy_growth_rate ** years_ahead)
+                    if m_num in monthly_actuals.index and 2025 in monthly_actuals.columns and 2024 in monthly_actuals.columns:
+                        act_2025 = monthly_actuals.loc[m_num, 2025]
+                        act_2024 = monthly_actuals.loc[m_num, 2024]
+                        if pd.notna(act_2025) and pd.notna(act_2024) and act_2024 > 0:
+                            forecast_2026.loc[idx, "Forecast"] = act_2025 * (act_2025 / act_2024)
+
+                # 2027 Forecast logic: based on 2026 actual sales, falling back to 2026 forecast if empty
+                for idx, row in forecast_2027.iterrows():
+                    m_num = row["Date"].month
+                    if m_num in monthly_actuals.index and 2026 in monthly_actuals.columns:
+                        act_2026_val = monthly_actuals.loc[m_num, 2026]
+                        if pd.notna(act_2026_val) and act_2026_val > 0:
+                            # Trend based on 2026 actual sales with a slight progression or YoY rate
+                            act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else act_2026_val
+                            yoy_rate = (act_2026_val / act_2025) if (pd.notna(act_2025) and act_2025 > 0) else 1.05
+                            forecast_2027.loc[idx, "Forecast"] = act_2026_val * yoy_rate
+                        else:
+                            # Fallback to 2026 forecast value for this month
+                            match_26 = forecast_2026.loc[forecast_2026["Date"].dt.month == m_num, "Forecast"]
+                            if not match_26.empty:
+                                forecast_2027.loc[idx, "Forecast"] = match_26.iloc[0]
+
+            if forecast_year == 2026:
+                forecast = forecast_2026
+            else:
+                forecast = forecast_2027
 
             if metric == "GP%" and not forecast.empty:
                 avg_forecast_val = forecast["Forecast"].mean()
@@ -608,40 +640,9 @@ elif selected_tab == "Forecast":
                     )
                     .dropna(subset=[metric])
                 )
-                forecast_year_num = pd.Timestamp.today().year
-                full_year_forecast = forecast_engine.forecast_calendar_year(
-                    selected_sales,
-                    metric,
-                    forecast_year_num,
-                    forecast_from,
-                    bias,
-                    confidence_alpha,
-                )
-                if not full_year_forecast.empty and "Date" not in full_year_forecast.columns:
-                    full_year_forecast = full_year_forecast.reset_index()
-                
-                # Apply compound growth scaling to full-year forecast for chart generation
-                if not forecast_year_num in full_year_forecast.columns.astype(str) and not full_year_forecast.empty and metric != "GP%":
-                    monthly_actuals_full = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
-                    for idx, row in full_year_forecast.iterrows():
-                        m_num = row["Date"].month
-                        row_year = row["Date"].year
-                        if m_num in monthly_actuals_full.index:
-                            act_2025 = monthly_actuals_full.loc[m_num, 2025] if 2025 in monthly_actuals_full.columns else pd.NA
-                            act_2026 = monthly_actuals_full.loc[m_num, 2026] if 2026 in monthly_actuals_full.columns else pd.NA
-                            if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0:
-                                yoy_growth_rate = act_2026 / act_2025
-                                years_ahead = max(1, row_year - 2026) if row_year > 2026 else 1
-                                full_year_forecast.loc[idx, "Forecast"] = act_2026 * (yoy_growth_rate ** years_ahead)
-
-                if metric == "GP%" and not full_year_forecast.empty:
-                    full_year_forecast["Forecast"] = full_year_forecast["Forecast"].mean()
 
                 forecast_chart_data = pd.concat(
-                    [
-                        forecast.loc[forecast["Date"].dt.year.gt(forecast_year_num)],
-                        full_year_forecast,
-                    ],
+                    [forecast_2026, forecast_2027],
                     ignore_index=True,
                 )
                 forecast_chart_data["Year"] = forecast_chart_data["Date"].dt.year.astype(str)
