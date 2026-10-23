@@ -9,26 +9,6 @@ import forecast_engine  # type: ignore
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 
-# Top-right manual refresh button container
-top_left, top_right = st.columns([8, 2])
-with top_left:
-    st.title("📦 Inventory & Purchasing System Migration")
-    st.subheader("Options Data Integration")
-with top_right:
-    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
-    if st.button("🔄 Refresh data", use_container_width=True):
-        load_csv.clear()
-        load_raw_folder_data.clear()
-        st.rerun()
-
-st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
-    unsafe_allow_html=True,
-)
-
-
-st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
-
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
@@ -297,6 +277,26 @@ def load_raw_folder_data(
         "Sales Data": formatted_sales,
     }
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
+
+
+# Top-right manual refresh button container
+top_left, top_right = st.columns([8, 2])
+with top_left:
+    st.title("📦 Inventory & Purchasing System Migration")
+    st.subheader("Options Data Integration")
+with top_right:
+    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh data", use_container_width=True):
+        load_csv.clear()
+        load_raw_folder_data.clear()
+        st.rerun()
+
+st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
+
+st.sidebar.markdown(
+    "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
+    unsafe_allow_html=True,
+)
 
 
 # Automatic source-data refresh limitation note:
