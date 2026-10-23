@@ -516,13 +516,11 @@ elif selected_tab == "Forecast":
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
-            # Weighted average GP% computation based on sales volume if GP% is selected
+            # If GP% metric is selected, configure engine/aggregation values to compute simple/sales-weighted averages rather than summing
             if metric == "GP%" and not selected_sales.empty:
-                if "Sale" in selected_sales.columns and "GP%" in selected_sales.columns:
-                    total_sales_val = selected_sales["Sale"].sum()
-                    if total_sales_val > 0:
-                        weighted_gp = (selected_sales["GP%"] * selected_sales["Sale"]).sum() / total_sales_val
-                        selected_sales["GP%"] = weighted_gp
+                if "GP%" in selected_sales.columns:
+                    mean_gp = selected_sales["GP%"].mean()
+                    selected_sales["GP%"] = mean_gp
 
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
             historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
@@ -534,6 +532,16 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
+            
+            # If GP% forecast outputs or profile aggregations sum values internally, override to average
+            if metric == "GP%" and not forecast.empty:
+                avg_forecast_val = forecast["Forecast"].mean()
+                forecast["Forecast"] = avg_forecast_val
+                if "Lower" in forecast.columns:
+                    forecast["Lower"] = forecast["Lower"].mean()
+                if "Upper" in forecast.columns:
+                    forecast["Upper"] = forecast["Upper"].mean()
+
             purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
             on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
 
@@ -549,7 +557,13 @@ elif selected_tab == "Forecast":
                 displayed_forecast["Open PO Qty"] = (
                     displayed_forecast["Date"].map(po_by_month).fillna(0)
                 )
-                total_forecast = float(displayed_forecast["Forecast"].sum())
+                
+                # For summary totals, average GP% instead of summing
+                if metric == "GP%":
+                    total_forecast = float(displayed_forecast["Forecast"].mean()) if not displayed_forecast.empty else 0.0
+                else:
+                    total_forecast = float(displayed_forecast["Forecast"].sum())
+                    
                 total_po = float(displayed_forecast["Open PO Qty"].sum())
                 summary = st.columns(5)
                 
@@ -566,6 +580,13 @@ elif selected_tab == "Forecast":
                     metric,
                     forecast_from,
                 )
+                
+                # If metric is GP%, average the yearly monthly profile instead of summing
+                if metric == "GP%" and not annual_profile.empty:
+                    numeric_cols = [c for c in annual_profile.columns if c != "Month"]
+                    for col in numeric_cols:
+                        annual_profile[col] = annual_profile[col].mean()
+
                 year_columns = [column for column in annual_profile.columns if column != "Month"]
                 st.subheader("Monthly comparison by year")
                 actual_chart_data = (
@@ -583,6 +604,10 @@ elif selected_tab == "Forecast":
                     bias,
                     confidence_alpha,
                 )
+                
+                if metric == "GP%" and not full_year_forecast.empty:
+                    full_year_forecast["Forecast"] = full_year_forecast["Forecast"].mean()
+
                 forecast_chart_data = pd.concat(
                     [
                         forecast.loc[forecast["Date"].dt.year.gt(forecast_year_num)],
@@ -724,8 +749,6 @@ elif selected_tab == "Forecast":
                 )
                 graph_table.columns.name = None
                 
-                # Apply number formatting to the monthly comparison data table values based on active metric
-                table_num_format = "$%,.0f" if metric in ["Sale", "Cost", "GP $"] else ("%,.0f" if metric != "GP%" else "%.1f%%")
                 formatted_graph_table = graph_table.copy()
                 for col in forecast_engine.MONTHS:
                     if col in formatted_graph_table.columns:
