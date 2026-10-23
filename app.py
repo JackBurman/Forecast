@@ -523,7 +523,7 @@ elif selected_tab == "Forecast":
 
             target_data = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
 
-            # Separate Forecast calculations for 2026 and 2027
+            # Separate Forecast calculations for 2026 and 2027 with guaranteed Date reset
             actual_26, forecast_2026, mape_26 = forecast_engine.calculate_forecast(
                 target_data,
                 metric,
@@ -531,8 +531,11 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
-            if not forecast_2026.empty and "Date" not in forecast_2026.columns:
-                forecast_2026 = forecast_2026.reset_index()
+            if not forecast_2026.empty:
+                if "Date" not in forecast_2026.columns:
+                    forecast_2026 = forecast_2026.reset_index()
+                if "Date" not in forecast_2026.columns and "index" in forecast_2026.columns:
+                    forecast_2026 = forecast_2026.rename(columns={"index": "Date"})
 
             actual_27, forecast_2027, mape_27 = forecast_engine.calculate_forecast(
                 target_data,
@@ -541,8 +544,11 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
-            if not forecast_2027.empty and "Date" not in forecast_2027.columns:
-                forecast_2027 = forecast_2027.reset_index()
+            if not forecast_2027.empty:
+                if "Date" not in forecast_2027.columns:
+                    forecast_2027 = forecast_2027.reset_index()
+                if "Date" not in forecast_2027.columns and "index" in forecast_2027.columns:
+                    forecast_2027 = forecast_2027.rename(columns={"index": "Date"})
 
             mape = mape_27 if mape_27 is not None else mape_26
             actual = actual_27 if not actual_27.empty else actual_26
