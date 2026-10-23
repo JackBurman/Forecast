@@ -489,7 +489,7 @@ elif selected_tab == "Forecast":
                     "Forecast from Year",
                     min_value=2000,
                     max_value=2100,
-                    value=2024,
+                    value=2027,  # Default set to 2027 to incorporate 2026 results
                     step=1,
                 )
                 forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
@@ -761,20 +761,17 @@ elif selected_tab == "Forecast":
                     height=220,
                 )
 
-                # Product-Level Performance & Forecast Intelligence Section
                 st.markdown("---")
                 st.subheader("📦 Product-Level Performance & Forecast Intelligence")
 
                 col_up, col_down = st.columns(2)
 
+                sku_col = "SKU Key" if "SKU Key" in selected_sales.columns else "SKU"
+                model_col = "Model" if "Model" in selected_sales.columns else "Description"
+
                 with col_up:
                     st.markdown("#### 🟢 Product Drivers of Uplift")
                     if not selected_sales.empty:
-                        # Highest contributing SKUs / Models
-                        sku_col = "SKU Key" if "SKU Key" in selected_sales.columns else "SKU"
-                        model_col = "Model" if "Model" in selected_sales.columns else "Description"
-                        class_col = "OptionsData.Fourth Product Group" if "OptionsData.Fourth Product Group" in selected_sales.columns else "OptionsData.Class"
-
                         top_skus = selected_sales.groupby(sku_col)[metric].sum().nlargest(3)
                         top_models = selected_sales.groupby(model_col)[metric].sum().nlargest(3)
 
