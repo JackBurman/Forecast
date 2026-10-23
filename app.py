@@ -461,7 +461,7 @@ def rolling_wmape(
     predicted = blended_forecast(actual, window[0], SEASON, yoy_weight, bias, clip_at_zero)
     observed = actual.reindex(window)
     valid = observed.notna() & observed.ne(0) & predicted.notna()
-    if not valid.any():
+    if not valid.empty:
         return None, window
     
     abs_errors = (observed[valid] - predicted[valid]).abs()
