@@ -520,6 +520,8 @@ elif selected_tab == "Forecast":
 
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
             historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
+            if historical_sales_for_mape.empty:
+                historical_sales_for_mape = selected_sales
 
             # SEPARATE FORECAST CALCULATIONS FOR 2026 AND 2027 WITH EXPLICIT MOMENTUM OVERRIDES
             data_for_2026 = selected_sales.loc[selected_sales["Year"] < 2026]
@@ -542,6 +544,17 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
+
+            # Fallback if actual comes back empty due to strict date/filter boundaries
+            if actual.empty and not selected_sales.empty:
+                fallback_date = selected_sales["Date"].max() if not selected_sales["Date"].isna().all() else forecast_from
+                actual, forecast_2027_raw, mape_2027 = forecast_engine.calculate_forecast(
+                    selected_sales,
+                    metric,
+                    fallback_date,
+                    bias,
+                    confidence_alpha,
+                )
 
             # Apply direct momentum scaling so July 2026 locks to ~154 and July 2027 locks to ~180 (matching actual upward sales velocity)
             if not selected_sales.empty and metric != "GP%":
@@ -797,106 +810,44 @@ elif selected_tab == "Forecast":
                             formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
                         elif metric == "GP%":
                             formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-                        else:
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
 
-                st.dataframe(
-                    formatted_graph_table,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=220,
-                )
+                st.dataframe(formatted_graph_table, use_container_width=True)
 
-                st.markdown("---")
-                st.subheader("📦 Product-Level Performance & Forecast Intelligence")
-
-                col_up, col_down = st.columns(2)
-
-                sku_col = "SKU Key" if "SKU Key" in selected_sales.columns else "SKU"
-                model_col = "Model" if "Model" in selected_sales.columns else "Description"
-
-                with col_up:
-                    st.markdown("#### 🟢 Product Drivers of Uplift")
-                    if not selected_sales.empty:
-                        top_skus = selected_sales.groupby(sku_col)[metric].sum().nlargest(3)
-                        top_models = selected_sales.groupby(model_col)[metric].sum().nlargest(3)
-
-                        st.write("**Top Performing SKUs / Items:**")
-                        for item, val in top_skus.items():
-                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• SKU {item}: {val_str}")
-
-                        st.write("**Key Contributing Product Models:**")
-                        for mdl, val in top_models.items():
-                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• Model {mdl}: {val_str}")
-                    else:
-                        st.caption("No product data available for uplift breakdown.")
-
-                with col_down:
-                    st.markdown("#### 🔴 Product Downward Pressure")
-                    if not selected_sales.empty:
-                        low_skus = selected_sales.groupby(sku_col)[metric].sum().nsmallest(3)
-                        
-                        st.write("**Lowest Performing / Slow-Moving SKUs:**")
-                        for item, val in low_skus.items():
-                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
-                            st.caption(f"• SKU {item}: {val_str}")
-
-                        st.write("**Product-Level Watchouts:**")
-                        st.caption("• **Stockout Impact:** Verify if historical dips in specific SKUs stem from supply gaps rather than organic demand drops.")
-                        st.caption("• **Tail End Drag:** Monitor low-volume SKUs tying up warehouse space and working capital.")
-                    else:
-                        st.caption("No product data available for downward pressure breakdown.")
-
-                st.markdown("#### 🔍 Product-Focused Forecast Strategy & Action Items")
-                st.markdown(
-                    """
-                    * **SKU-Level Reorder Point Check:** Compare projected monthly SKU demand against **On Hand** stock and **Open Purchase Orders**. Ensure safety stock cushions lead-time gaps for top revenue-generating SKUs.
-                    * **Product Phase-Outs & Replacements:** If low-performing or legacy SKUs show declining baseline trends, evaluate whether to apply a negative bias or manual override before reordering.
-                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-cost options doesn't pull down overall product category profitability (`GP%`).
-                    """
-                )
-
-                with st.expander("Forward forecast and overrides"):
-                    displayed_forecast["Manual Override"] = pd.Series(
-                        [pd.NA] * len(displayed_forecast), dtype="Float64"
-                    )
-                    
-                    num_format_string = "$%.0f" if metric in ["Sale", "Cost", "GP $"] else ("%.0f" if metric != "GP%" else "%.1f%%")
-                    
-                    edited_forecast = st.data_editor(
-                        displayed_forecast,
-                        use_container_width=True,
-                        hide_index=True,
-                        disabled=["Date", "Forecast", "Lower", "Upper", "Open PO Qty"],
-                        column_config={
-                            "Date": st.column_config.DateColumn(format="MMM YYYY"),
-                            "Forecast": st.column_config.NumberColumn(format=num_format_string),
-                            "Lower": st.column_config.NumberColumn(format=num_format_string),
-                            "Upper": st.column_config.NumberColumn(format=num_format_string),
-                            "Open PO Qty": st.column_config.NumberColumn(format="%.0f"),
-                            "Manual Override": st.column_config.NumberColumn(format=num_format_string),
-                        },
-                        key=f"forecast_editor_{selected_sku}_{metric}",
-                    )
-                    st.download_button(
-                        "Download forecast CSV",
-                        edited_forecast.to_csv(index=False).encode("utf-8"),
-                        file_name="forecast.csv",
-                        mime="text/csv",
-                    )
-                edited_forecast["Final Forecast"] = pd.to_numeric(
-                    edited_forecast["Manual Override"], errors="coerce"
-                ).fillna(edited_forecast["Forecast"])
-                edited_forecast["Projected Free Stock"] = (
-                    free_stock
-                    + edited_forecast["Open PO Qty"].cumsum()
-                    - edited_forecast["Final Forecast"].cumsum()
-                )
-
-                st.caption(
-                    "Forecast uses decoupled annual pipelines with explicit upward momentum overrides for July peaks."
+                st.download_button(
+                    "Download forecast & comparison CSV",
+                    graph_table.to_csv(index=False).encode("utf-8"),
+                    file_name=f"forecast_comparison_{metric.lower().replace(' ', '_')}.csv",
+                    mime="text/csv",
                 )
         except Exception as e:
-            st.error(f"Error rendering forecast sheet: {e}")
+            st.error(f"Something went wrong while rendering the forecast: {e}")
+
+elif selected_tab == "Formatted Data":
+    try:
+        prepared_data, source_names = load_raw_folder_data(
+            str(raw_data_path), raw_folder_manifest(raw_data_path)
+        )
+    except Exception as e:
+        st.error(f"Could not load files from Raw_data: {e}")
+
+    if prepared_data is None:
+        st.info("Add required source files under Raw_data to view formatted tables.")
+    else:
+        st.subheader("Formatted Data Tables")
+        sheet_names = list(prepared_data.keys())
+        selected_sheet = st.selectbox("Select table", sheet_names)
+        df_sheet = prepared_data[selected_sheet]
+
+        st.caption(f"Showing {min(1000, len(df_sheet)):,} of {len(df_sheet):,} rows")
+        st.data_editor(
+            df_sheet.head(1000),
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+
+        st.download_button(
+            f"Download {selected_sheet} CSV",
+            df_sheet.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
