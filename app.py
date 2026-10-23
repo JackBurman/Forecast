@@ -533,21 +533,18 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
             
-            # Apply direct Year-on-Year growth trend scaling so future forecasts step up from 2026 actuals rather than dropping
+            # Directly scale 2027 forecasts using monthly Year-on-Year growth from 2025 to 2026
             if not selected_sales.empty and not forecast.empty and metric != "GP%":
                 monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
-                if 2026 in monthly_actuals.columns and 2025 in monthly_actuals.columns:
-                    for idx, row in forecast.iterrows():
-                        m_num = row["Date"].month
-                        if m_num in monthly_actuals.index:
-                            act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else pd.NA
-                            act_2026 = monthly_actuals.loc[m_num, 2026] if 2026 in monthly_actuals.columns else pd.NA
-                            if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0 and act_2026 > 0:
-                                yoy_ratio = act_2026 / act_2025
-                                # Scale forecast to grow beyond 2026 actuals based on the YoY trend
-                                current_val = row["Forecast"]
-                                scaled_val = act_2026 * (yoy_ratio ** 0.8) * (current_val / (act_2026 if act_2026 > 0 else 1))
-                                forecast.loc[idx, "Forecast"] = max(current_val, scaled_val)
+                for idx, row in forecast.iterrows():
+                    m_num = row["Date"].month
+                    if m_num in monthly_actuals.index:
+                        act_2025 = monthly_actuals.loc[m_num, 2025] if 2025 in monthly_actuals.columns else pd.NA
+                        act_2026 = monthly_actuals.loc[m_num, 2026] if 2026 in monthly_actuals.columns else pd.NA
+                        if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0:
+                            yoy_multiplier = max(1.0, act_2026 / act_2025)
+                            # Anchor forecast directly on 2026 actuals stepped up by the YoY growth trend
+                            forecast.loc[idx, "Forecast"] = act_2026 * yoy_multiplier
 
             if metric == "GP%" and not forecast.empty:
                 avg_forecast_val = forecast["Forecast"].mean()
@@ -618,6 +615,18 @@ elif selected_tab == "Forecast":
                     confidence_alpha,
                 )
                 
+                # Apply the same YoY scaling to full-year forecast for chart generation
+                if not forecast_year_num in full_year_forecast.columns.astype(str) and not full_year_forecast.empty and metric != "GP%":
+                    monthly_actuals_full = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
+                    for idx, row in full_year_forecast.iterrows():
+                        m_num = row["Date"].month
+                        if m_num in monthly_actuals_full.index:
+                            act_2025 = monthly_actuals_full.loc[m_num, 2025] if 2025 in monthly_actuals_full.columns else pd.NA
+                            act_2026 = monthly_actuals_full.loc[m_num, 2026] if 2026 in monthly_actuals_full.columns else pd.NA
+                            if pd.notna(act_2025) and pd.notna(act_2026) and act_2025 > 0:
+                                yoy_multiplier = max(1.0, act_2026 / act_2025)
+                                full_year_forecast.loc[idx, "Forecast"] = act_2026 * yoy_multiplier
+
                 if metric == "GP%" and not full_year_forecast.empty:
                     full_year_forecast["Forecast"] = full_year_forecast["Forecast"].mean()
 
@@ -868,7 +877,7 @@ elif selected_tab == "Forecast":
                 )
 
                 st.caption(
-                    "Forecast uses 12-month seasonal Holt-Winters combined with year-on-year historical growth trend projection."
+                    "Forecast uses 12-month seasonal Holt-Winters scaled dynamically by Year-on-Year actual sales growth trends."
                 )
         except Exception as e:
             st.error(f"Error rendering forecast sheet: {e}")
