@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -300,34 +301,258 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
-def ensure_date_column(frame: pd.DataFrame | None) -> pd.DataFrame:
-    """Return a copy of a forecast frame with a real datetime 'Date' column."""
-    if frame is None or frame.empty:
-        return pd.DataFrame(columns=["Date", "Forecast"])
-    frame = frame.copy()
-    if "Date" not in frame.columns:
-        frame = frame.reset_index()
-        first = frame.columns[0]
-        if first == "index" or pd.api.types.is_datetime64_any_dtype(frame[first]):
-            frame = frame.rename(columns={first: "Date"})
-    if "Date" in frame.columns:
-        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    return frame.reset_index(drop=True)
+# ---------------------------------------------------------------------------
+# Forecasting
+#
+# This-year forecast  : additive Holt-Winters (ETS) fitted to monthly history
+#                       before 1 January, blended with a year-on-year trend
+#                       projection (same month last year × last year's growth).
+# Next-year forecast  : this year's actual month × this year's growth where a
+#                       complete month exists, otherwise this year's forecast.
+# Rolling 12 months   : the 12 months after the current month, summed.
+# Rolling MAPE        : the same method back-tested on the previous 12
+#                       complete months.
+# ---------------------------------------------------------------------------
+
+SEASON = 12
+GROWTH_FLOOR, GROWTH_CAP = 0.5, 1.2
+DEFAULT_GROWTH = 1.05  # used for next year when there is no prior-year base
 
 
-def keep_forecast_year(frame: pd.DataFrame, year: int) -> pd.DataFrame:
-    """Keep only the twelve months of the requested year.
+def monthly_series(sales: pd.DataFrame, metric: str, before: pd.Timestamp | None = None) -> pd.Series:
+    """Aggregate dated sales into a gap-free monthly series (PeriodIndex)."""
+    if metric not in sales.columns or "Date" not in sales.columns:
+        return pd.Series(dtype=float)
+    dated = sales.dropna(subset=["Date"])
+    if before is not None:
+        dated = dated.loc[dated["Date"] < before]
+    if dated.empty:
+        return pd.Series(dtype=float)
+    grouped = dated.groupby(dated["Date"].dt.to_period("M"))[metric]
+    series = grouped.mean() if metric == "GP%" else grouped.sum()
+    full_range = pd.period_range(series.index.min(), series.index.max(), freq="M")
+    series = series.reindex(full_range)
+    series = series.ffill().bfill() if metric == "GP%" else series.fillna(0.0)
+    return series.astype(float)
 
-    The engine can return more than twelve months from the start date; without
-    this the 2026 and 2027 forecasts overlap, drawing the same series twice and
-    breaking the summary table pivot.
+
+def _holt_winters_run(y: list[float], alpha: float, beta: float, gamma: float, phi: float, horizon: int):
+    """One pass of additive Holt-Winters with a damped trend; returns (forecast, SSE)."""
+    n = len(y)
+    level = sum(y[:SEASON]) / SEASON
+    trend = (sum(y[SEASON : 2 * SEASON]) / SEASON - level) / SEASON
+    seasonal = [value - level for value in y[:SEASON]]
+    sse = 0.0
+    for t in range(n):
+        index = t % SEASON
+        s = seasonal[index]
+        predicted = level + phi * trend + s
+        if t >= SEASON:  # skip the initialisation season
+            error = y[t] - predicted
+            sse += error * error
+        new_level = alpha * (y[t] - s) + (1 - alpha) * (level + phi * trend)
+        trend = beta * (new_level - level) + (1 - beta) * phi * trend
+        seasonal[index] = gamma * (y[t] - new_level) + (1 - gamma) * s
+        level = new_level
+    forecast = []
+    damped = 0.0
+    for h in range(1, horizon + 1):
+        damped += phi**h
+        forecast.append(level + damped * trend + seasonal[(n + h - 1) % SEASON])
+    return forecast, sse
+
+
+@st.cache_data(show_spinner=False)
+def holt_winters(values: tuple[float, ...], horizon: int) -> tuple[float, ...]:
+    """ETS forecast `horizon` months past the end of `values`.
+
+    Smoothing parameters are chosen by grid search on one-step-ahead error.
+    With fewer than two seasons of history it falls back to seasonal naive,
+    and with less than one season to the mean.
     """
-    if frame.empty or "Date" not in frame.columns:
-        return frame
-    in_year = frame.loc[frame["Date"].dt.year == year]
-    if in_year.empty:
-        in_year = frame.head(12)
-    return in_year.reset_index(drop=True)
+    y = [float(value) for value in values]
+    n = len(y)
+    if n == 0:
+        return tuple([float("nan")] * horizon)
+    if n < SEASON:
+        mean = sum(y) / n
+        return tuple([mean] * horizon)
+    if n < 2 * SEASON:
+        return tuple(y[n - SEASON + ((h - 1) % SEASON)] for h in range(1, horizon + 1))
+
+    best_sse = None
+    best_forecast = None
+    for alpha in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9):
+        for beta in (0.0, 0.05, 0.1, 0.2, 0.3):
+            for gamma in (0.05, 0.1, 0.2, 0.3, 0.5):
+                for phi in (0.9, 1.0):
+                    forecast, sse = _holt_winters_run(y, alpha, beta, gamma, phi, horizon)
+                    if best_sse is None or sse < best_sse:
+                        best_sse, best_forecast = sse, forecast
+    return tuple(best_forecast)
+
+
+def clamp_growth(ratio: float) -> float:
+    return min(max(ratio, GROWTH_FLOOR), GROWTH_CAP)
+
+
+def yoy_growth(history: pd.Series) -> float | None:
+    """Last 12 months over the 12 before, clamped; None without two full years."""
+    if len(history) < 2 * SEASON:
+        return None
+    recent = float(history.iloc[-SEASON:].sum())
+    prior = float(history.iloc[-2 * SEASON : -SEASON].sum())
+    if recent <= 0 or prior <= 0:
+        return None
+    return clamp_growth(recent / prior)
+
+
+def blended_forecast(
+    history: pd.Series,
+    start: pd.Period,
+    horizon: int,
+    yoy_weight: float,
+    bias: float,
+    clip_at_zero: bool,
+) -> pd.Series:
+    """ETS forecast from `start`, blended with the YoY trend projection.
+
+    forecast[m] = (1 - w) × ETS[m] + w × (actual[m - 12 months] × growth),
+    using the ETS value alone where no prior-year month exists.
+    """
+    periods = pd.period_range(start, periods=horizon, freq="M")
+    history = history[history.index < start]
+    if history.empty:
+        return pd.Series(np.nan, index=periods, dtype=float)
+
+    full_range = pd.period_range(history.index.min(), start - 1, freq="M")
+    history = history.reindex(full_range)
+    history = history.fillna(0.0) if clip_at_zero else history.ffill().bfill()
+
+    ets_values = holt_winters(tuple(history.tolist()), horizon)
+    forecast = pd.Series(ets_values, index=periods, dtype=float)
+
+    growth = yoy_growth(history)
+    if growth is not None and yoy_weight > 0:
+        for period in periods:
+            prior = period - SEASON
+            if prior in history.index:
+                yoy_value = history[prior] * growth
+                forecast[period] = (1 - yoy_weight) * forecast[period] + yoy_weight * yoy_value
+
+    forecast = forecast * bias
+    if clip_at_zero:
+        forecast = forecast.clip(lower=0.0)
+    return forecast
+
+
+def next_year_forecast(
+    actual: pd.Series,
+    this_year_forecast: pd.Series,
+    this_year: int,
+    last_complete: pd.Period,
+    bias: float,
+) -> pd.Series:
+    """Next year by month: this year's complete actual × growth, else this year's forecast."""
+    this_year_months = [
+        period
+        for period in pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
+        if period <= last_complete and period in actual.index
+    ]
+    recent = sum(float(actual[period]) for period in this_year_months)
+    prior = sum(
+        float(actual[period - SEASON])
+        for period in this_year_months
+        if (period - SEASON) in actual.index
+    )
+    growth = clamp_growth(recent / prior) if recent > 0 and prior > 0 else DEFAULT_GROWTH
+
+    values = {}
+    for period in pd.period_range(f"{this_year + 1}-01", periods=SEASON, freq="M"):
+        base_period = period - SEASON
+        actual_value = (
+            float(actual[base_period])
+            if base_period <= last_complete and base_period in actual.index
+            else np.nan
+        )
+        if pd.notna(actual_value) and actual_value > 0:
+            values[period] = actual_value * growth * bias
+        else:
+            values[period] = (
+                float(this_year_forecast[base_period])
+                if base_period in this_year_forecast.index
+                else np.nan
+            )
+    return pd.Series(values, dtype=float)
+
+
+def rolling_mape(
+    actual: pd.Series, last_complete: pd.Period, yoy_weight: float, bias: float, clip_at_zero: bool
+) -> tuple[float | None, pd.PeriodIndex]:
+    """Back-test the blended method over the previous 12 complete months."""
+    window = pd.period_range(last_complete - (SEASON - 1), periods=SEASON, freq="M")
+    predicted = blended_forecast(actual, window[0], SEASON, yoy_weight, bias, clip_at_zero)
+    observed = actual.reindex(window)
+    valid = observed.notna() & observed.ne(0) & predicted.notna()
+    if not valid.any():
+        return None, window
+    errors = (observed[valid] - predicted[valid]).abs() / observed[valid].abs()
+    return float(errors.mean()), window
+
+
+def build_forecasts(
+    selected_sales: pd.DataFrame,
+    metric: str,
+    yoy_weight: float,
+    bias: float,
+    today: pd.Timestamp | None = None,
+) -> dict:
+    """Everything the Forecast tab needs, computed from the filtered sales."""
+    today = (today or pd.Timestamp.today()).normalize()
+    current_period = today.to_period("M")
+    current_month_start = current_period.to_timestamp()
+    last_complete = current_period - 1
+    this_year = today.year
+    clip_at_zero = metric != "GP%"
+
+    actual = monthly_series(selected_sales, metric, before=current_month_start)
+
+    this_start = pd.Period(f"{this_year}-01", freq="M")
+    forecast_this = blended_forecast(actual, this_start, SEASON, yoy_weight, bias, clip_at_zero)
+    forecast_next = next_year_forecast(actual, forecast_this, this_year, last_complete, bias)
+
+    if metric == "GP%":
+        forecast_this[:] = forecast_this.mean()
+        forecast_next[:] = forecast_next.mean()
+
+    rolling_window = pd.period_range(current_period + 1, periods=SEASON, freq="M")
+    rolling = pd.concat([forecast_this, forecast_next]).reindex(rolling_window)
+    if rolling.notna().any():
+        rolling_total = float(rolling.mean() if metric == "GP%" else rolling.sum())
+    else:
+        rolling_total = None
+
+    mape, mape_window = rolling_mape(actual, last_complete, yoy_weight, bias, clip_at_zero)
+
+    def as_frame(series: pd.Series) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"Date": series.index.to_timestamp(), "Forecast": series.to_numpy(dtype=float)}
+        )
+
+    return {
+        "actual": actual,
+        "this_year": this_year,
+        "forecast_this": as_frame(forecast_this),
+        "forecast_next": as_frame(forecast_next),
+        "rolling_window": rolling_window,
+        "rolling_total": rolling_total,
+        "mape": mape,
+        "mape_window": mape_window,
+    }
+
+
+def window_label(window: pd.PeriodIndex) -> str:
+    return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
 
 
 # Top-right manual refresh button container
@@ -534,27 +759,30 @@ elif selected_tab == "Forecast":
                 st.subheader("Forecast settings")
                 metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
                 metric = st.selectbox("View", metric_options, index=0)
-                forecast_year = st.number_input(
-                    "Forecast from Year",
+                history_from_year = st.number_input(
+                    "History from Year",
                     min_value=2000,
                     max_value=2100,
                     value=2024,
                     step=1,
+                    help="First year of actuals shown on the chart.",
                 )
-                forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
+                forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
                 bias = st.number_input(
                     "Forecast bias",
                     min_value=0.0,
                     max_value=5.0,
                     value=1.0,
                     step=0.05,
+                    help="Multiplier applied to every forecast month.",
                 )
-                confidence_alpha = st.number_input(
-                    "Confidence alpha",
-                    min_value=0.05,
-                    max_value=0.9,
-                    value=0.35,
+                yoy_weight = st.slider(
+                    "YoY trend weight",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.5,
                     step=0.05,
+                    help="0 = pure ETS, 1 = pure year-on-year trend projection.",
                 )
 
             filters = {
@@ -570,80 +798,11 @@ elif selected_tab == "Forecast":
             if metric == "GP%" and not selected_sales.empty and "GP%" in selected_sales.columns:
                 selected_sales["GP%"] = selected_sales["GP%"].mean()
 
-            current_month_start = pd.Timestamp.today().normalize().replace(day=1)
-            historical_sales_for_mape = selected_sales.loc[
-                selected_sales["Date"] < current_month_start
-            ]
-            target_data = (
-                historical_sales_for_mape
-                if not historical_sales_for_mape.empty
-                else selected_sales
-            )
-
-            # Separate forecast runs for 2026 and 2027, each trimmed to its own year.
-            actual_26, forecast_2026, mape_26 = forecast_engine.calculate_forecast(
-                target_data, metric, pd.Timestamp("2026-01-01"), bias, confidence_alpha
-            )
-            forecast_2026 = keep_forecast_year(ensure_date_column(forecast_2026), 2026)
-
-            actual_27, forecast_2027, mape_27 = forecast_engine.calculate_forecast(
-                target_data, metric, pd.Timestamp("2027-01-01"), bias, confidence_alpha
-            )
-            forecast_2027 = keep_forecast_year(ensure_date_column(forecast_2027), 2027)
-
-            mape = mape_27 if mape_27 is not None else mape_26
-            actual = actual_27 if not actual_27.empty else actual_26
-
-            # Year-on-year overrides, with a safe fallback to the 2026 forecast.
-            if not selected_sales.empty and metric != "GP%":
-                monthly_actuals = selected_sales.pivot_table(
-                    index=selected_sales["Date"].dt.month,
-                    columns="Year",
-                    values=metric,
-                    aggfunc="sum",
-                )
-
-                def actual_for(month: int, year: int):
-                    if month in monthly_actuals.index and year in monthly_actuals.columns:
-                        return monthly_actuals.loc[month, year]
-                    return pd.NA
-
-                # 2026: last year's actual scaled by last year's growth.
-                for idx, row in forecast_2026.iterrows():
-                    m_num = row["Date"].month
-                    act_2025 = actual_for(m_num, 2025)
-                    act_2024 = actual_for(m_num, 2024)
-                    if pd.notna(act_2025) and pd.notna(act_2024) and act_2024 > 0:
-                        forecast_2026.loc[idx, "Forecast"] = act_2025 * (act_2025 / act_2024)
-
-                # 2027: 2026 actuals where they exist, otherwise the 2026 forecast.
-                for idx, row in forecast_2027.iterrows():
-                    m_num = row["Date"].month
-                    match_26 = forecast_2026.loc[
-                        forecast_2026["Date"].dt.month == m_num, "Forecast"
-                    ]
-                    base_val = match_26.iloc[0] if not match_26.empty else row["Forecast"]
-
-                    act_2026_val = actual_for(m_num, 2026)
-                    if pd.notna(act_2026_val) and act_2026_val > 0:
-                        act_2025 = actual_for(m_num, 2025)
-                        yoy_rate = (
-                            act_2026_val / act_2025
-                            if pd.notna(act_2025) and act_2025 > 0
-                            else 1.05
-                        )
-                        forecast_2027.loc[idx, "Forecast"] = act_2026_val * min(yoy_rate, 1.2)
-                    else:
-                        forecast_2027.loc[idx, "Forecast"] = base_val
-
-            forecast = forecast_2026 if forecast_year == 2026 else forecast_2027
-
-            if metric == "GP%" and not forecast.empty:
-                forecast["Forecast"] = forecast["Forecast"].mean()
-                if "Lower" in forecast.columns:
-                    forecast["Lower"] = forecast["Lower"].mean()
-                if "Upper" in forecast.columns:
-                    forecast["Upper"] = forecast["Upper"].mean()
+            result = build_forecasts(selected_sales, metric, yoy_weight, bias)
+            this_year = result["this_year"]
+            forecast_this_year = result["forecast_this"]
+            forecast_next_year = result["forecast_next"]
+            rolling_window = result["rolling_window"]
 
             purchase_months = forecast_engine.monthly_purchase_orders(
                 sheets["Purchase Orders"], filters
@@ -652,49 +811,52 @@ elif selected_tab == "Forecast":
                 sheets["Current Inventory"], filters
             )
 
-            if actual.empty:
-                st.warning("No dated sales match these selections and forecast start date.")
+            if result["actual"].empty:
+                st.warning("No completed months of dated sales match these selections.")
             else:
-                displayed_forecast = forecast.head(12).copy()
-                po_by_month = (
-                    purchase_months.set_index("Date")["Open PO Qty"]
-                    if not purchase_months.empty
-                    else pd.Series(dtype=float)
-                )
-                displayed_forecast["Open PO Qty"] = (
-                    displayed_forecast["Date"].map(po_by_month).fillna(0)
-                    if not displayed_forecast.empty
-                    else 0.0
-                )
-                if displayed_forecast.empty:
-                    total_forecast = 0.0
-                elif metric == "GP%":
-                    total_forecast = float(displayed_forecast["Forecast"].mean())
-                else:
-                    total_forecast = float(displayed_forecast["Forecast"].sum())
-                total_po = (
-                    float(displayed_forecast["Open PO Qty"].sum())
-                    if not displayed_forecast.empty
-                    else 0.0
-                )
+                # Open POs due by the end of the rolling window, including overdue ones.
+                total_po = 0.0
+                if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
+                    purchase_months.columns
+                ):
+                    po_periods = pd.to_datetime(
+                        purchase_months["Date"], errors="coerce"
+                    ).dt.to_period("M")
+                    po_by_period = purchase_months.groupby(po_periods)["Open PO Qty"].sum()
+                    total_po = float(po_by_period[po_by_period.index <= rolling_window[-1]].sum())
+
+                rolling_total = result["rolling_total"]
+                mape = result["mape"]
                 summary = st.columns(5)
                 forecast_label_prefix = "$" if metric in ["Sale", "Cost", "GP $"] else ""
+                if rolling_total is None:
+                    rolling_display = "n/a"
+                elif metric == "GP%":
+                    rolling_display = f"{rolling_total:.1f}%"
+                else:
+                    rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
                 summary[0].metric(
-                    "12-month forecast",
-                    f"{forecast_label_prefix}{total_forecast:,.0f}"
-                    if metric != "GP%"
-                    else f"{total_forecast:.1f}%",
+                    "Rolling 12-Month Forecast",
+                    rolling_display,
+                    help=f"{window_label(rolling_window)} · "
+                    + ("average GP%" if metric == "GP%" else f"total {metric}"),
                 )
                 summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
                 summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
-                summary[3].metric("Open PO quantity", f"{total_po:,.0f}")
+                summary[3].metric(
+                    "Open PO quantity",
+                    f"{total_po:,.0f}",
+                    help=f"Open POs due by {rolling_window[-1].strftime('%b %Y')}, including overdue.",
+                )
                 summary[4].metric(
-                    "Historical MAPE", f"{mape:.1%}" if mape is not None else "n/a"
+                    "Historical MAPE",
+                    f"{mape:.1%}" if mape is not None else "n/a",
+                    help=f"Rolling previous 12 months · {window_label(result['mape_window'])}",
                 )
 
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
-                    forecast.iloc[0:0],
+                    pd.DataFrame(columns=["Date", "Forecast"]),
                     metric,
                     forecast_from,
                 )
@@ -719,10 +881,11 @@ elif selected_tab == "Forecast":
                 actual_chart_data["Line Type"] = "Actual"
 
                 forecast_frames = [
-                    frame
-                    for frame in (forecast_2026, forecast_2027)
-                    if not frame.empty and "Date" in frame.columns
+                    frame.dropna(subset=["Forecast"])
+                    for frame in (forecast_this_year, forecast_next_year)
+                    if not frame.empty
                 ]
+                forecast_frames = [frame for frame in forecast_frames if not frame.empty]
                 if forecast_frames:
                     forecast_chart_data = pd.concat(forecast_frames, ignore_index=True)
                     forecast_chart_data["Year"] = (
@@ -859,7 +1022,13 @@ elif selected_tab == "Forecast":
                             .add_params(month_hover_selection)
                         )
                 st.altair_chart(alt.layer(yearly_chart, *month_hover_charts), **FULL_WIDTH)
-                st.caption("Solid lines: actual by year · Dashed line: forecast")
+                st.caption(
+                    f"Solid lines: actual by year · Dashed lines: forecast · "
+                    f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
+                    f"blended with the year-on-year trend · "
+                    f"Forecast {this_year + 1} = {this_year} actual × growth where the month is "
+                    f"complete, otherwise the {this_year} forecast."
+                )
 
                 graph_table = (
                     chart_data.drop_duplicates(subset=["Series", "Month"], keep="last")
