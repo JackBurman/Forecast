@@ -299,7 +299,6 @@ st.sidebar.markdown(
 )
 
 
-# Automatic source-data refresh limitation note:
 @st.fragment(run_every="1h")
 def automatic_source_refresh():
     current_time = pd.Timestamp.now()
@@ -516,7 +515,6 @@ elif selected_tab == "Forecast":
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
-            # If GP% metric is selected, configure engine/aggregation values to compute simple/sales-weighted averages rather than summing
             if metric == "GP%" and not selected_sales.empty:
                 if "GP%" in selected_sales.columns:
                     mean_gp = selected_sales["GP%"].mean()
@@ -533,7 +531,6 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
             
-            # If GP% forecast outputs or profile aggregations sum values internally, override to average
             if metric == "GP%" and not forecast.empty:
                 avg_forecast_val = forecast["Forecast"].mean()
                 forecast["Forecast"] = avg_forecast_val
@@ -558,7 +555,6 @@ elif selected_tab == "Forecast":
                     displayed_forecast["Date"].map(po_by_month).fillna(0)
                 )
                 
-                # For summary totals, average GP% instead of summing
                 if metric == "GP%":
                     total_forecast = float(displayed_forecast["Forecast"].mean()) if not displayed_forecast.empty else 0.0
                 else:
@@ -581,7 +577,6 @@ elif selected_tab == "Forecast":
                     forecast_from,
                 )
                 
-                # If metric is GP%, average the yearly monthly profile instead of summing
                 if metric == "GP%" and not annual_profile.empty:
                     numeric_cols = [c for c in annual_profile.columns if c != "Month"]
                     for col in numeric_cols:
@@ -764,6 +759,52 @@ elif selected_tab == "Forecast":
                     use_container_width=True,
                     hide_index=True,
                     height=220,
+                )
+
+                # In-depth Sales Uplift, Downward Pressure & Forecast Analysis Section
+                st.markdown("---")
+                st.subheader("📊 Sales Performance & Forecast Intelligence")
+
+                col_up, col_down = st.columns(2)
+
+                with col_up:
+                    st.markdown("#### 🟢 Drivers of Uplift")
+                    if not selected_sales.empty:
+                        top_channels = selected_sales.groupby("Sales Channel Net")[metric].sum().nlargest(3)
+                        top_suppliers = selected_sales.groupby("OptionsData.Supplier" if "OptionsData.Supplier" in selected_sales.columns else "City")[metric].sum().nlargest(3)
+                        
+                        st.write("**Top Performing Channels:**")
+                        for ch, val in top_channels.items():
+                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
+                            st.caption(f"• {ch}: {val_str}")
+
+                        st.write("**Key Contributing Suppliers/Locations:**")
+                        for sup, val in top_suppliers.items():
+                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
+                            st.caption(f"• {sup}: {val_str}")
+                    else:
+                        st.caption("No data available for uplift breakdown.")
+
+                with col_down:
+                    st.markdown("#### 🔴 Downward Pressure")
+                    if not selected_sales.empty:
+                        low_channels = selected_sales.groupby("Sales Channel Net")[metric].sum().nsmallest(3)
+                        st.write("**Underperforming or Niche Channels:**")
+                        for ch, val in low_channels.items():
+                            val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
+                            st.caption(f"• {ch}: {val_str}")
+                        
+                        st.caption("• **Lagging Periods:** Check months displaying flat or dipping historical trendlines relative to prior years.")
+                    else:
+                        st.caption("No data available for downward pressure breakdown.")
+
+                st.markdown("#### 🔍 Upcoming Forecast Analysis & Focus Areas")
+                st.markdown(
+                    """
+                    * **Stock Cover & Free Stock Alignment:** Compare the 12-month rolling forecast against your current **Free Stock** and incoming **Open PO Quantities**. If projected free stock dips below safety thresholds during peak seasonal months, trigger purchase orders early.
+                    * **Seasonality & Trend Divergence:** Look closely at the dashed forecast line compared to previous years' solid lines. If the model anticipates a sharper surge or drop than historical norms, investigate whether recent marketing pushes or supply constraints explain the anomaly.
+                    * **Margin vs. Volume Trade-offs:** If viewing gross profit percentage (`GP%`), ensure that volume increases (Qty/Sale) aren't eroding margins. Look for SKUs or categories where high turnover coincides with dipping profit percentages.
+                    """
                 )
 
                 with st.expander("Forward forecast and overrides"):
