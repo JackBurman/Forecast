@@ -489,7 +489,7 @@ elif selected_tab == "Forecast":
                     "Forecast from Year",
                     min_value=2000,
                     max_value=2100,
-                    value=2027,  # Default set to 2027 to incorporate 2026 results
+                    value=2024,
                     step=1,
                 )
                 forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
