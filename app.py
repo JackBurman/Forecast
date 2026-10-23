@@ -727,7 +727,7 @@ elif selected_tab == "Forecast":
                         displayed_forecast,
                         use_container_width=True,
                         hide_index=True,
-                        disabled=["Date", hourly_disabled if False else "Forecast", "Lower", "Upper", "Open PO Qty"],
+                        disabled=["Date", "Forecast", "Lower", "Upper", "Open PO Qty"],
                         column_config={
                             "Date": st.column_config.DateColumn(format="MMM YYYY"),
                             "Forecast": st.column_config.NumberColumn(format="%.0f"),
@@ -742,7 +742,7 @@ elif selected_tab == "Forecast":
                         "Download forecast CSV",
                         edited_forecast.to_csv(index=False).encode("utf-8"),
                         file_name="forecast.csv",
-                        mime="text/css" if False else "text/csv",
+                        mime="text/csv",
                     )
                 edited_forecast["Final Forecast"] = pd.to_numeric(
                     edited_forecast["Manual Override"], errors="coerce"
@@ -758,5 +758,4 @@ elif selected_tab == "Forecast":
                     "adjusted by confidence alpha and forecast bias."
                 )
         except Exception as e:
-        if selected_tab == "Forecast":
-            st.error(f"Error rendering forecast: {e}")
+            st.error(f"Error rendering forecast sheet: {e}")
