@@ -514,13 +514,13 @@ elif selected_tab == "Forecast":
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
             # Ensure 'Date' column is present and converted properly
-            if not selected_sales.empty and "Date" not in selected_sales.columns:
-                if "Invoice Date" in selected_sales.columns:
+            if not selected_sales.empty:
+                if "Date" not in selected_sales.columns and "Invoice Date" in selected_sales.columns:
                     selected_sales["Date"] = pd.to_datetime(selected_sales["Invoice Date"], errors="coerce")
-            if not selected_sales.empty and "Date" in selected_sales.columns:
-                selected_sales["Date"] = pd.to_datetime(selected_sales["Date"], errors="coerce")
-                selected_sales["Year"] = selected_sales["Date"].dt.year
-                selected_sales["Month"] = selected_sales["Date"].dt.month_name()
+                if "Date" in selected_sales.columns:
+                    selected_sales["Date"] = pd.to_datetime(selected_sales["Date"], errors="coerce")
+                    selected_sales["Year"] = selected_sales["Date"].dt.year
+                    selected_sales["Month"] = selected_sales["Date"].dt.month_name()
 
             if metric == "GP%" and not selected_sales.empty:
                 if "GP%" in selected_sales.columns:
@@ -544,6 +544,8 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
+            if not forecast_2026_raw.empty and "Date" not in forecast_2026_raw.columns:
+                forecast_2026_raw = forecast_2026_raw.reset_index()
 
             data_for_2027 = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
             actual, forecast_2027_raw, mape_2027 = forecast_engine.calculate_forecast(
@@ -553,6 +555,8 @@ elif selected_tab == "Forecast":
                 bias,
                 confidence_alpha,
             )
+            if not forecast_2027_raw.empty and "Date" not in forecast_2027_raw.columns:
+                forecast_2027_raw = forecast_2027_raw.reset_index()
 
             # Apply direct momentum scaling so July 2026 locks to ~154 and July 2027 locks to ~180 (matching actual upward sales velocity)
             if not selected_sales.empty and metric != "GP%" and "Date" in selected_sales.columns:
