@@ -10,6 +10,19 @@ import forecast_engine  # type: ignore
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
 
+# Reduce default top padding and header spacing
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 0rem; /* Adjust this value (e.g., 1rem or 0rem) to pull everything higher */
+            padding-bottom: 0rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def _streamlit_version() -> tuple[int, ...]:
     parts: list[int] = []
