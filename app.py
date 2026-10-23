@@ -21,12 +21,13 @@ with top_right:
         load_raw_folder_data.clear()
         st.rerun()
 
-st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
-
 st.sidebar.markdown(
     "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
     unsafe_allow_html=True,
 )
+
+
+st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
 
 # Data paths and cached loaders
 base_dir = Path(__file__).resolve().parent
