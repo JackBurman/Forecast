@@ -461,7 +461,7 @@ def rolling_wmape(
     predicted = blended_forecast(actual, window[0], SEASON, yoy_weight, bias, clip_at_zero)
     observed = actual.reindex(window)
     valid = observed.notna() & observed.ne(0) & predicted.notna()
-    if not valid.empty:
+    if valid.empty:
         return None, window
     
     abs_errors = (observed[valid] - predicted[valid]).abs()
@@ -847,10 +847,10 @@ if selected_tab == "Forecast":
 
                 if metric == "GP%":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).mean()) if prior_ytd_periods else np.nan
-                    prior_fy_act = float(actual_series.reindex(prior_year_periods).mean()) if prior_year_periods else np.nan
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).mean()) if not prior_year_periods.empty else np.nan
                 else:
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
-                    prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if prior_year_periods else 0.0
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
                 py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
                 py_ytd_pct = (py_ytd_diff / prior_ytd_act * 100) if pd.notna(py_ytd_diff) and prior_ytd_act != 0 else np.nan
