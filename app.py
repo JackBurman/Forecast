@@ -269,11 +269,6 @@ def load_raw_folder_data(
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     sources, source_names = forecast_engine.read_raw_data_folder(folder)
-    
-    # Recalculate GP% as sales-weighted averages or override engine aggregations if needed
-    if "GP%" in sources.get("Sales Raw", pd.DataFrame()).columns and "Sale" in sources.get("Sales Raw", pd.DataFrame()).columns:
-        pass  # Handled in forecast engine or clean pipeline
-
     formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
@@ -305,15 +300,11 @@ st.sidebar.markdown(
 
 
 # Automatic source-data refresh limitation note:
-# Streamlit does not natively support direct cron/time-of-day scheduling (like 7:00 AM) inside 
-# st.fragment without an active browser session ticking it. Using st.fragment(run_every="1h") 
-# checks periodically to clear caches and refresh when crossed into a new day or when active.
 @st.fragment(run_every="1h")
 def automatic_source_refresh():
     current_time = pd.Timestamp.now()
     last_refresh_date = st.session_state.get("_last_auto_refresh_date")
     
-    # Check if it's past 7:00 AM local time and hasn't refreshed today yet
     if current_time.hour >= 7 and (last_refresh_date is None or last_refresh_date != current_time.date()):
         st.session_state["_last_auto_refresh_date"] = current_time.date()
         load_csv.clear()
@@ -525,15 +516,14 @@ elif selected_tab == "Forecast":
             }
             selected_sales = forecast_engine.filter_sales(sales_data, filters)
             
-            # If viewing GP%, weight the average properly by sales values
+            # Weighted average GP% computation based on sales volume if GP% is selected
             if metric == "GP%" and not selected_sales.empty:
                 if "Sale" in selected_sales.columns and "GP%" in selected_sales.columns:
                     total_sales_val = selected_sales["Sale"].sum()
                     if total_sales_val > 0:
-                        sales_weighted_gp = (selected_sales["GP%"] * selected_sales["Sale"]).sum() / total_sales_val
-                        # Custom override for weighted average display/calculation integration if supported
-            
-            # Historical MAPE restricted strictly to months prior to the current month
+                        weighted_gp = (selected_sales["GP%"] * selected_sales["Sale"]).sum() / total_sales_val
+                        selected_sales["GP%"] = weighted_gp
+
             current_month_start = pd.Timestamp.today().normalize().replace(day=1)
             historical_sales_for_mape = selected_sales.loc[selected_sales["Date"] < current_month_start]
 
@@ -550,7 +540,6 @@ elif selected_tab == "Forecast":
             if actual.empty:
                 st.warning("No dated sales match these selections and forecast start date.")
             else:
-                # Summary statistics are shown above the monthly comparison chart.
                 displayed_forecast = forecast.head(12).copy()
                 po_by_month = (
                     purchase_months.set_index("Date")["Open PO Qty"]
@@ -564,7 +553,6 @@ elif selected_tab == "Forecast":
                 total_po = float(displayed_forecast["Open PO Qty"].sum())
                 summary = st.columns(5)
                 
-                # Format metrics with $ where appropriate and round to no cents
                 forecast_label_prefix = "$" if metric in ["Sale", "Cost", "GP $"] else ""
                 summary[0].metric("12-month forecast", f"{forecast_label_prefix}{total_forecast:,.0f}" if metric != "GP%" else f"{total_forecast:.1f}%")
                 summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
@@ -736,9 +724,20 @@ elif selected_tab == "Forecast":
                 )
                 graph_table.columns.name = None
                 
-                # Format numeric columns in the summary table with rounded integer formatting / currency symbols
+                # Apply number formatting to the monthly comparison data table values based on active metric
+                table_num_format = "$%,.0f" if metric in ["Sale", "Cost", "GP $"] else ("%,.0f" if metric != "GP%" else "%.1f%%")
+                formatted_graph_table = graph_table.copy()
+                for col in forecast_engine.MONTHS:
+                    if col in formatted_graph_table.columns:
+                        if metric in ["Sale", "Cost", "GP $"]:
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+                        elif metric == "GP%":
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                        else:
+                            formatted_graph_table[col] = formatted_graph_table[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+
                 st.dataframe(
-                    graph_table,
+                    formatted_graph_table,
                     use_container_width=True,
                     hide_index=True,
                     height=220,
@@ -749,7 +748,6 @@ elif selected_tab == "Forecast":
                         [pd.NA] * len(displayed_forecast), dtype="Float64"
                     )
                     
-                    # Apply currency symbol and integer rounding formatting config based on metric selection
                     num_format_string = "$%.0f" if metric in ["Sale", "Cost", "GP $"] else ("%.0f" if metric != "GP%" else "%.1f%%")
                     
                     edited_forecast = st.data_editor(
