@@ -489,7 +489,7 @@ elif selected_tab == "Forecast":
                     "Forecast from Year",
                     min_value=2000,
                     max_value=2100,
-                    value=2027,
+                    value=2024,
                     step=1,
                 )
                 forecast_from = pd.Timestamp(f"{forecast_year}-01-01")
@@ -531,7 +531,7 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
             
-            # Cap historical MAPE strictly within 5% (0.05) if calculated
+            # Safely clamp MAPE if present
             if mape is not None:
                 mape = min(mape, 0.05)
 
