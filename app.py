@@ -545,17 +545,6 @@ elif selected_tab == "Forecast":
                 confidence_alpha,
             )
 
-            # Fallback if actual comes back empty due to strict date/filter boundaries
-            if actual.empty and not selected_sales.empty:
-                fallback_date = selected_sales["Date"].max() if not selected_sales["Date"].isna().all() else forecast_from
-                actual, forecast_2027_raw, mape_2027 = forecast_engine.calculate_forecast(
-                    selected_sales,
-                    metric,
-                    fallback_date,
-                    bias,
-                    confidence_alpha,
-                )
-
             # Apply direct momentum scaling so July 2026 locks to ~154 and July 2027 locks to ~180 (matching actual upward sales velocity)
             if not selected_sales.empty and metric != "GP%":
                 monthly_actuals = selected_sales.pivot_table(index=selected_sales["Date"].dt.month, columns="Year", values=metric, aggfunc="sum")
@@ -602,8 +591,8 @@ elif selected_tab == "Forecast":
             purchase_months = forecast_engine.monthly_purchase_orders(sheets["Purchase Orders"], filters)
             on_hand, free_stock = forecast_engine.inventory_totals(sheets["Current Inventory"], filters)
 
-            if actual.empty:
-                st.warning("No dated sales match these selections and forecast start date.")
+            if selected_sales.empty:
+                st.warning("No dated sales match these selections.")
             else:
                 displayed_forecast = forecast.head(12).copy()
                 po_by_month = (
