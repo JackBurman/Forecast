@@ -525,27 +525,21 @@ elif selected_tab == "Forecast":
 
             target_data = historical_sales_for_mape if not historical_sales_for_mape.empty else selected_sales
 
-            # Automatically optimize bias and alpha to achieve a genuine historical MAPE around 5% (0.05)
-            best_bias = bias
-            best_alpha = confidence_alpha
-            best_mape = float("inf")
+            # Weighted historical weighting & Year-on-Year Growth Trend Layer
+            if not target_data.empty and metric != "GP%":
+                # Assign recency weights (heavily favoring 2025/2026 over 2024)
+                target_data = target_data.copy()
+                year_weights = {2024: 0.5, 2025: 1.0, 2026: 1.5, 2027: 2.0}
+                target_data["_RecencyWeight"] = target_data["Year"].map(year_weights).fillna(1.0)
+                
+                # Calculate Year-on-Year growth factor from 2025 to 2026 to project growth trend forward
+                annual_totals = target_data.groupby("Year")[metric].sum()
+                yoy_growth_factor = 1.05  # default baseline growth trend
+                if 2025 in annual_totals and 2026 in annual_totals and annual_totals[2025] > 0:
+                    yoy_growth_factor = max(0.8, min(1.5, annual_totals[2026] / annual_totals[2025]))
 
-            for test_bias in [0.95, 1.0, 1.02, 1.05, 1.08, 1.1]:
-                for test_alpha in [0.2, 0.35, 0.5, 0.65]:
-                    _, _, test_mape = forecast_engine.calculate_forecast(
-                        target_data,
-                        metric,
-                        forecast_from,
-                        test_bias,
-                        test_alpha,
-                    )
-                    if test_mape is not None and abs(test_mape - 0.05) < abs(best_mape - 0.05):
-                        best_mape = test_mape
-                        best_bias = test_bias
-                        best_alpha = test_alpha
-
-            bias = best_bias
-            confidence_alpha = best_alpha
+                # Adjust bias dynamically using the YoY growth trend
+                bias = max(bias, yoy_growth_factor)
 
             actual, forecast, mape = forecast_engine.calculate_forecast(
                 target_data,
@@ -821,7 +815,7 @@ elif selected_tab == "Forecast":
                             val_str = f"${val:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{val:,.0f}"
                             st.caption(f"• SKU {item}: {val_str}")
 
-                        st.write("**Product-Level Watchouts:**")
+                        st.write("**Product-Level Watchouts:**`")
                         st.caption("• **Stockout Impact:** Verify if historical dips in specific SKUs stem from supply gaps rather than organic demand drops.")
                         st.caption("• **Tail End Drag:** Monitor low-volume SKUs tying up warehouse space and working capital.")
                     else:
@@ -832,7 +826,7 @@ elif selected_tab == "Forecast":
                     """
                     * **SKU-Level Reorder Point Check:** Compare projected monthly SKU demand against **On Hand** stock and **Open Purchase Orders**. Ensure safety stock cushions lead-time gaps for top revenue-generating SKUs.
                     * **Product Phase-Outs & Replacements:** If low-performing or legacy SKUs show declining baseline trends, evaluate whether to apply a negative bias or manual override before reordering.
-                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-cost options doesn't pull down overall product category profitability (`GP%`).
+                    * **Margin Dilution at Item Level:** Ensure promotional discounting on specific SKUs or high-count options doesn't pull down overall product category profitability (`GP%`).
                     """
                 )
 
@@ -866,6 +860,7 @@ elif selected_tab == "Forecast":
                     )
                 edited_forecast["Final Forecast"] = pd.to_numeric(
                     edited_forecast["Manual Override"], errors="coerce"
+
                 ).fillna(edited_forecast["Forecast"])
                 edited_forecast["Projected Free Stock"] = (
                     free_stock
@@ -874,8 +869,7 @@ elif selected_tab == "Forecast":
                 )
 
                 st.caption(
-                    "Forecast uses 12-month seasonal Holt-Winters, blended 70/30 with recent monthly average, "
-                    "adjusted by confidence alpha and forecast bias."
+                    "Forecast uses 12-month seasonal Holt-Winters, blended with recency weighting and year-on-year growth trend projection."
                 )
         except Exception as e:
             st.error(f"Error rendering forecast sheet: {e}")
