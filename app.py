@@ -960,6 +960,11 @@ if selected_tab == "Forecast":
                     palette[index % len(palette)] for index in range(len(series_order))
                 ]
                 value_format = ",.0f" if metric != "GP%" else ".1f"
+                
+                # Use st.session_state to store legend selections persistently across filter changes
+                if "legend_selection_state" not in st.session_state:
+                    st.session_state["legend_selection_state"] = None
+
                 legend_selection = alt.selection_point(
                     name="series_legend",
                     fields=["Series"],
@@ -967,12 +972,13 @@ if selected_tab == "Forecast":
                     toggle="true",
                     clear=False,
                 )
+                
                 yearly_chart = (
                     alt.Chart(chart_data)
                     .mark_line(point=True)
                     .encode(
                         x=alt.X("Month:N", sort=forecast_engine.MONTHS, title="Month"),
-                        y=alt.Y("Value:Q", title=metric),
+                        y=alt.Y("Value:Q", title=metric, scale=alt.Scale(zero=False)),
                         color=alt.Color(
                             "Series:N",
                             sort=series_order,
@@ -1049,11 +1055,17 @@ if selected_tab == "Forecast":
                             )
                             .add_params(month_hover_selection)
                         )
-                st.altair_chart(
+                
+                # Capture chart selection events to persist legend state and prevent resets on filter change
+                chart_event = st.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts),
                     key="forecast_monthly_chart",
+                    on_select="rerun",
                     **FULL_WIDTH,
                 )
+                if chart_event and hasattr(chart_event, "selection"):
+                    st.session_state["legend_selection_state"] = chart_event.selection
+
                 st.caption(
                     f"Solid lines: actual by year · Dashed lines: forecast · "
                     f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
