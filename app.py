@@ -640,10 +640,10 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-# Tab-style navigation.
+# Tab-style navigation (Forecast positioned at the beginning).
 selected_tab = st.radio(
     "View",
-    ["Options Data", "Forecast", "Formatted Data"],
+    ["Forecast", "Options Data", "Formatted Data"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -651,41 +651,7 @@ selected_tab = st.radio(
 prepared_data = None
 source_names = []
 
-if selected_tab == "Options Data":
-    try:
-        df_options = load_csv(str(csv_path))
-        st.success(f"Options data loaded successfully from {csv_path.name}!")
-
-        df_options_filtered = filter_options_data(df_options)
-
-        st.subheader("Options Data Table:")
-        st.caption(
-            f"Showing {min(1000, len(df_options_filtered)):,} of "
-            f"{len(df_options_filtered):,} filtered rows "
-            f"({len(df_options):,} total options)"
-        )
-        st.data_editor(
-            df_options_filtered.head(1000),
-            num_rows="dynamic",
-            **FULL_WIDTH,
-        )
-
-        st.download_button(
-            "Download full options data",
-            df_options.to_csv(index=False).encode("utf-8"),
-            file_name="options_data.csv",
-            mime="text/csv",
-        )
-
-    except FileNotFoundError:
-        st.warning(
-            "⚠️ 'options_data.csv' not found. "
-            "Please make sure your CSV file is in the Raw_data folder."
-        )
-    except Exception as e:
-        st.error(f"Something went wrong while loading the data: {e}")
-
-elif selected_tab == "Forecast":
+if selected_tab == "Forecast":
     try:
         prepared_data, source_names = load_raw_folder_data(
             str(raw_data_path), raw_folder_manifest(raw_data_path)
@@ -863,12 +829,11 @@ elif selected_tab == "Forecast":
                     help=f"Rolling previous 12 months (Weighted) · {window_label(result['mape_window'])}",
                 )
 
-                # --- 2026 FORECAST VS ACTUAL OVERVIEW (YTD, YTG, FULL YEAR) ---
+                # --- FORECAST VS ACTUAL OVERVIEW (YTD, YTG, FULL YEAR) ---
                 this_year_periods = pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
                 ytd_periods = [p for p in this_year_periods if p <= last_complete]
                 ytg_periods = [p for p in this_year_periods if p > last_complete]
 
-                # Map forecasts into a indexed Series for calculation
                 fc_this_series = pd.Series(
                     forecast_this_year["Forecast"].values,
                     index=pd.to_datetime(forecast_this_year["Date"]).dt.to_period("M")
@@ -912,7 +877,7 @@ elif selected_tab == "Forecast":
                 o_col3.metric(
                     "Full Year Outlook (Actual + Forecast)",
                     fmt_str(fy_act_fc),
-                    delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Full Year Baseline FC" if pd.notna(fy_diff) else "n/a",
+                    delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
                     help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
                 )
                 o_col4.metric(
@@ -933,8 +898,6 @@ elif selected_tab == "Forecast":
                     for col in numeric_cols:
                         annual_profile[col] = annual_profile[col].mean()
 
-                # Year columns can come back as ints or strings; keep the
-                # originals for lookups and use strings for everything drawn.
                 year_columns = sorted(
                     (column for column in annual_profile.columns if column != "Month"),
                     key=lambda value: int(value),
@@ -1142,6 +1105,40 @@ elif selected_tab == "Forecast":
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
 
+elif selected_tab == "Options Data":
+    try:
+        df_options = load_csv(str(csv_path))
+        st.success(f"Options data loaded successfully from {csv_path.name}!")
+
+        df_options_filtered = filter_options_data(df_options)
+
+        st.subheader("Options Data Table:")
+        st.caption(
+            f"Showing {min(1000, len(df_options_filtered)):,} of "
+            f"{len(df_options_filtered):,} filtered rows "
+            f"({len(df_options):,} total options)"
+        )
+        st.data_editor(
+            df_options_filtered.head(1000),
+            num_rows="dynamic",
+            **FULL_WIDTH,
+        )
+
+        st.download_button(
+            "Download full options data",
+            df_options.to_csv(index=False).encode("utf-8"),
+            file_name="options_data.csv",
+            mime="text/csv",
+        )
+
+    except FileNotFoundError:
+        st.warning(
+            "⚠️ 'options_data.csv' not found. "
+            "Please make sure your CSV file is in the Raw_data folder."
+        )
+    except Exception as e:
+        st.error(f"Something went wrong while loading the data: {e}")
+
 elif selected_tab == "Formatted Data":
     try:
         prepared_data, source_names = load_raw_folder_data(
@@ -1171,3 +1168,4 @@ elif selected_tab == "Formatted Data":
             file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
             mime="text/csv",
         )
+```[cite: 1]
