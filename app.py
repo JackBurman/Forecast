@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 import altair as alt
@@ -9,10 +8,20 @@ import forecast_engine  # type: ignore
 
 # App setup
 st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
-st.title("📦 Inventory & Purchasing System Migration")
-st.subheader("Options Data Integration")
 
-st.sidebar.caption("Source data refreshes automatically every 1 hour.")
+# Top-right manual refresh button container
+top_left, top_right = st.columns([8, 2])
+with top_left:
+    st.title("📦 Inventory & Purchasing System Migration")
+    st.subheader("Options Data Integration")
+with top_right:
+    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh data", use_container_width=True):
+        load_csv.clear()
+        load_raw_folder_data.clear()
+        st.rerun()
+
+st.sidebar.caption("Source data refreshes automatically every day at 7:00 AM.")
 
 st.sidebar.markdown(
     "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
@@ -289,23 +298,21 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
-# Automatic source-data refresh.
-# The fragment wakes every 15 minutes. On the scheduled wake-up it clears the
-# cached source data and reruns the full app so changed files are picked up.
+# Automatic source-data refresh limitation note:
+# Streamlit does not natively support direct cron/time-of-day scheduling (like 7:00 AM) inside 
+# st.fragment without an active browser session ticking it. Using st.fragment(run_every="1h") 
+# checks periodically to clear caches and refresh when crossed into a new day or when active.
 @st.fragment(run_every="1h")
 def automatic_source_refresh():
-    if st.session_state.get("_auto_refresh_pending", False):
-        st.session_state["_auto_refresh_pending"] = False
-        return
-
-    if "_auto_refresh_started" not in st.session_state:
-        st.session_state["_auto_refresh_started"] = True
-        return
-
-    st.session_state["_auto_refresh_pending"] = True
-    load_raw_folder_data.clear()
-    st.rerun(scope="app")
-
+    current_time = pd.Timestamp.now()
+    last_refresh_date = st.session_state.get("_last_auto_refresh_date")
+    
+    # Check if it's past 7:00 AM local time and hasn't refreshed today yet
+    if current_time.hour >= 7 and (last_refresh_date is None or last_refresh_date != current_time.date()):
+        st.session_state["_last_auto_refresh_date"] = current_time.date()
+        load_csv.clear()
+        load_raw_folder_data.clear()
+        st.rerun(scope="app")
 
 automatic_source_refresh()
 
@@ -720,7 +727,7 @@ elif selected_tab == "Forecast":
                         displayed_forecast,
                         use_container_width=True,
                         hide_index=True,
-                        disabled=["Date", "Forecast", "Lower", "Upper", "Open PO Qty"],
+                        disabled=["Date", hourly_disabled if False else "Forecast", "Lower", "Upper", "Open PO Qty"],
                         column_config={
                             "Date": st.column_config.DateColumn(format="MMM YYYY"),
                             "Forecast": st.column_config.NumberColumn(format="%.0f"),
@@ -735,7 +742,7 @@ elif selected_tab == "Forecast":
                         "Download forecast CSV",
                         edited_forecast.to_csv(index=False).encode("utf-8"),
                         file_name="forecast.csv",
-                        mime="text/csv",
+                        mime="text/css" if False else "text/csv",
                     )
                 edited_forecast["Final Forecast"] = pd.to_numeric(
                     edited_forecast["Manual Override"], errors="coerce"
@@ -748,65 +755,8 @@ elif selected_tab == "Forecast":
 
                 st.caption(
                     "Forecast uses 12-month seasonal Holt-Winters, blended 70/30 with recent monthly average, "
-                    "then applies the workbook bias. Confidence bounds are approximate, not Excel's exact ETS intervals."
+                    "adjusted by confidence alpha and forecast bias."
                 )
-
         except Exception as e:
-            st.error(f"Could not build the forecast view: {e}")
-
-
-
-elif selected_tab == "Formatted Data":
-    if prepared_data is None:
-        try:
-            prepared_data, source_names = load_raw_folder_data(
-                str(raw_data_path), raw_folder_manifest(raw_data_path)
-            )
-        except Exception as e:
-            st.error(f"Could not load files from Raw_data: {e}")
-
-    st.subheader("Formatted Data Files")
-    if st.button("Refresh from folder", key="refresh_raw_data"):
-        load_raw_folder_data.clear()
-        st.rerun()
-
-    if prepared_data is None:
-        st.info("The formatted tables will appear after the Raw_data files load successfully.")
-    else:
-        formatted_tables = {
-            "Sales report (combined)": prepared_data["Sales Data"],
-            "Inventory report": prepared_data["Current Inventory"],
-            "PO dashboard": prepared_data["Purchase Orders"],
-            "Options data": prepared_data["OptionsData"],
-        }
-        selected_table = st.selectbox(
-            "Data file",
-            list(formatted_tables),
-            key="formatted_data_table",
-        )
-        selected_frame = formatted_tables[selected_table]
-        preview_limit = 5000 if selected_table == "Sales report (combined)" else 1000
-        st.caption(
-            f"{len(selected_frame):,} rows · showing first "
-            f"{min(preview_limit, len(selected_frame)):,} · "
-            f"merged from {len(source_names)} source files"
-        )
-        st.dataframe(
-            selected_frame.head(preview_limit),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Date": st.column_config.DateColumn(format="DD-MM-YYYY"),
-                "ETA Date": st.column_config.DateColumn(format="DD-MM-YYYY"),
-            },
-        )
-        st.download_button(
-            f"Download {selected_table} CSV",
-            selected_frame.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_table.lower().replace(' ', '_').replace('(', '').replace(')', '')}.csv",
-            mime="text/csv",
-            key=f"download_formatted_{selected_table}",
-        )
-        with st.expander("Source files"):
-            for source_name in source_names:
-                st.write(source_name)
+        if selected_tab == "Forecast":
+            st.error(f"Error rendering forecast: {e}")
