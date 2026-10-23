@@ -8,7 +8,7 @@ import streamlit as st
 import forecast_engine  # type: ignore
 
 # App setup
-st.set_page_config(page_title="Inventory & Purchasing System", layout="wide")
+st.set_page_config(page_title="Inventory & Purchasing System texrt", layout="wide")
 
 # Reduce default top padding to pull everything higher up the page
 st.markdown(
