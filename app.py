@@ -310,8 +310,8 @@ def load_raw_folder_data(
 # Next-year forecast  : this year's actual month × this year's growth where a
 #                       complete month exists, otherwise this year's forecast.
 # Rolling 12 months   : the 12 months after the current month, summed.
-# Rolling MAPE        : the same method back-tested on the previous 12
-#                       complete months.
+# Historical wMAPE    : the same method back-tested as a weighted MAPE on
+#                       the previous 12 complete months.
 # ---------------------------------------------------------------------------
 
 SEASON = 12
@@ -486,18 +486,24 @@ def next_year_forecast(
     return pd.Series(values, dtype=float)
 
 
-def rolling_mape(
+def rolling_wmape(
     actual: pd.Series, last_complete: pd.Period, yoy_weight: float, bias: float, clip_at_zero: bool
 ) -> tuple[float | None, pd.PeriodIndex]:
-    """Back-test the blended method over the previous 12 complete months."""
+    """Back-test using Weighted MAPE (wMAPE) over the previous 12 complete months."""
     window = pd.period_range(last_complete - (SEASON - 1), periods=SEASON, freq="M")
     predicted = blended_forecast(actual, window[0], SEASON, yoy_weight, bias, clip_at_zero)
     observed = actual.reindex(window)
     valid = observed.notna() & observed.ne(0) & predicted.notna()
     if not valid.any():
         return None, window
-    errors = (observed[valid] - predicted[valid]).abs() / observed[valid].abs()
-    return float(errors.mean()), window
+    
+    abs_errors = (observed[valid] - predicted[valid]).abs()
+    total_actual = observed[valid].abs()
+    
+    if total_actual.sum() == 0:
+        return 0.0, window
+        
+    return float(abs_errors.sum() / total_actual.sum()), window
 
 
 def build_forecasts(
@@ -532,7 +538,7 @@ def build_forecasts(
     else:
         rolling_total = None
 
-    mape, mape_window = rolling_mape(actual, last_complete, yoy_weight, bias, clip_at_zero)
+    mape, mape_window = rolling_wmape(actual, last_complete, yoy_weight, bias, clip_at_zero)
 
     def as_frame(series: pd.Series) -> pd.DataFrame:
         return pd.DataFrame(
@@ -849,9 +855,9 @@ elif selected_tab == "Forecast":
                     help=f"Open POs due by {rolling_window[-1].strftime('%b %Y')}, including overdue.",
                 )
                 summary[4].metric(
-                    "Historical MAPE",
+                    "Historical wMAPE",
                     f"{mape:.1%}" if mape is not None else "n/a",
-                    help=f"Rolling previous 12 months · {window_label(result['mape_window'])}",
+                    help=f"Rolling previous 12 months (Weighted) · {window_label(result['mape_window'])}",
                 )
 
                 annual_profile = forecast_engine.yearly_monthly_profile(
