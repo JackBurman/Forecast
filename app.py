@@ -1168,4 +1168,3 @@ elif selected_tab == "Formatted Data":
             file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
             mime="text/csv",
         )
-```[cite: 1]
