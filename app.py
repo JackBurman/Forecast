@@ -578,8 +578,7 @@ def window_label(window: pd.PeriodIndex) -> str:
 # Top-right manual refresh button container
 top_left, top_right = st.columns([8, 2])
 with top_left:
-    st.title("📦 Inventory & Purchasing System Migration")
-    st.subheader("Options Data Integration")
+    st.title("📦 Forcasting & Purchasing System")
 with top_right:
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
     if st.button("🔄 Refresh data", **FULL_WIDTH):
