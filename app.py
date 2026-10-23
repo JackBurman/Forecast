@@ -13,7 +13,7 @@ st.title("📦 Inventory & Purchasing System Migration")
 st.subheader("Options Data Integration")
 
 st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: +12px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
+    "<div style='text-align: center; margin-top: -60px;'><img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'></div>",
     unsafe_allow_html=True,
 )
 
