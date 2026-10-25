@@ -417,42 +417,31 @@ def blended_forecast(
 
 def next_year_forecast(
     actual: pd.Series,
-    this_year_forecast: pd.Series,
     this_year: int,
     last_complete: pd.Period,
+    yoy_weight: float,
     bias: float,
-    history_from_year: int,
+    clip_at_zero: bool,
 ) -> pd.Series:
-    this_year_months = [
-        period
-        for period in pd.period_range(f"{history_from_year}-01", periods=(this_year - history_from_year + 1) * SEASON, freq="M")
-        if period <= last_complete and period in actual.index
-    ]
-    recent = sum(float(actual[period]) for period in this_year_months)
-    prior = sum(
-        float(actual[period - SEASON])
-        for period in this_year_months
-        if (period - SEASON) in actual.index
-    )
-    growth = clamp_growth(recent / prior) if recent > 0 and prior > 0 else DEFAULT_GROWTH
+    # 2027 forecast starts at Jan (this_year + 1)
+    next_start = pd.Period(f"{this_year + 1}-01", freq="M")
 
-    values = {}
-    for period in pd.period_range(f"{this_year + 1}-01", periods=SEASON, freq="M"):
-        base_period = period - SEASON
-        actual_value = (
-            float(actual[base_period])
-            if base_period <= last_complete and base_period in actual.index
-            else np.nan
-        )
-        if pd.notna(actual_value) and actual_value > 0:
-            values[period] = actual_value * growth * bias
-        else:
-            values[period] = (
-                float(this_year_forecast[base_period])
-                if base_period in this_year_forecast.index
-                else np.nan
-            )
-    return pd.Series(values, dtype=float)
+    # Fit ETS + YoY trend up to the most recent completed sales period (last_complete + 1)
+    as_of_period = last_complete + 1
+    months_ahead = (next_start - as_of_period).n
+    horizon = months_ahead + SEASON
+
+    forecast_series = blended_forecast(
+        history=actual,
+        start=as_of_period,
+        horizon=horizon,
+        yoy_weight=yoy_weight,
+        bias=bias,
+        clip_at_zero=clip_at_zero,
+    )
+
+    next_year_periods = pd.period_range(next_start, periods=SEASON, freq="M")
+    return forecast_series.reindex(next_year_periods)
 
 
 def rolling_wmape(
@@ -493,7 +482,7 @@ def build_forecasts(
 
     this_start = pd.Period(f"{this_year}-01", freq="M")
     forecast_this = blended_forecast(actual, this_start, SEASON, yoy_weight, bias, clip_at_zero)
-    forecast_next = next_year_forecast(actual, forecast_this, this_year, last_complete, bias, history_from_year)
+    forecast_next = next_year_forecast(actual, this_year, last_complete, yoy_weight, bias, clip_at_zero)
 
     if metric == "GP%":
         forecast_this[:] = forecast_this.mean()
@@ -1073,8 +1062,8 @@ if selected_tab == "Forecast":
                     f"Solid lines: actual by year · Dashed lines: forecast · "
                     f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
                     f"blended with the year-on-year trend · "
-                    f"Forecast {this_year + 1} = {this_year} actual × growth where the month is "
-                    f"complete, otherwise the {this_year} forecast."
+                    f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
+                    f"blended with the year-on-year trend."
                 )
 
                 graph_table = (
