@@ -1190,7 +1190,8 @@ if selected_tab == "Forecast":
                             .add_params(month_hover_selection)
                         )
                 
-                chart_event = alt.altair_chart(
+                # FIXED: Changed alt.altair_chart to st.altair_chart
+                chart_event = st.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts),
                     key="forecast_monthly_chart",
                     on_select="rerun",
