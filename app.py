@@ -10,13 +10,57 @@ import forecast_engine  # type: ignore
 # App setup
 st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 
-# Reduce default top padding to pull everything higher up the page
+# Layout-only styling: tighter page frame, compact metric tiles, card headings.
+# Everything here is cosmetic; no data or calculations depend on it.
 st.markdown(
     """
     <style>
+        /* Tighter page frame so the headline cards and chart fit one screen */
         .block-container {
-            padding-top: 1.3rem;
-            padding-bottom: 0rem;
+            padding-top: 1.2rem;
+            padding-bottom: 1rem;
+        }
+        /* Less vertical gap between stacked elements (default is 1rem) */
+        [data-testid="stVerticalBlock"] {
+            gap: 0.6rem;
+        }
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+            gap: 0.45rem;
+        }
+        /* Smaller page title */
+        h1 {
+            font-size: 1.8rem !important;
+            padding-top: 0.2rem !important;
+            padding-bottom: 0.2rem !important;
+        }
+        h2, h3 {
+            padding-top: 0.3rem !important;
+            padding-bottom: 0.2rem !important;
+        }
+        /* Compact metric tiles */
+        [data-testid="stMetric"] {
+            padding: 0.1rem 0;
+        }
+        [data-testid="stMetricLabel"] p {
+            font-size: 0.78rem;
+            line-height: 1.2;
+            white-space: normal;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.5rem;
+            line-height: 1.2;
+        }
+        [data-testid="stMetricDelta"] {
+            font-size: 0.78rem;
+        }
+        /* Card headings */
+        .card-title {
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            opacity: 0.65;
+            margin: 0 0 0.15rem 0;
         }
     </style>
     """,
@@ -450,13 +494,13 @@ def rolling_wmape(
     valid = observed.notna() & observed.ne(0) & predicted.notna()
     if valid.empty:
         return None, window
-    
+
     abs_errors = (observed[valid] - predicted[valid]).abs()
     total_actual = observed[valid].abs()
-    
+
     if total_actual.sum() == 0:
         return 0.0, window
-        
+
     return float(abs_errors.sum() / total_actual.sum()), window
 
 
@@ -516,12 +560,36 @@ def window_label(window: pd.PeriodIndex) -> str:
     return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
 
 
-# Top-right manual refresh button container
-top_left, top_right = st.columns([8, 2])
-with top_left:
+# ---------------------------------------------------------------------------
+# Layout helpers (presentation only)
+# ---------------------------------------------------------------------------
+
+def metric_card(title: str, tiles: list[dict]) -> None:
+    """A bordered card with a small heading and one st.metric per tile."""
+    with st.container(border=True):
+        st.markdown(f"<p class='card-title'>{title}</p>", unsafe_allow_html=True)
+        columns = st.columns(len(tiles), gap="small")
+        for column, tile in zip(columns, tiles):
+            column.metric(**tile)
+
+
+def chart_formats(metric: str) -> tuple[str, str, str]:
+    """Axis format, tooltip format and axis title for a metric (display only)."""
+    if metric in ["Sale", "Cost", "GP $"]:
+        return "$~s", "$,.0f", f"{metric.replace(' $', '')} ($)"
+    if metric == "GP%":
+        return ".1f", ".1f", "GP %"
+    return "~s", ",.0f", "Qty (units)"
+
+
+# ---------------------------------------------------------------------------
+# Page header
+# ---------------------------------------------------------------------------
+
+header_left, header_right = st.columns([6, 1], gap="small", vertical_alignment="center")
+with header_left:
     st.title("📦 Forecasting & Purchasing System")
-with top_right:
-    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+with header_right:
     if st.button("🔄 Refresh data", **FULL_WIDTH):
         load_csv.clear()
         load_raw_folder_data.clear()
@@ -619,17 +687,6 @@ if selected_tab == "Forecast":
         try:
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
-            
-            planner_col, year_type_col = st.columns([2, 1])
-            with planner_col:
-                st.subheader("Forecast Planner")
-            with year_type_col:
-                year_view = st.selectbox(
-                    "Year Type View",
-                    ["Calendar Year (Jan-Dec)", "Financial Year (Jul-Jun)"],
-                    index=0,
-                    key="year_type_view_select"
-                )
 
             def choices_for(series: pd.Series) -> list[str]:
                 values = sorted(
@@ -653,15 +710,20 @@ if selected_tab == "Forecast":
                 index = choices.index(default) if default in choices else 0
                 return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
 
+            # Sidebar: the metric and the filters stay visible; tuning
+            # parameters and the target live in collapsed expanders.
             with st.sidebar:
                 st.header("Forecast filters")
-                st.subheader("Sales")
+                metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
+                metric = st.selectbox("View", metric_options, index=0)
+
+                st.markdown("**Sales**")
                 selected_location = filter_selectbox("Location", sales_data["City"])
                 selected_channel = filter_selectbox(
                     "Sales channel", sales_data["Sales Channel Net"]
                 )
 
-                st.subheader("Product")
+                st.markdown("**Product**")
                 selected_classification = filter_selectbox(
                     "Classification", sales_data["OptionsData.Fourth Product Group"]
                 )
@@ -672,43 +734,41 @@ if selected_tab == "Forecast":
                 selected_model = filter_selectbox("Model", sales_data["Model"])
                 selected_sku = filter_selectbox("SKU", sales_data["SKU Key"])
 
-                st.subheader("Forecast settings")
-                metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
-                metric = st.selectbox("View", metric_options, index=0)
-                history_from_year = st.number_input(
-                    "History from Year",
-                    min_value=2000,
-                    max_value=2100,
-                    value=2024,
-                    step=1,
-                    help="First year of actuals shown on the chart.",
-                )
-                forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
-                bias = st.number_input(
-                    "Forecast bias",
-                    min_value=0.0,
-                    max_value=5.0,
-                    value=1.0,
-                    step=0.05,
-                    help="Multiplier applied to every forecast month.",
-                )
-                yoy_weight = st.slider(
-                    "YoY trend weight",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.5,
-                    step=0.05,
-                    help="0 = pure ETS, 1 = pure year-on-year trend projection.",
-                )
+                with st.expander("Forecast settings", expanded=False):
+                    history_from_year = st.number_input(
+                        "History from Year",
+                        min_value=2000,
+                        max_value=2100,
+                        value=2024,
+                        step=1,
+                        help="First year of actuals shown on the chart.",
+                    )
+                    forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
+                    bias = st.number_input(
+                        "Forecast bias",
+                        min_value=0.0,
+                        max_value=5.0,
+                        value=1.0,
+                        step=0.05,
+                        help="Multiplier applied to every forecast month.",
+                    )
+                    yoy_weight = st.slider(
+                        "YoY trend weight",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=0.5,
+                        step=0.05,
+                        help="0 = pure ETS, 1 = pure year-on-year trend projection.",
+                    )
 
-                st.subheader("Target Settings")
-                sale_target = st.number_input(
-                    "Sale Target ($)",
-                    min_value=0.0,
-                    value=70000000.0,
-                    step=1000000.0,
-                    help="Target sale value for comparison.",
-                )
+                with st.expander("Target settings", expanded=False):
+                    sale_target = st.number_input(
+                        "Sale Target ($)",
+                        min_value=0.0,
+                        value=70000000.0,
+                        step=1000000.0,
+                        help="Target sale value for comparison.",
+                    )
 
             filters = {
                 "Location": selected_location,
@@ -741,6 +801,10 @@ if selected_tab == "Forecast":
             if result["actual"].empty:
                 st.warning("No completed months of dated sales match these selections.")
             else:
+                # ------------------------------------------------------------
+                # Calculations (unchanged) — all computed up front so the
+                # layout below can place them freely.
+                # ------------------------------------------------------------
                 total_po = 0.0
                 if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
                     purchase_months.columns
@@ -753,7 +817,6 @@ if selected_tab == "Forecast":
 
                 rolling_total = result["rolling_total"]
                 mape = result["mape"]
-                summary = st.columns(5)
                 forecast_label_prefix = "$" if metric in ["Sale", "Cost", "GP $"] else ""
                 if rolling_total is None:
                     rolling_display = "n/a"
@@ -761,26 +824,8 @@ if selected_tab == "Forecast":
                     rolling_display = f"{rolling_total:.1f}%"
                 else:
                     rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
-                summary[0].metric(
-                    "Rolling 12-Month Forecast",
-                    rolling_display,
-                    help=f"{window_label(rolling_window)} · "
-                    + ("average GP%" if metric == "GP%" else f"total {metric}"),
-                )
-                summary[1].metric("On hand · all sites", f"{on_hand:,.0f}")
-                summary[2].metric("Free stock · all sites", f"{free_stock:,.0f}")
-                summary[3].metric(
-                    "Open PO quantity",
-                    f"{total_po:,.0f}",
-                    help=f"Open POs due by {rolling_window[-1].strftime('%b %Y')}, including overdue.",
-                )
-                summary[4].metric(
-                    "Historical wMAPE",
-                    f"{mape:.1%}" if mape is not None else "n/a",
-                    help=f"Rolling previous 12 months (Weighted) · {window_label(result['mape_window'])}",
-                )
 
-                # --- FORECAST VS ACTUAL OVERVIEW (YTD, YTG, FULL YEAR) ---
+                # Forecast vs actual (YTD, YTG, full year)
                 this_year_periods = pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
                 ytd_periods = [p for p in this_year_periods if p <= last_complete]
                 ytg_periods = [p for p in this_year_periods if p > last_complete]
@@ -809,35 +854,9 @@ if selected_tab == "Forecast":
                 fy_diff = fy_act_fc - fy_fc if pd.notna(fy_act_fc) and pd.notna(fy_fc) else np.nan
                 fy_pct = (fy_diff / fy_fc * 100) if pd.notna(fy_diff) and fy_fc != 0 else np.nan
 
-                st.markdown(f"### 📊 {this_year} Forecast vs Actual Overview")
-                o_col1, o_col2, o_col3, o_col4 = st.columns(4)
-
                 fmt_str = lambda x: f"{x:.1f}%" if metric == "GP%" else f"{forecast_label_prefix}{x:,.0f}"
 
-                o_col1.metric(
-                    "YTD Actual vs Forecast",
-                    fmt_str(ytd_act),
-                    delta=f"{ytd_diff:+.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a",
-                    help=f"Actuals from Jan {this_year} to {last_complete.strftime('%b %Y')} vs blended forecast.",
-                )
-                o_col2.metric(
-                    "YTG Forecast Remaining",
-                    fmt_str(ytg_fc),
-                    help=f"Blended forecast for remaining months of {this_year}.",
-                )
-                o_col3.metric(
-                    "Full Year Outlook (Actual + Forecast)",
-                    fmt_str(fy_act_fc),
-                    delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
-                    help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
-                )
-                o_col4.metric(
-                    "Full Year Baseline Forecast",
-                    fmt_str(fy_fc),
-                    help=f"Original full-year blended forecast for {this_year}.",
-                )
-
-                # --- THIS YEAR VS PREVIOUS YEAR PERFORMANCE ---
+                # This year vs previous year
                 prior_year = this_year - 1
                 prior_year_periods = pd.period_range(f"{prior_year}-01", periods=SEASON, freq="M")
                 prior_ytd_periods = [p - SEASON for p in ytd_periods]
@@ -849,174 +868,78 @@ if selected_tab == "Forecast":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
-                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & UNIQUE IN-GRAPH LABELS ---
-                if metric == "Sale":
-                    st.markdown(f"### 🎯 Target & Performance Comparison")
-                    target_80 = sale_target * 0.8
-                    
-                    target_diff = fy_act_fc - sale_target
-                    target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
-
-                    target_80_diff = fy_act_fc - target_80
-                    target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
-
-                    prior_target_diff = prior_fy_act - sale_target
-                    prior_target_pct = (prior_target_diff / sale_target) * 100 if sale_target > 0 else 0.0
-
-                    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
-
-                    t_col1.metric(
-                        "Full Year Outlook",
-                        fmt_str(fy_act_fc),
-                        delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)",
-                        help="Comparison of Full Year Outlook (Actual + Forecast) against the Sale Target.",
-                    )
-                    t_col2.metric(
-                        "100% Sale Target",
-                        f"${sale_target:,.0f}",
-                        delta=f"{target_pct:+.1f}% to Target",
-                        help="Editable Sale Target.",
-                    )
-                    t_col3.metric(
-                        "80% Sale Target",
-                        f"${target_80:,.0f}",
-                        delta=f"{target_80_pct:+.1f}% to 80% Target",
-                        help="80% threshold of the custom Sale Target.",
-                    )
-                    t_col4.metric(
-                        f"{prior_year} Full Year Actuals",
-                        fmt_str(prior_fy_act),
-                        help=f"Total actual performance across all 12 months of {prior_year}.",
-                    )
-
-                    # 2 Distinct Horizontal Bars Dataset with Unique Text Labels
-                    target_df = pd.DataFrame([
-                        {
-                            "Category": f"{prior_year} Actuals",
-                            "Value": prior_fy_act,
-                            "Label": f"${prior_fy_act:,.0f} ({prior_target_pct:+.1f}% vs Target)"
-                        },
-                        {
-                            "Category": f"{this_year} Outlook",
-                            "Value": fy_act_fc,
-                            "Label": f"${fy_act_fc:,.0f} ({target_pct:+.1f}% vs Target)"
-                        },
-                    ])
-
-                    horizontal_bar_chart = (
-                        alt.Chart(target_df)
-                        .mark_bar(size=26)
-                        .encode(
-                            y=alt.Y(
-                                "Category:N",
-                                sort=[f"{prior_year} Actuals", f"{this_year} Outlook"],
-                                title=None,
-                            ),
-                            x=alt.X(
-                                "Value:Q",
-                                title="Sales ($)",
-                                scale=alt.Scale(zero=True),
-                            ),
-                            color=alt.Color(
-                                "Category:N",
-                                scale=alt.Scale(
-                                    domain=[f"{prior_year} Actuals", f"{this_year} Outlook"],
-                                    range=["#56b4e9", "#009e73"],
-                                ),
-                                legend=None,
-                            ),
-                            tooltip=[
-                                alt.Tooltip("Category:N", title="Performance"),
-                                alt.Tooltip("Value:Q", title="Value", format="$,.0f"),
-                            ],
-                        )
-                    )
-
-                    # Top Bar Label (Above the top bar: dy = -12)
-                    bar_label_top = (
-                        alt.Chart(target_df.iloc[[0]])
-                        .mark_text(align="left", dx=4, dy=-12, color="#002b49", fontWeight="bold", fontSize=11)
-                        .encode(
-                            y=alt.Y("Category:N", sort=[f"{prior_year} Actuals", f"{this_year} Outlook"]),
-                            x=alt.X("Value:Q"),
-                            text=alt.Text("Label:N"),
-                        )
-                    )
-
-                    # Bottom Bar Label (Below the bottom bar: dy = 18)
-                    bar_label_bottom = (
-                        alt.Chart(target_df.iloc[[1]])
-                        .mark_text(align="left", dx=4, dy=18, color="#009e73", fontWeight="bold", fontSize=11)
-                        .encode(
-                            y=alt.Y("Category:N", sort=[f"{prior_year} Actuals", f"{this_year} Outlook"]),
-                            x=alt.X("Value:Q"),
-                            text=alt.Text("Label:N"),
-                        )
-                    )
-
-                    # Vertical Dotted Lines for Target Benchmarks with text annotations on top
-                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
-                        color="#0072b2", strokeDash=[4, 4], strokeWidth=2
-                    ).encode(x="x:Q")
-
-                    target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f})"]})).mark_text(
-                        align="center", baseline="bottom", dy=-10, color="#0072b2", fontWeight="bold", fontSize=11
-                    ).encode(x="x:Q", text="label:N")
-
-                    target_80_line = alt.Chart(pd.DataFrame({"x": [target_80]})).mark_rule(
-                        color="#e69f00", strokeDash=[2, 2], strokeWidth=2
-                    ).encode(x="x:Q")
-
-                    target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f})"]})).mark_text(
-                        align="center", baseline="bottom", dy=-25, color="#e69f00", fontWeight="bold", fontSize=11
-                    ).encode(x="x:Q", text="label:N")
-
-                    st.altair_chart(
-                        alt.layer(
-                            horizontal_bar_chart,
-                            bar_label_top,
-                            bar_label_bottom,
-                            target_100_line,
-                            target_100_text,
-                            target_80_line,
-                            target_80_text,
-                        ).properties(height=180),
-                        **FULL_WIDTH,
-                    )
-
                 py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
                 py_ytd_pct = (py_ytd_diff / prior_ytd_act * 100) if pd.notna(py_ytd_diff) and prior_ytd_act != 0 else np.nan
 
                 py_fy_diff = fy_act_fc - prior_fy_act if pd.notna(fy_act_fc) and pd.notna(prior_fy_act) else np.nan
                 py_fy_pct = (py_fy_diff / prior_fy_act * 100) if pd.notna(py_fy_diff) and prior_fy_act != 0 else np.nan
 
-                st.markdown(f"### 📈 Performance: {this_year} vs {prior_year}")
-                p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+                # ------------------------------------------------------------
+                # Tier 1 — headline cards
+                # ------------------------------------------------------------
+                card_left, card_right = st.columns([2, 3], gap="small")
+                with card_left:
+                    metric_card(
+                        "Forecast",
+                        [
+                            dict(
+                                label="Rolling 12-Month Forecast",
+                                value=rolling_display,
+                                help=f"{window_label(rolling_window)} · "
+                                + ("average GP%" if metric == "GP%" else f"total {metric}"),
+                            ),
+                            dict(
+                                label="Historical wMAPE",
+                                value=f"{mape:.1%}" if mape is not None else "n/a",
+                                help=f"Rolling previous 12 months (Weighted) · {window_label(result['mape_window'])}",
+                            ),
+                        ],
+                    )
+                with card_right:
+                    metric_card(
+                        "Stock & supply",
+                        [
+                            dict(label="On hand · all sites", value=f"{on_hand:,.0f}"),
+                            dict(label="Free stock · all sites", value=f"{free_stock:,.0f}"),
+                            dict(
+                                label="Open PO quantity",
+                                value=f"{total_po:,.0f}",
+                                help=f"Open POs due by {rolling_window[-1].strftime('%b %Y')}, including overdue.",
+                            ),
+                        ],
+                    )
 
-                p_col1.metric(
-                    f"{this_year} YTD Actuals",
-                    fmt_str(ytd_act),
-                    delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_year}" if pd.notna(py_ytd_diff) else "n/a",
-                    help=f"Actual performance through {last_complete.strftime('%b %Y')} compared to same period in {prior_year}.",
+                metric_card(
+                    f"{this_year} forecast vs actual",
+                    [
+                        dict(
+                            label="YTD Actual vs Forecast",
+                            value=fmt_str(ytd_act),
+                            delta=f"{ytd_diff:+.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a",
+                            help=f"Actuals from Jan {this_year} to {last_complete.strftime('%b %Y')} vs blended forecast.",
+                        ),
+                        dict(
+                            label="YTG Forecast Remaining",
+                            value=fmt_str(ytg_fc),
+                            help=f"Blended forecast for remaining months of {this_year}.",
+                        ),
+                        dict(
+                            label="Full Year Outlook (Actual + Forecast)",
+                            value=fmt_str(fy_act_fc),
+                            delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
+                            help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
+                        ),
+                        dict(
+                            label="Full Year Baseline Forecast",
+                            value=fmt_str(fy_fc),
+                            help=f"Original full-year blended forecast for {this_year}.",
+                        ),
+                    ],
                 )
-                p_col2.metric(
-                    f"{prior_year} Same-Period YTD",
-                    fmt_str(prior_ytd_act),
-                    help=f"Actuals from Jan {prior_year} through {last_complete.strftime('%b')} {prior_year}.",
-                )
-                p_col3.metric(
-                    f"{this_year} Full Year Outlook",
-                    fmt_str(fy_act_fc),
-                    delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_year} Total" if pd.notna(py_fy_diff) else "n/a",
-                    help=f"Full year {this_year} projected outlook vs total actual performance in {prior_year}.",
-                )
-                p_col4.metric(
-                    f"{prior_year} Full Year Actuals",
-                    fmt_str(prior_fy_act),
-                    help=f"Total actual performance across all 12 months of {prior_year}.",
-                )
-                # --------------------------------------------------------------
 
+                # ------------------------------------------------------------
+                # Tier 2 — monthly comparison chart
+                # ------------------------------------------------------------
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
                     pd.DataFrame(columns=["Date", "Forecast"]),
@@ -1034,8 +957,28 @@ if selected_tab == "Forecast":
                 )
                 year_labels = [str(column) for column in year_columns]
 
+                chart_title_col, chart_control_col = st.columns(
+                    [5, 2], gap="small", vertical_alignment="bottom"
+                )
+                with chart_control_col:
+                    year_view = st.selectbox(
+                        "Year Type View",
+                        ["Calendar Year (Jan-Dec)", "Financial Year (Jul-Jun)"],
+                        index=0,
+                        key="year_type_view_select",
+                        label_visibility="collapsed",
+                    )
                 month_sort_order = FY_MONTHS if "Financial Year" in year_view else forecast_engine.MONTHS
-                st.subheader(f"Monthly comparison by year ({'FY Jul-Jun' if 'Financial Year' in year_view else 'Calendar Jan-Dec'})")
+                with chart_title_col:
+                    st.subheader(
+                        "Monthly comparison by year",
+                        help=(
+                            f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
+                            f"blended with the year-on-year trend. "
+                            f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
+                            f"blended with the year-on-year trend."
+                        ),
+                    )
 
                 actual_chart_data = annual_profile.melt(
                     id_vars="Month", var_name="Year", value_name="Value"
@@ -1094,8 +1037,8 @@ if selected_tab == "Forecast":
                 series_colors = [
                     palette[index % len(palette)] for index in range(len(series_order))
                 ]
-                value_format = ",.0f" if metric != "GP%" else ".1f"
-                
+                axis_format, value_format, y_title = chart_formats(metric)
+
                 if "legend_selection_state" not in st.session_state:
                     st.session_state["legend_selection_state"] = None
 
@@ -1106,18 +1049,57 @@ if selected_tab == "Forecast":
                     toggle="true",
                     clear=False,
                 )
-                
+
+                # Shared month axis: three-letter labels, no title, no grid.
+                month_axis = alt.X(
+                    "Month:N",
+                    sort=month_sort_order,
+                    title=None,
+                    axis=alt.Axis(
+                        labelAngle=0,
+                        labelExpr="slice(datum.label, 0, 3)",
+                        grid=False,
+                        ticks=False,
+                        domain=False,
+                        labelPadding=6,
+                    ),
+                )
+
                 yearly_chart = (
                     alt.Chart(chart_data)
-                    .mark_line(point=True)
+                    .mark_line(point=alt.OverlayMarkDef(size=28), strokeWidth=2)
                     .encode(
-                        x=alt.X("Month:N", sort=month_sort_order, title="Month"),
-                        y=alt.Y("Value:Q", title=metric, scale=alt.Scale(zero=False)),
+                        x=month_axis,
+                        y=alt.Y(
+                            "Value:Q",
+                            title=y_title,
+                            scale=alt.Scale(zero=False),
+                            axis=alt.Axis(
+                                format=axis_format,
+                                grid=True,
+                                gridOpacity=0.35,
+                                gridDash=[2, 3],
+                                tickCount=5,
+                                ticks=False,
+                                domain=False,
+                                titleFontWeight="normal",
+                                titlePadding=10,
+                            ),
+                        ),
                         color=alt.Color(
                             "Series:N",
                             sort=series_order,
                             scale=alt.Scale(domain=series_order, range=series_colors),
-                            title="Year",
+                            legend=alt.Legend(
+                                title=None,
+                                orient="top",
+                                direction="horizontal",
+                                symbolType="stroke",
+                                symbolStrokeWidth=3,
+                                labelFontSize=11,
+                                padding=0,
+                                offset=6,
+                            ),
                         ),
                         strokeDash=alt.StrokeDash(
                             "Line Type:N",
@@ -1178,7 +1160,7 @@ if selected_tab == "Forecast":
                             alt.Chart(pd.DataFrame([tooltip_row]))
                             .mark_rule(color="#667085", strokeWidth=12)
                             .encode(
-                                x=alt.X("Month:N", sort=month_sort_order),
+                                x=month_axis,
                                 opacity=alt.condition(
                                     month_hover_selection,
                                     alt.value(0.18),
@@ -1189,10 +1171,11 @@ if selected_tab == "Forecast":
                             )
                             .add_params(month_hover_selection)
                         )
-                
-                # FIXED: Changed alt.altair_chart to st.altair_chart
+
                 chart_event = st.altair_chart(
-                    alt.layer(yearly_chart, *month_hover_charts),
+                    alt.layer(yearly_chart, *month_hover_charts)
+                    .properties(height=360)
+                    .configure_view(strokeWidth=0),
                     key="forecast_monthly_chart",
                     on_select="rerun",
                     **FULL_WIDTH,
@@ -1201,12 +1184,183 @@ if selected_tab == "Forecast":
                     st.session_state["legend_selection_state"] = chart_event.selection
 
                 st.caption(
-                    f"Solid lines: actual by year · Dashed lines: forecast · "
-                    f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
-                    f"blended with the year-on-year trend · "
-                    f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
-                    f"blended with the year-on-year trend."
+                    f"{'FY Jul–Jun' if 'Financial Year' in year_view else 'Calendar Jan–Dec'} · "
+                    "Solid lines: actual · Dashed lines: forecast · "
+                    "Click a legend entry to show or hide a series · "
+                    "Hover a month to compare every year."
                 )
+
+                # ------------------------------------------------------------
+                # Tier 3 — secondary detail, collapsed by default
+                # ------------------------------------------------------------
+                if metric == "Sale":
+                    target_80 = sale_target * 0.8
+
+                    target_diff = fy_act_fc - sale_target
+                    target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
+
+                    target_80_diff = fy_act_fc - target_80
+                    target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
+
+                    prior_target_diff = prior_fy_act - sale_target
+                    prior_target_pct = (prior_target_diff / sale_target) * 100 if sale_target > 0 else 0.0
+
+                    with st.expander("🎯 Target & performance comparison", expanded=False):
+                        t_col1, t_col2, t_col3, t_col4 = st.columns(4, gap="small")
+
+                        t_col1.metric(
+                            "Full Year Outlook",
+                            fmt_str(fy_act_fc),
+                            delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)",
+                            help="Comparison of Full Year Outlook (Actual + Forecast) against the Sale Target.",
+                        )
+                        t_col2.metric(
+                            "100% Sale Target",
+                            f"${sale_target:,.0f}",
+                            delta=f"{target_pct:+.1f}% to Target",
+                            help="Editable Sale Target.",
+                        )
+                        t_col3.metric(
+                            "80% Sale Target",
+                            f"${target_80:,.0f}",
+                            delta=f"{target_80_pct:+.1f}% to 80% Target",
+                            help="80% threshold of the custom Sale Target.",
+                        )
+                        t_col4.metric(
+                            f"{prior_year} Full Year Actuals",
+                            fmt_str(prior_fy_act),
+                            help=f"Total actual performance across all 12 months of {prior_year}.",
+                        )
+
+                        target_df = pd.DataFrame([
+                            {
+                                "Category": f"{prior_year} Actuals",
+                                "Value": prior_fy_act,
+                                "Label": f"${prior_fy_act:,.0f} ({prior_target_pct:+.1f}% vs Target)"
+                            },
+                            {
+                                "Category": f"{this_year} Outlook",
+                                "Value": fy_act_fc,
+                                "Label": f"${fy_act_fc:,.0f} ({target_pct:+.1f}% vs Target)"
+                            },
+                        ])
+                        category_order = [f"{prior_year} Actuals", f"{this_year} Outlook"]
+
+                        horizontal_bar_chart = (
+                            alt.Chart(target_df)
+                            .mark_bar(size=26)
+                            .encode(
+                                y=alt.Y(
+                                    "Category:N",
+                                    sort=category_order,
+                                    title=None,
+                                    axis=alt.Axis(labelFontSize=12, ticks=False, domain=False),
+                                ),
+                                x=alt.X(
+                                    "Value:Q",
+                                    title=None,
+                                    scale=alt.Scale(zero=True),
+                                    axis=alt.Axis(
+                                        format="$~s",
+                                        grid=True,
+                                        gridOpacity=0.35,
+                                        gridDash=[2, 3],
+                                        tickCount=5,
+                                        ticks=False,
+                                        domain=False,
+                                    ),
+                                ),
+                                color=alt.Color(
+                                    "Category:N",
+                                    scale=alt.Scale(
+                                        domain=category_order,
+                                        range=["#56b4e9", "#009e73"],
+                                    ),
+                                    legend=None,
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("Category:N", title="Performance"),
+                                    alt.Tooltip("Value:Q", title="Value", format="$,.0f"),
+                                ],
+                            )
+                        )
+
+                        bar_label_top = (
+                            alt.Chart(target_df.iloc[[0]])
+                            .mark_text(align="left", dx=4, dy=-12, color="#002b49", fontWeight="bold", fontSize=11)
+                            .encode(
+                                y=alt.Y("Category:N", sort=category_order),
+                                x=alt.X("Value:Q"),
+                                text=alt.Text("Label:N"),
+                            )
+                        )
+
+                        bar_label_bottom = (
+                            alt.Chart(target_df.iloc[[1]])
+                            .mark_text(align="left", dx=4, dy=18, color="#009e73", fontWeight="bold", fontSize=11)
+                            .encode(
+                                y=alt.Y("Category:N", sort=category_order),
+                                x=alt.X("Value:Q"),
+                                text=alt.Text("Label:N"),
+                            )
+                        )
+
+                        target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
+                            color="#0072b2", strokeDash=[4, 4], strokeWidth=2
+                        ).encode(x="x:Q")
+
+                        target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f})"]})).mark_text(
+                            align="center", baseline="bottom", dy=-10, color="#0072b2", fontWeight="bold", fontSize=11
+                        ).encode(x="x:Q", text="label:N")
+
+                        target_80_line = alt.Chart(pd.DataFrame({"x": [target_80]})).mark_rule(
+                            color="#e69f00", strokeDash=[2, 2], strokeWidth=2
+                        ).encode(x="x:Q")
+
+                        target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f})"]})).mark_text(
+                            align="center", baseline="bottom", dy=-25, color="#e69f00", fontWeight="bold", fontSize=11
+                        ).encode(x="x:Q", text="label:N")
+
+                        st.altair_chart(
+                            alt.layer(
+                                horizontal_bar_chart,
+                                bar_label_top,
+                                bar_label_bottom,
+                                target_100_line,
+                                target_100_text,
+                                target_80_line,
+                                target_80_text,
+                            )
+                            .properties(height=170)
+                            .configure_view(strokeWidth=0),
+                            **FULL_WIDTH,
+                        )
+
+                with st.expander(f"📈 Performance: {this_year} vs {prior_year}", expanded=False):
+                    p_col1, p_col2, p_col3, p_col4 = st.columns(4, gap="small")
+
+                    p_col1.metric(
+                        f"{this_year} YTD Actuals",
+                        fmt_str(ytd_act),
+                        delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_year}" if pd.notna(py_ytd_diff) else "n/a",
+                        help=f"Actual performance through {last_complete.strftime('%b %Y')} compared to same period in {prior_year}.",
+                    )
+                    p_col2.metric(
+                        f"{prior_year} Same-Period YTD",
+                        fmt_str(prior_ytd_act),
+                        help=f"Actuals from Jan {prior_year} through {last_complete.strftime('%b')} {prior_year}.",
+                    )
+                    p_col3.metric(
+                        f"{this_year} Full Year Outlook",
+                        fmt_str(fy_act_fc),
+                        delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_year} Total" if pd.notna(py_fy_diff) else "n/a",
+                        help=f"Full year {this_year} projected outlook vs total actual performance in {prior_year}.",
+                    )
+                    p_col4.metric(
+                        f"{prior_year} Full Year Actuals",
+                        fmt_str(prior_fy_act),
+                        help=f"Total actual performance across all 12 months of {prior_year}.",
+                    )
 
                 graph_table = (
                     chart_data.drop_duplicates(subset=["Series", "Month"], keep="last")
@@ -1241,41 +1395,49 @@ if selected_tab == "Forecast":
                     formatted_graph_table["Total"] = formatted_graph_table["Total"].apply(
                         lambda x: (f"{x:.1f}%" if metric == "GP%" else (f"${x:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{x:,.0f}")) if pd.notna(x) else ""
                     )
-
-                st.dataframe(
-                    formatted_graph_table,
-                    hide_index=True,
-                    height=220,
-                    **FULL_WIDTH,
+                # Three-letter month headers to match the chart; data unchanged.
+                formatted_graph_table = formatted_graph_table.rename(
+                    columns={month: month[:3] for month in month_sort_order}
                 )
+
+                with st.expander("📋 Monthly data table", expanded=False):
+                    st.dataframe(
+                        formatted_graph_table,
+                        hide_index=True,
+                        height=int(38 + 35 * len(formatted_graph_table)) + 3,
+                        **FULL_WIDTH,
+                    )
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
 
 elif selected_tab == "Options Data":
     try:
         df_options = load_csv(str(csv_path))
-        st.success(f"Options data loaded successfully from {csv_path.name}!")
-
         df_options_filtered = filter_options_data(df_options)
 
-        st.subheader("Options Data Table:")
-        st.caption(
-            f"Showing {min(1000, len(df_options_filtered)):,} of "
-            f"{len(df_options_filtered):,} filtered rows "
-            f"({len(df_options):,} total options)"
-        )
-        st.data_editor(
-            df_options_filtered.head(1000),
-            num_rows="dynamic",
-            **FULL_WIDTH,
-        )
+        head_left, head_right = st.columns([5, 2], gap="small", vertical_alignment="center")
+        with head_left:
+            st.subheader("Options data")
+            st.caption(
+                f"Showing {min(1000, len(df_options_filtered)):,} of "
+                f"{len(df_options_filtered):,} filtered rows "
+                f"({len(df_options):,} total options) · loaded from {csv_path.name}"
+            )
+        with head_right:
+            st.download_button(
+                "Download full options data",
+                df_options.to_csv(index=False).encode("utf-8"),
+                file_name="options_data.csv",
+                mime="text/csv",
+                **FULL_WIDTH,
+            )
 
-        st.download_button(
-            "Download full options data",
-            df_options.to_csv(index=False).encode("utf-8"),
-            file_name="options_data.csv",
-            mime="text/csv",
-        )
+        with st.container(border=True):
+            st.data_editor(
+                df_options_filtered.head(1000),
+                num_rows="dynamic",
+                **FULL_WIDTH,
+            )
 
     except FileNotFoundError:
         st.warning(
@@ -1296,21 +1458,25 @@ elif selected_tab == "Formatted Data":
     if prepared_data is None:
         st.info("Add required source files under Raw_data to view formatted tables.")
     else:
-        st.subheader("Formatted Data Tables")
         sheet_names = list(prepared_data.keys())
-        selected_sheet = st.selectbox("Select table", sheet_names)
+
+        head_left, head_right = st.columns([5, 2], gap="small", vertical_alignment="bottom")
+        with head_left:
+            selected_sheet = st.selectbox("Select table", sheet_names)
         df_sheet = prepared_data[selected_sheet]
+        with head_right:
+            st.download_button(
+                f"Download {selected_sheet} CSV",
+                df_sheet.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
+                mime="text/csv",
+                **FULL_WIDTH,
+            )
 
         st.caption(f"Showing {min(1000, len(df_sheet)):,} of {len(df_sheet):,} rows")
-        st.data_editor(
-            df_sheet.head(1000),
-            num_rows="dynamic",
-            **FULL_WIDTH,
-        )
-
-        st.download_button(
-            f"Download {selected_sheet} CSV",
-            df_sheet.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_sheet.lower().replace('_', '_')}.csv",
-            mime="text/csv",
-        )
+        with st.container(border=True):
+            st.data_editor(
+                df_sheet.head(1000),
+                num_rows="dynamic",
+                **FULL_WIDTH,
+            )
