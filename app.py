@@ -849,7 +849,7 @@ if selected_tab == "Forecast":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
-                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & ARROWS COMPARISON SECTION ---
+                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & IN-GRAPH LABELS COMPARISON SECTION ---
                 if metric == "Sale":
                     st.markdown(f"### 🎯 Target & Performance Comparison")
                     target_80 = sale_target * 0.8
@@ -886,7 +886,7 @@ if selected_tab == "Forecast":
                         help=f"Total actual performance across all 12 months of {prior_year}.",
                     )
 
-                    # 2 Distinct Horizontal Bars Dataset (Categorical y-axis order ensures no overlay)
+                    # 2 Distinct Horizontal Bars Dataset
                     target_df = pd.DataFrame([
                         {"Category": f"{prior_year} Actuals", "Value": prior_fy_act},
                         {"Category": f"{this_year} Outlook", "Value": fy_act_fc},
@@ -921,17 +921,43 @@ if selected_tab == "Forecast":
                         )
                     )
 
-                    # Vertical Dotted Lines for Target Benchmarks
-                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
+                    # Text labels inside/next to the bars showing value and % difference to 100% target
+                    bar_labels = (
+                        alt.Chart(target_df)
+                        .mark_text(align="left", dx=6, color="black", fontWeight="bold")
+                        .encode(
+                            y=alt.Y("Category:N", sort=[f"{prior_year} Actuals", f"{this_year} Outlook"]),
+                            x=alt.X("Value:Q"),
+                            text=alt.Text("Value:Q", format="$,.0f"),
+                        )
+                    )
+
+                    # Vertical Dotted Lines for Target Benchmarks with text annotations on top
+                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target: ${sale_target:,.0f} ({target_pct:+.1f}%)"]})).mark_rule(
                         color="#0072b2", strokeDash=[4, 4], strokeWidth=2
                     ).encode(x="x:Q")
+
+                    target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f}) [{target_pct:+.1f}%]"]})).mark_text(
+                        align="center", baseline="bottom", dy=-10, color="#0072b2", fontWeight="bold", fontSize=11
+                    ).encode(x="x:Q", text="label:N")
 
                     target_80_line = alt.Chart(pd.DataFrame({"x": [target_80]})).mark_rule(
                         color="#e69f00", strokeDash=[2, 2], strokeWidth=2
                     ).encode(x="x:Q")
 
+                    target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f}) [{target_80_pct:+.1f}%]"]})).mark_text(
+                        align="center", baseline="bottom", dy=-25, color="#e69f00", fontWeight="bold", fontSize=11
+                    ).encode(x="x:Q", text="label:N")
+
                     st.altair_chart(
-                        alt.layer(horizontal_bar_chart, target_100_line, target_80_line),
+                        alt.layer(
+                            horizontal_bar_chart,
+                            bar_labels,
+                            target_100_line,
+                            target_100_text,
+                            target_80_line,
+                            target_80_text,
+                        ).properties(height=180),
                         **FULL_WIDTH,
                     )
 
