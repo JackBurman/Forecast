@@ -1247,6 +1247,3 @@ elif selected_tab == "Formatted Data":
             file_name=f"{selected_sheet.lower().replace('_', '_')}.csv",
             mime="text/csv",
         )
-```<FollowUp>
-Would you like to customize the colors or add target reference lines to the monthly breakdown chart as well?
-</FollowUp>
