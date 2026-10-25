@@ -423,10 +423,7 @@ def next_year_forecast(
     bias: float,
     clip_at_zero: bool,
 ) -> pd.Series:
-    # 2027 forecast starts at Jan (this_year + 1)
     next_start = pd.Period(f"{this_year + 1}-01", freq="M")
-
-    # Fit ETS + YoY trend up to the most recent completed sales period (last_complete + 1)
     as_of_period = last_complete + 1
     months_ahead = (next_start - as_of_period).n
     horizon = months_ahead + SEASON
@@ -840,27 +837,6 @@ if selected_tab == "Forecast":
                     help=f"Original full-year blended forecast for {this_year}.",
                 )
 
-                # --- TARGET COMPARISON SECTION ---
-                if metric == "Sale":
-                    st.markdown(f"### 🎯 Target Comparison")
-                    t_col1, t_col2 = st.columns(2)
-                    target_80 = sale_target * 0.8
-                    
-                    target_diff = fy_act_fc - sale_target
-                    target_pct = (fy_act_fc / sale_target) * 100 if sale_target > 0 else 0.0
-
-                    t_col1.metric(
-                        "Full Year Outlook vs Target ($70M)",
-                        fmt_str(fy_act_fc),
-                        delta=f"{target_diff:+,.0f} ({target_pct:.1f}% of Target)",
-                        help="Comparison of Full Year Outlook (Actual + Forecast) against the editable Sale Target.",
-                    )
-                    t_col2.metric(
-                        "80% of Sale Target",
-                        f"${target_80:,.0f}",
-                        help="80% threshold of the custom Sale Target.",
-                    )
-
                 # --- THIS YEAR VS PREVIOUS YEAR PERFORMANCE ---
                 prior_year = this_year - 1
                 prior_year_periods = pd.period_range(f"{prior_year}-01", periods=SEASON, freq="M")
@@ -872,6 +848,75 @@ if selected_tab == "Forecast":
                 else:
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
+
+                # --- TARGET & PRIOR YEAR COMPARISON SECTION ---
+                if metric == "Sale":
+                    st.markdown(f"### 🎯 Target & Performance Comparison")
+                    target_80 = sale_target * 0.8
+                    
+                    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
+
+                    target_diff = fy_act_fc - sale_target
+                    target_pct = (fy_act_fc / sale_target) * 100 if sale_target > 0 else 0.0
+
+                    t_col1.metric(
+                        "Full Year Outlook",
+                        fmt_str(fy_act_fc),
+                        delta=f"{target_diff:+,.0f} ({target_pct:.1f}% of Target)",
+                        help="Comparison of Full Year Outlook (Actual + Forecast) against the Sale Target.",
+                    )
+                    t_col2.metric(
+                        "100% Sale Target",
+                        f"${sale_target:,.0f}",
+                        help="Editable Sale Target.",
+                    )
+                    t_col3.metric(
+                        "80% Sale Target",
+                        f"${target_80:,.0f}",
+                        help="80% threshold of the custom Sale Target.",
+                    )
+                    t_col4.metric(
+                        f"{prior_year} Full Year Actuals",
+                        fmt_str(prior_fy_act),
+                        help=f"Total actual performance across all 12 months of {prior_year}.",
+                    )
+
+                    target_df = pd.DataFrame([
+                        {"Category": f"{prior_year} Actuals", "Value": prior_fy_act},
+                        {"Category": "80% Target", "Value": target_80},
+                        {"Category": f"{this_year} Outlook", "Value": fy_act_fc},
+                        {"Category": "100% Target", "Value": sale_target},
+                    ])
+
+                    target_bar_chart = (
+                        alt.Chart(target_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("Category:N", sort=[f"{prior_year} Actuals", "80% Target", f"{this_year} Outlook", "100% Target"], title=None),
+                            y=alt.Y("Value:Q", title="Sales ($)", scale=alt.Scale(zero=False)),
+                            color=alt.Color("Category:N", scale=alt.Scale(
+                                domain=[f"{prior_year} Actuals", "80% Target", f"{this_year} Outlook", "100% Target"],
+                                range=["#56b4e9", "#e69f00", "#009e73", "#0072b2"]
+                            ), legend=None),
+                            tooltip=[
+                                alt.Tooltip("Category:N", title="Benchmark"),
+                                alt.Tooltip("Value:Q", title="Value", format="$,.0f"),
+                            ]
+                        )
+                    )
+
+                    target_100_line = alt.Chart(pd.DataFrame({"y": [sale_target]})).mark_rule(
+                        color="#0072b2", strokeDash=[4, 4], strokeWidth=2
+                    ).encode(y="y:Q")
+
+                    target_80_line = alt.Chart(pd.DataFrame({"y": [target_80]})).mark_rule(
+                        color="#e69f00", strokeDash=[2, 2], strokeWidth=2
+                    ).encode(y="y:Q")
+
+                    st.altair_chart(
+                        alt.layer(target_bar_chart, target_100_line, target_80_line),
+                        **FULL_WIDTH
+                    )
 
                 py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
                 py_ytd_pct = (py_ytd_diff / prior_ytd_act * 100) if pd.notna(py_ytd_diff) and prior_ytd_act != 0 else np.nan
@@ -1202,3 +1247,6 @@ elif selected_tab == "Formatted Data":
             file_name=f"{selected_sheet.lower().replace('_', '_')}.csv",
             mime="text/csv",
         )
+```<FollowUp>
+Would you like to customize the colors or add target reference lines to the monthly breakdown chart as well?
+</FollowUp>
