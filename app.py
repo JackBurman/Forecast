@@ -421,10 +421,11 @@ def next_year_forecast(
     this_year: int,
     last_complete: pd.Period,
     bias: float,
+    history_from_year: int,
 ) -> pd.Series:
     this_year_months = [
         period
-        for period in pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
+        for period in pd.period_range(f"{history_from_year}-01", periods=(this_year - history_from_year + 1) * SEASON, freq="M")
         if period <= last_complete and period in actual.index
     ]
     recent = sum(float(actual[period]) for period in this_year_months)
@@ -478,6 +479,7 @@ def build_forecasts(
     metric: str,
     yoy_weight: float,
     bias: float,
+    history_from_year: int = 2024,
     today: pd.Timestamp | None = None,
 ) -> dict:
     today = (today or pd.Timestamp.today()).normalize()
@@ -491,7 +493,7 @@ def build_forecasts(
 
     this_start = pd.Period(f"{this_year}-01", freq="M")
     forecast_this = blended_forecast(actual, this_start, SEASON, yoy_weight, bias, clip_at_zero)
-    forecast_next = next_year_forecast(actual, forecast_this, this_year, last_complete, bias)
+    forecast_next = next_year_forecast(actual, forecast_this, this_year, last_complete, bias, history_from_year)
 
     if metric == "GP%":
         forecast_this[:] = forecast_this.mean()
@@ -726,7 +728,7 @@ if selected_tab == "Forecast":
             if metric == "GP%" and not selected_sales.empty and "GP%" in selected_sales.columns:
                 selected_sales["GP%"] = selected_sales["GP%"].mean()
 
-            result = build_forecasts(selected_sales, metric, yoy_weight, bias)
+            result = build_forecasts(selected_sales, metric, yoy_weight, bias, history_from_year)
             this_year = result["this_year"]
             forecast_this_year = result["forecast_this"]
             forecast_next_year = result["forecast_next"]
