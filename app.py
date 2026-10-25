@@ -849,7 +849,7 @@ if selected_tab == "Forecast":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
-                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & IN-GRAPH LABELS COMPARISON SECTION ---
+                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & UNIQUE IN-GRAPH LABELS ---
                 if metric == "Sale":
                     st.markdown(f"### 🎯 Target & Performance Comparison")
                     target_80 = sale_target * 0.8
@@ -859,6 +859,9 @@ if selected_tab == "Forecast":
 
                     target_80_diff = fy_act_fc - target_80
                     target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
+
+                    prior_target_diff = prior_fy_act - sale_target
+                    prior_target_pct = (prior_target_diff / sale_target) * 100 if sale_target > 0 else 0.0
 
                     t_col1, t_col2, t_col3, t_col4 = st.columns(4)
 
@@ -886,10 +889,18 @@ if selected_tab == "Forecast":
                         help=f"Total actual performance across all 12 months of {prior_year}.",
                     )
 
-                    # 2 Distinct Horizontal Bars Dataset
+                    # 2 Distinct Horizontal Bars Dataset with Unique Text Labels
                     target_df = pd.DataFrame([
-                        {"Category": f"{prior_year} Actuals", "Value": prior_fy_act},
-                        {"Category": f"{this_year} Outlook", "Value": fy_act_fc},
+                        {
+                            "Category": f"{prior_year} Actuals",
+                            "Value": prior_fy_act,
+                            "Label": f"${prior_fy_act:,.0f} ({prior_target_pct:+.1f}% vs Target)"
+                        },
+                        {
+                            "Category": f"{this_year} Outlook",
+                            "Value": fy_act_fc,
+                            "Label": f"${fy_act_fc:,.0f} ({target_pct:+.1f}% vs Target)"
+                        },
                     ])
 
                     horizontal_bar_chart = (
@@ -921,23 +932,34 @@ if selected_tab == "Forecast":
                         )
                     )
 
-                    # Text labels inside/next to the bars showing value and % difference to 100% target
-                    bar_labels = (
-                        alt.Chart(target_df)
-                        .mark_text(align="left", dx=6, color="black", fontWeight="bold")
+                    # Top Bar Label (Above the top bar: dy = -12)
+                    bar_label_top = (
+                        alt.Chart(target_df.iloc[[0]])
+                        .mark_text(align="left", dx=4, dy=-12, color="#002b49", fontWeight="bold", fontSize=11)
                         .encode(
                             y=alt.Y("Category:N", sort=[f"{prior_year} Actuals", f"{this_year} Outlook"]),
                             x=alt.X("Value:Q"),
-                            text=alt.Text("Value:Q", format="$,.0f"),
+                            text=alt.Text("Label:N"),
+                        )
+                    )
+
+                    # Bottom Bar Label (Below the bottom bar: dy = 18)
+                    bar_label_bottom = (
+                        alt.Chart(target_df.iloc[[1]])
+                        .mark_text(align="left", dx=4, dy=18, color="#009e73", fontWeight="bold", fontSize=11)
+                        .encode(
+                            y=alt.Y("Category:N", sort=[f"{prior_year} Actuals", f"{this_year} Outlook"]),
+                            x=alt.X("Value:Q"),
+                            text=alt.Text("Label:N"),
                         )
                     )
 
                     # Vertical Dotted Lines for Target Benchmarks with text annotations on top
-                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target: ${sale_target:,.0f} ({target_pct:+.1f}%)"]})).mark_rule(
+                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
                         color="#0072b2", strokeDash=[4, 4], strokeWidth=2
                     ).encode(x="x:Q")
 
-                    target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f}) [{target_pct:+.1f}%]"]})).mark_text(
+                    target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f})"]})).mark_text(
                         align="center", baseline="bottom", dy=-10, color="#0072b2", fontWeight="bold", fontSize=11
                     ).encode(x="x:Q", text="label:N")
 
@@ -945,14 +967,15 @@ if selected_tab == "Forecast":
                         color="#e69f00", strokeDash=[2, 2], strokeWidth=2
                     ).encode(x="x:Q")
 
-                    target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f}) [{target_80_pct:+.1f}%]"]})).mark_text(
+                    target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f})"]})).mark_text(
                         align="center", baseline="bottom", dy=-25, color="#e69f00", fontWeight="bold", fontSize=11
                     ).encode(x="x:Q", text="label:N")
 
                     st.altair_chart(
                         alt.layer(
                             horizontal_bar_chart,
-                            bar_labels,
+                            bar_label_top,
+                            bar_label_bottom,
                             target_100_line,
                             target_100_text,
                             target_80_line,
@@ -1167,7 +1190,7 @@ if selected_tab == "Forecast":
                             .add_params(month_hover_selection)
                         )
                 
-                chart_event = st.altair_chart(
+                chart_event = alt.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts),
                     key="forecast_monthly_chart",
                     on_select="rerun",
