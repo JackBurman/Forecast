@@ -849,7 +849,7 @@ if selected_tab == "Forecast":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
-                # --- TARGET & PRIOR YEAR COMPARISON SECTION ---
+                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART COMPARISON SECTION ---
                 if metric == "Sale":
                     st.markdown(f"### 🎯 Target & Performance Comparison")
                     target_80 = sale_target * 0.8
@@ -881,41 +881,53 @@ if selected_tab == "Forecast":
                         help=f"Total actual performance across all 12 months of {prior_year}.",
                     )
 
+                    # 2 Horizontal Bars Dataset
                     target_df = pd.DataFrame([
                         {"Category": f"{prior_year} Actuals", "Value": prior_fy_act},
-                        {"Category": "80% Target", "Value": target_80},
                         {"Category": f"{this_year} Outlook", "Value": fy_act_fc},
-                        {"Category": "100% Target", "Value": sale_target},
                     ])
 
-                    target_bar_chart = (
+                    horizontal_bar_chart = (
                         alt.Chart(target_df)
-                        .mark_bar()
+                        .mark_bar(size=35)
                         .encode(
-                            x=alt.X("Category:N", sort=[f"{prior_year} Actuals", "80% Target", f"{this_year} Outlook", "100% Target"], title=None),
-                            y=alt.Y("Value:Q", title="Sales ($)", scale=alt.Scale(zero=False)),
-                            color=alt.Color("Category:N", scale=alt.Scale(
-                                domain=[f"{prior_year} Actuals", "80% Target", f"{this_year} Outlook", "100% Target"],
-                                range=["#56b4e9", "#e69f00", "#009e73", "#0072b2"]
-                            ), legend=None),
+                            y=alt.Y(
+                                "Category:N",
+                                sort=[f"{prior_year} Actuals", f"{this_year} Outlook"],
+                                title=None,
+                            ),
+                            x=alt.X(
+                                "Value:Q",
+                                title="Sales ($)",
+                                scale=alt.Scale(zero=True),
+                            ),
+                            color=alt.Color(
+                                "Category:N",
+                                scale=alt.Scale(
+                                    domain=[f"{prior_year} Actuals", f"{this_year} Outlook"],
+                                    range=["#56b4e9", "#009e73"],
+                                ),
+                                legend=None,
+                            ),
                             tooltip=[
-                                alt.Tooltip("Category:N", title="Benchmark"),
+                                alt.Tooltip("Category:N", title="Performance"),
                                 alt.Tooltip("Value:Q", title="Value", format="$,.0f"),
-                            ]
+                            ],
                         )
                     )
 
-                    target_100_line = alt.Chart(pd.DataFrame({"y": [sale_target]})).mark_rule(
+                    # Vertical Dotted Lines for Target Benchmarks
+                    target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
                         color="#0072b2", strokeDash=[4, 4], strokeWidth=2
-                    ).encode(y="y:Q")
+                    ).encode(x="x:Q")
 
-                    target_80_line = alt.Chart(pd.DataFrame({"y": [target_80]})).mark_rule(
+                    target_80_line = alt.Chart(pd.DataFrame({"x": [target_80]})).mark_rule(
                         color="#e69f00", strokeDash=[2, 2], strokeWidth=2
-                    ).encode(y="y:Q")
+                    ).encode(x="x:Q")
 
                     st.altair_chart(
-                        alt.layer(target_bar_chart, target_100_line, target_80_line),
-                        **FULL_WIDTH
+                        alt.layer(horizontal_bar_chart, target_100_line, target_80_line),
+                        **FULL_WIDTH,
                     )
 
                 py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
