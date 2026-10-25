@@ -704,6 +704,15 @@ if selected_tab == "Forecast":
                     help="0 = pure ETS, 1 = pure year-on-year trend projection.",
                 )
 
+                st.subheader("Target Settings")
+                sale_target = st.number_input(
+                    "Sale Target ($)",
+                    min_value=0.0,
+                    value=70000000.0,
+                    step=1000000.0,
+                    help="Target sale value for comparison.",
+                )
+
             filters = {
                 "Location": selected_location,
                 "Sales Channel": selected_channel,
@@ -830,6 +839,27 @@ if selected_tab == "Forecast":
                     fmt_str(fy_fc),
                     help=f"Original full-year blended forecast for {this_year}.",
                 )
+
+                # --- TARGET COMPARISON SECTION ---
+                if metric == "Sale":
+                    st.markdown(f"### 🎯 Target Comparison")
+                    t_col1, t_col2 = st.columns(2)
+                    target_80 = sale_target * 0.8
+                    
+                    target_diff = fy_act_fc - sale_target
+                    target_pct = (fy_act_fc / sale_target) * 100 if sale_target > 0 else 0.0
+
+                    t_col1.metric(
+                        "Full Year Outlook vs Target ($70M)",
+                        fmt_str(fy_act_fc),
+                        delta=f"{target_diff:+,.0f} ({target_pct:.1f}% of Target)",
+                        help="Comparison of Full Year Outlook (Actual + Forecast) against the editable Sale Target.",
+                    )
+                    t_col2.metric(
+                        "80% of Sale Target",
+                        f"${target_80:,.0f}",
+                        help="80% threshold of the custom Sale Target.",
+                    )
 
                 # --- THIS YEAR VS PREVIOUS YEAR PERFORMANCE ---
                 prior_year = this_year - 1
@@ -1169,6 +1199,6 @@ elif selected_tab == "Formatted Data":
         st.download_button(
             f"Download {selected_sheet} CSV",
             df_sheet.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
+            file_name=f"{selected_sheet.lower().replace('_', '_')}.csv",
             mime="text/csv",
         )
