@@ -849,30 +849,35 @@ if selected_tab == "Forecast":
                     prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
 
-                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART COMPARISON SECTION ---
+                # --- TARGET & PRIOR YEAR HORIZONTAL BAR CHART & ARROWS COMPARISON SECTION ---
                 if metric == "Sale":
                     st.markdown(f"### 🎯 Target & Performance Comparison")
                     target_80 = sale_target * 0.8
                     
-                    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
-
                     target_diff = fy_act_fc - sale_target
-                    target_pct = (fy_act_fc / sale_target) * 100 if sale_target > 0 else 0.0
+                    target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
+
+                    target_80_diff = fy_act_fc - target_80
+                    target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
+
+                    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
 
                     t_col1.metric(
                         "Full Year Outlook",
                         fmt_str(fy_act_fc),
-                        delta=f"{target_diff:+,.0f} ({target_pct:.1f}% of Target)",
+                        delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)",
                         help="Comparison of Full Year Outlook (Actual + Forecast) against the Sale Target.",
                     )
                     t_col2.metric(
                         "100% Sale Target",
                         f"${sale_target:,.0f}",
+                        delta=f"{target_pct:+.1f}% to Target",
                         help="Editable Sale Target.",
                     )
                     t_col3.metric(
                         "80% Sale Target",
                         f"${target_80:,.0f}",
+                        delta=f"{target_80_pct:+.1f}% to 80% Target",
                         help="80% threshold of the custom Sale Target.",
                     )
                     t_col4.metric(
@@ -881,7 +886,7 @@ if selected_tab == "Forecast":
                         help=f"Total actual performance across all 12 months of {prior_year}.",
                     )
 
-                    # 2 Horizontal Bars Dataset
+                    # 2 Distinct Horizontal Bars Dataset (Categorical y-axis order ensures no overlay)
                     target_df = pd.DataFrame([
                         {"Category": f"{prior_year} Actuals", "Value": prior_fy_act},
                         {"Category": f"{this_year} Outlook", "Value": fy_act_fc},
@@ -889,7 +894,7 @@ if selected_tab == "Forecast":
 
                     horizontal_bar_chart = (
                         alt.Chart(target_df)
-                        .mark_bar(size=35)
+                        .mark_bar(size=26)
                         .encode(
                             y=alt.Y(
                                 "Category:N",
