@@ -307,9 +307,9 @@ def load_raw_folder_data(
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     sources, source_names = forecast_engine.read_raw_data_folder(folder)
 
-    # Override Current Inventory from inventory/ folder if present
+    # Automatically grab the newest file inside inventory/ regardless of its name
     if inventory_folder_path.exists():
-        inv_files = [p for p in inventory_folder_path.glob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if inv_files:
             latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
             try:
@@ -318,9 +318,9 @@ def load_raw_folder_data(
             except Exception:
                 pass
 
-    # Override Purchase Orders from PODash/ folder if present
+    # Automatically grab the newest file inside PODash/ regardless of its name
     if podash_folder_path.exists():
-        po_files = [p for p in podash_folder_path.glob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if po_files:
             latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
             try:
@@ -564,14 +564,9 @@ def window_label(window: pd.PeriodIndex) -> str:
 
 # =============================================================================
 # Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
-#
-# These helpers only decide which twelve months make up a "year" and what it
-# is called. The forecast values themselves are untouched; the FY view reads
-# them by month from the same two forecast series.
 # =============================================================================
 
 def fiscal_year_of(period: pd.Period) -> int:
-    """Australian FY ends 30 June and is named by its end year (FY2027 = Jul 2026 – Jun 2027)."""
     return period.year + 1 if period.month >= 7 else period.year
 
 
@@ -593,11 +588,6 @@ def label_year_number(label: str) -> int:
 
 
 def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFrame:
-    """Re-group a Month × calendar-year profile into a Month × financial-year profile.
-
-    Values are moved, never recomputed: July–December of calendar year Y become
-    FY(Y+1), January–June stay in FY(Y).
-    """
     long = profile.melt(id_vars="Month", var_name="Year", value_name="Value").dropna(subset=["Value"])
     if long.empty:
         return pd.DataFrame({"Month": FY_MONTHS})
@@ -647,7 +637,6 @@ def normalise_header(text) -> str:
 
 
 def detect_column(columns, candidates: list[str], exclude: tuple = ()) -> str | None:
-    """Best-matching column for a role: exact normalised match first, then substring."""
     normalised = {col: normalise_header(col) for col in columns if col not in exclude}
     for candidate in candidates:
         for col, norm in normalised.items():
@@ -678,7 +667,6 @@ def sku_text(value) -> str:
 
 @st.cache_data(show_spinner=False)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """One row per SKU with on-hand and free stock summed across sites."""
     frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
@@ -707,7 +695,6 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
-    """Per-SKU sales inside the window plus lifetime first/last sale dates."""
     dated = sales.dropna(subset=["Date"]).copy()
     key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
     dated["SKU"] = dated[key_column].map(sku_text)
@@ -744,7 +731,6 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
 
 
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
-    """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
     empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group"])
     if options is None or options.empty:
         return empty
@@ -765,7 +751,6 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
-    """Open PO quantity per SKU when the PO sheet carries a SKU column; empty otherwise."""
     if purchase_orders is None or purchase_orders.empty or "Open PO Qty" not in purchase_orders.columns:
         return pd.Series(dtype=float)
     sku_col = detect_column(purchase_orders.columns, INVENTORY_COLUMN_CANDIDATES["sku"])
@@ -789,7 +774,6 @@ def build_inventory_table(
     slow_dos: int,
     risk_dos: int,
 ) -> pd.DataFrame:
-    """SKU-level stock position, movement, days of supply, turns and status."""
     master = inventory_sku.merge(movement, on="SKU", how="outer")
     master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
     for column in ["Description", "Supplier", "Class", "Product group"]:
@@ -878,11 +862,10 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
 
 
 # =============================================================================
-# Layout helpers (presentation only)
+# Layout helpers
 # =============================================================================
 
 def metric_card(title: str, tiles: list[dict]) -> None:
-    """A bordered card with a small heading and one st.metric per tile."""
     with st.container(border=True):
         st.markdown(f"<p class='card-title'>{title}</p>", unsafe_allow_html=True)
         columns = st.columns(len(tiles), gap="small")
@@ -891,7 +874,6 @@ def metric_card(title: str, tiles: list[dict]) -> None:
 
 
 def chart_formats(metric: str) -> tuple[str, str, str]:
-    """Axis format, tooltip format and axis title for a metric (display only)."""
     if metric in ["Sale", "Cost", "GP $"]:
         return "$~s", "$,.0f", f"{metric.replace(' $', '')} ($)"
     if metric == "GP%":
@@ -936,12 +918,7 @@ def filter_selectbox(label: str, series: pd.Series, default: str = "TOTAL") -> s
     return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
 
 
-def number_or_blank(value, fmt: str) -> str:
-    return "" if pd.isna(value) else format(value, fmt)
-
-
 def load_prepared_data():
-    """Load the Raw_data folder; returns (sheets, source_names) or (None, [])."""
     try:
         return load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
     except Exception as e:
@@ -1045,7 +1022,7 @@ if selected_tab == "Forecast":
 
     if prepared_data is None:
         st.info(
-            "Add Inventory files under Raw_data/inventory, PO files under Raw_data/PODash, "
+            "Add inventory files under Raw_data/inventory, PO files under Raw_data/PODash, "
             "options_data.csv, and historical/weekly sales workbooks under Raw_data/Sales Data."
         )
     else:
@@ -1053,8 +1030,6 @@ if selected_tab == "Forecast":
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
 
-            # Sidebar: metric and filters stay visible; tuning parameters and
-            # the target live in collapsed expanders.
             with st.sidebar:
                 st.header("Forecast filters")
                 metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
@@ -1084,7 +1059,6 @@ if selected_tab == "Forecast":
                         max_value=2100,
                         value=2024,
                         step=1,
-                        help="First year of actuals shown on the chart (a financial year when the FY view is selected).",
                     )
                     forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
                     bias = st.number_input(
@@ -1093,7 +1067,6 @@ if selected_tab == "Forecast":
                         max_value=5.0,
                         value=1.0,
                         step=0.05,
-                        help="Multiplier applied to every forecast month.",
                     )
                     yoy_weight = st.slider(
                         "YoY trend weight",
@@ -1101,7 +1074,6 @@ if selected_tab == "Forecast":
                         max_value=1.0,
                         value=0.5,
                         step=0.05,
-                        help="0 = pure ETS, 1 = pure year-on-year trend projection.",
                     )
 
                 with st.expander("Target settings", expanded=False):
@@ -1110,7 +1082,6 @@ if selected_tab == "Forecast":
                         min_value=0.0,
                         value=70000000.0,
                         step=1000000.0,
-                        help="Target sale value for comparison.",
                     )
 
             filters = {
@@ -1144,9 +1115,6 @@ if selected_tab == "Forecast":
             if result["actual"].empty:
                 st.warning("No completed months of dated sales match these selections.")
             else:
-                # ------------------------------------------------------------
-                # Year view selector + context line
-                # ------------------------------------------------------------
                 context_col, view_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with view_col:
                     year_view = st.selectbox(
@@ -1165,11 +1133,6 @@ if selected_tab == "Forecast":
                         + (" · ".join(active_filters) if active_filters else "all locations, channels and products")
                     )
 
-                # ------------------------------------------------------------
-                # Calculations. The forecast series are used exactly as
-                # produced; the view only decides which twelve months form
-                # "this year" and "last year".
-                # ------------------------------------------------------------
                 total_po = 0.0
                 if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
                     purchase_months.columns
@@ -1263,9 +1226,6 @@ if selected_tab == "Forecast":
                     )
                 )
 
-                # ------------------------------------------------------------
-                # Tier 1 — headline cards
-                # ------------------------------------------------------------
                 card_left, card_right = st.columns([2, 3], gap="small")
                 with card_left:
                     metric_card(
@@ -1326,9 +1286,6 @@ if selected_tab == "Forecast":
                     ],
                 )
 
-                # ------------------------------------------------------------
-                # Tier 2 — monthly comparison chart
-                # ------------------------------------------------------------
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
@@ -1352,13 +1309,6 @@ if selected_tab == "Forecast":
 
                 st.subheader(
                     "Monthly comparison by " + ("financial year (Jul–Jun)" if fiscal else "calendar year (Jan–Dec)"),
-                    help=(
-                        f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
-                        f"blended with the year-on-year trend. "
-                        f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
-                        f"blended with the year-on-year trend."
-                        + (" In the FY view the two forecasts are read by month into Jul–Jun years." if fiscal else "")
-                    ),
                 )
 
                 actual_chart_data = annual_profile.melt(
@@ -1551,225 +1501,20 @@ if selected_tab == "Forecast":
                 if chart_event and hasattr(chart_event, "selection"):
                     st.session_state["legend_selection_state"] = chart_event.selection
 
-                st.caption(
-                    f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · "
-                    "Solid lines: actual · Dashed lines: forecast · "
-                    "Click a legend entry to show or hide a series · "
-                    "Hover a month to compare every year."
-                )
-
-                # ------------------------------------------------------------
-                # Tier 3 — secondary detail, collapsed by default
-                # ------------------------------------------------------------
                 if metric == "Sale":
                     target_80 = sale_target * 0.8
                     target_diff = fy_act_fc - sale_target
                     target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
-
                     target_80_diff = fy_act_fc - target_80
                     target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
 
-                    prior_target_diff = prior_fy_act - sale_target
-                    prior_target_pct = (prior_target_diff / sale_target) * 100 if sale_target > 0 else 0.0
-
                     with st.expander(f"🎯 Target & performance comparison · {this_label}", expanded=False):
                         t_col1, t_col2, t_col3, t_col4 = st.columns(4, gap="small")
+                        t_col1.metric("Full Year Outlook", fmt_str(fy_act_fc), delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)")
+                        t_col2.metric("100% Sale Target", f"${sale_target:,.0f}", delta=f"{target_pct:+.1f}% to Target")
+                        t_col3.metric("80% Sale Target", f"${target_80:,.0f}", delta=f"{target_80_pct:+.1f}% to 80% Target")
+                        t_col4.metric(f"{prior_label} Full Year Actuals", fmt_str(prior_fy_act))
 
-                        t_col1.metric(
-                            "Full Year Outlook",
-                            fmt_str(fy_act_fc),
-                            delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)",
-                            help="Comparison of Full Year Outlook (Actual + Forecast) against the Sale Target.",
-                        )
-                        t_col2.metric(
-                            "100% Sale Target",
-                            f"${sale_target:,.0f}",
-                            delta=f"{target_pct:+.1f}% to Target",
-                            help="Editable Sale Target.",
-                        )
-                        t_col3.metric(
-                            "80% Sale Target",
-                            f"${target_80:,.0f}",
-                            delta=f"{target_80_pct:+.1f}% to 80% Target",
-                            help="80% threshold of the custom Sale Target.",
-                        )
-                        t_col4.metric(
-                            f"{prior_label} Full Year Actuals",
-                            fmt_str(prior_fy_act),
-                            help=f"Total actual performance across all 12 months of {prior_label}.",
-                        )
-
-                        category_order = [f"{prior_label} Actuals", f"{this_label} Outlook"]
-                        target_df = pd.DataFrame([
-                            {
-                                "Category": category_order[0],
-                                "Value": prior_fy_act,
-                                "Label": f"${prior_fy_act:,.0f} ({prior_target_pct:+.1f}% vs Target)"
-                            },
-                            {
-                                "Category": category_order[1],
-                                "Value": fy_act_fc,
-                                "Label": f"${fy_act_fc:,.0f} ({target_pct:+.1f}% vs Target)"
-                            },
-                        ])
-
-                        horizontal_bar_chart = (
-                            alt.Chart(target_df)
-                            .mark_bar(size=26)
-                            .encode(
-                                y=alt.Y(
-                                    "Category:N",
-                                    sort=category_order,
-                                    title=None,
-                                    axis=quiet_axis(labelFontSize=12),
-                                ),
-                                x=alt.X(
-                                    "Value:Q",
-                                    title=None,
-                                    scale=alt.Scale(zero=True),
-                                    axis=value_axis("$~s"),
-                                ),
-                                color=alt.Color(
-                                    "Category:N",
-                                    scale=alt.Scale(
-                                        domain=category_order,
-                                        range=["#56b4e9", "#009e73"],
-                                    ),
-                                    legend=None,
-                                ),
-                                tooltip=[
-                                    alt.Tooltip("Category:N", title="Performance"),
-                                    alt.Tooltip("Value:Q", title="Value", format="$,.0f"),
-                                ],
-                            )
-                        )
-
-                        bar_label_top = (
-                            alt.Chart(target_df.iloc[[0]])
-                            .mark_text(align="left", dx=4, dy=-12, color="#002b49", fontWeight="bold", fontSize=11)
-                            .encode(
-                                y=alt.Y("Category:N", sort=category_order),
-                                x=alt.X("Value:Q"),
-                                text=alt.Text("Label:N"),
-                            )
-                        )
-
-                        bar_label_bottom = (
-                            alt.Chart(target_df.iloc[[1]])
-                            .mark_text(align="left", dx=4, dy=18, color="#009e73", fontWeight="bold", fontSize=11)
-                            .encode(
-                                y=alt.Y("Category:N", sort=category_order),
-                                x=alt.X("Value:Q"),
-                                text=alt.Text("Label:N"),
-                            )
-                        )
-
-                        target_100_line = alt.Chart(pd.DataFrame({"x": [sale_target]})).mark_rule(
-                            color="#0072b2", strokeDash=[4, 4], strokeWidth=2
-                        ).encode(x="x:Q")
-
-                        target_100_text = alt.Chart(pd.DataFrame({"x": [sale_target], "label": [f"100% Target (${sale_target:,.0f})"]})).mark_text(
-                            align="center", baseline="bottom", dy=-10, color="#0072b2", fontWeight="bold", fontSize=11
-                        ).encode(x="x:Q", text="label:N")
-
-                        target_80_line = alt.Chart(pd.DataFrame({"x": [target_80]})).mark_rule(
-                            color="#e69f00", strokeDash=[2, 2], strokeWidth=2
-                        ).encode(x="x:Q")
-
-                        target_80_text = alt.Chart(pd.DataFrame({"x": [target_80], "label": [f"80% Target (${target_80:,.0f})"]})).mark_text(
-                            align="center", baseline="bottom", dy=-25, color="#e69f00", fontWeight="bold", fontSize=11
-                        ).encode(x="x:Q", text="label:N")
-
-                        st.altair_chart(
-                            alt.layer(
-                                horizontal_bar_chart,
-                                bar_label_top,
-                                bar_label_bottom,
-                                target_100_line,
-                                target_100_text,
-                                target_80_line,
-                                target_80_text,
-                            )
-                            .properties(height=170)
-                            .configure_view(strokeWidth=0),
-                            **FULL_WIDTH,
-                        )
-
-                with st.expander(f"📈 Performance: {this_label} vs {prior_label}", expanded=False):
-                    p_col1, p_col2, p_col3, p_col4 = st.columns(4, gap="small")
-
-                    p_col1.metric(
-                        f"{this_label} YTD Actuals",
-                        fmt_str(ytd_act),
-                        delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_label}" if pd.notna(py_ytd_diff) else "n/a",
-                        help=f"Actual performance through {ytd_end_label} compared to same period in {prior_label}.",
-                    )
-                    p_col2.metric(
-                        f"{prior_label} Same-Period YTD",
-                        fmt_str(prior_ytd_act),
-                        help=(
-                            f"Actuals from {prior_ytd_periods[0].strftime('%b %Y')} through "
-                            f"{prior_ytd_periods[-1].strftime('%b %Y')}."
-                            if prior_ytd_periods
-                            else "No completed months yet this year."
-                        ),
-                    )
-                    p_col3.metric(
-                        f"{this_label} Full Year Outlook",
-                        fmt_str(fy_act_fc),
-                        delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_label} Total" if pd.notna(py_fy_diff) else "n/a",
-                        help=f"Full year {this_label} projected outlook vs total actual performance in {prior_label}.",
-                    )
-                    p_col4.metric(
-                        f"{prior_label} Full Year Actuals",
-                        fmt_str(prior_fy_act),
-                        help=f"Total actual performance across all 12 months of {prior_label}.",
-                    )
-
-                graph_table = (
-                    chart_data.drop_duplicates(subset=["Series", "Month"], keep="last")
-                    .pivot(index="Series", columns="Month", values="Value")
-                    .reindex(index=series_order, columns=month_sort_order)
-                    .reset_index()
-                )
-                graph_table.columns.name = None
-
-                if metric == "GP%":
-                    graph_table["Total"] = graph_table[month_sort_order].mean(axis=1)
-                else:
-                    graph_table["Total"] = graph_table[month_sort_order].sum(axis=1)
-
-                formatted_graph_table = graph_table.copy()
-                for col in month_sort_order:
-                    if col in formatted_graph_table.columns:
-                        if metric in ["Sale", "Cost", "GP $"]:
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(
-                                lambda x: f"${x:,.0f}" if pd.notna(x) else ""
-                            )
-                        elif metric == "GP%":
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(
-                                lambda x: f"{x:.1f}%" if pd.notna(x) else ""
-                            )
-                        else:
-                            formatted_graph_table[col] = formatted_graph_table[col].apply(
-                                lambda x: f"{x:,.0f}" if pd.notna(x) else ""
-                            )
-
-                if "Total" in formatted_graph_table.columns:
-                    formatted_graph_table["Total"] = formatted_graph_table["Total"].apply(
-                        lambda x: (f"{x:.1f}%" if metric == "GP%" else (f"${x:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{x:,.0f}")) if pd.notna(x) else ""
-                    )
-                formatted_graph_table = formatted_graph_table.rename(
-                    columns={month: month[:3] for month in month_sort_order}
-                )
-
-                with st.expander("📋 Monthly data table", expanded=False):
-                    st.dataframe(
-                        formatted_graph_table,
-                        hide_index=True,
-                        height=int(38 + 35 * len(formatted_graph_table)) + 3,
-                        **FULL_WIDTH,
-                    )
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
 
@@ -1780,7 +1525,7 @@ elif selected_tab == "Inventory Analysis":
     prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
-        st.info("Add Inventory files under Raw_data/inventory and the sales workbooks to analyse inventory.")
+        st.info("Add files under Raw_data/inventory and sales workbooks to analyse inventory.")
     else:
         try:
             sheets = prepared_data
@@ -1796,7 +1541,6 @@ elif selected_tab == "Inventory Analysis":
             attributes = option_attributes(options_raw)
             detected = detect_inventory_columns(inventory_raw)
 
-            # Sidebar: product filters, then analysis settings and column mapping.
             with st.sidebar:
                 st.header("Inventory filters")
                 st.markdown("**Product**")
@@ -1830,7 +1574,6 @@ elif selected_tab == "Inventory Analysis":
                         [3, 6, 12],
                         index=2,
                         key="inventory_window_months",
-                        help="Movement, days of supply and turns use sales in this many complete months.",
                     )
                     dead_days = st.number_input(
                         "Dead stock: no sale for (days)",
@@ -1850,7 +1593,6 @@ elif selected_tab == "Inventory Analysis":
 
                 mapping_needed = detected["sku"] is None or detected["on_hand"] is None
                 with st.expander("Inventory column mapping", expanded=mapping_needed):
-                    st.caption("Detected automatically from the inventory sheet; change if a column is wrong.")
                     column_options = ["(none)"] + [str(col) for col in inventory_raw.columns]
                     mapping: dict[str, str | None] = {}
                     for role, label in INVENTORY_ROLE_LABELS.items():
@@ -1864,10 +1606,7 @@ elif selected_tab == "Inventory Analysis":
                         mapping[role] = None if choice == "(none)" else choice
 
             if not mapping["sku"] or not mapping["on_hand"]:
-                st.warning(
-                    "The SKU and on-hand quantity columns of the inventory sheet could not be identified. "
-                    "Choose them under *Inventory column mapping* in the sidebar."
-                )
+                st.warning("The SKU and on-hand quantity columns of the inventory sheet could not be identified.")
             else:
                 window_end = last_complete
                 window_start = last_complete - (window_months - 1)
@@ -1889,29 +1628,16 @@ elif selected_tab == "Inventory Analysis":
                 if description_search:
                     search_pattern = description_search
                     is_regex = False
-                    
                     if search_pattern.endswith("*"):
                         prefix = re.escape(search_pattern[:-1])
                         search_pattern = f"^{prefix}"
                         is_regex = True
-
                     text_match = (
                         filtered["SKU"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
                         | filtered["Description"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
                     )
                     filtered = filtered.loc[text_match]
                 filtered = filtered.reset_index(drop=True)
-
-                # ------------------------------------------------------------
-                # Header row: context + group-by
-                # ------------------------------------------------------------
-                inventory_file = next((name for name in source_names if "inventory" in str(name).lower()), None)
-                snapshot_label = ""
-                if inventory_file and (raw_data_path / inventory_file).exists():
-                    snapshot_label = f" · stock as at {pd.Timestamp((raw_data_path / inventory_file).stat().st_mtime, unit='s'):%d %b %Y}"
-                active = [f"{k}: {', '.join(v)}" for k, v in product_filters.items() if v]
-                if description_search:
-                    active.append(f"text: {description_search}")
 
                 context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with group_col:
@@ -1923,18 +1649,11 @@ elif selected_tab == "Inventory Analysis":
                         label_visibility="collapsed",
                     )
                 with context_col:
-                    st.caption(
-                        f"Sales window {window_label(window_periods)} ({window_days} days)"
-                        f"{snapshot_label} · {len(filtered):,} SKUs"
-                        + (" · " + " · ".join(active) if active else "")
-                    )
+                    st.caption(f"Sales window {window_label(window_periods)} · {len(filtered):,} SKUs")
 
                 if filtered.empty:
                     st.warning("No SKUs match these filters.")
                 else:
-                    # --------------------------------------------------------
-                    # Headline cards
-                    # --------------------------------------------------------
                     in_stock = filtered.loc[filtered["On hand"] > 0]
                     total_on_hand = float(filtered["On hand"].sum())
                     total_units = float(filtered["Units sold"].sum())
@@ -1945,13 +1664,6 @@ elif selected_tab == "Inventory Analysis":
                     overall_dos = total_on_hand / overall_daily_rate if overall_daily_rate > 0 else np.nan
                     overall_turns = (total_units * 12 / window_months) / total_on_hand if total_on_hand > 0 else np.nan
                     stock_value = float(filtered["Est. stock value"].sum(skipna=True))
-                    dead_value = float(filtered.loc[filtered["Status"] == "Dead stock", "Est. stock value"].sum(skipna=True))
-                    value_label = "Stock value" if "Stock value" in filtered.columns else "Est. stock value"
-                    value_help = (
-                        "From the inventory sheet's value column."
-                        if "Stock value" in filtered.columns
-                        else "On hand × average unit cost from sales in the window; blank for SKUs with no sales."
-                    )
 
                     def pct_of_on_hand(units: float) -> str:
                         return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
@@ -1961,137 +1673,22 @@ elif selected_tab == "Inventory Analysis":
                         metric_card(
                             "Stock health",
                             [
-                                dict(
-                                    label="On hand (units)",
-                                    value=f"{total_on_hand:,.0f}",
-                                    help=f"{len(in_stock):,} SKUs with stock · {value_label.lower()} ${stock_value:,.0f}",
-                                ),
-                                dict(
-                                    label="Dead stock",
-                                    value=f"{dead_units:,.0f}",
-                                    delta=pct_of_on_hand(dead_units),
-                                    delta_color="off",
-                                    help=f"{int(status_counts.get('Dead stock', 0))} SKUs with stock and no sale in {int(dead_days)} days · ${dead_value:,.0f} ({value_label.lower()})",
-                                ),
-                                dict(
-                                    label="Slow moving",
-                                    value=f"{slow_units:,.0f}",
-                                    delta=pct_of_on_hand(slow_units),
-                                    delta_color="off",
-                                    help=f"{int(status_counts.get('Slow moving', 0))} SKUs with more than {int(slow_dos)} days of supply.",
-                                ),
-                                dict(
-                                    label="Stock-out risk",
-                                    value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs",
-                                    help=f"Fewer than {int(risk_dos)} days of supply · plus {int(status_counts.get('Out of stock', 0))} SKUs already out of stock with recent sales.",
-                                ),
+                                dict(label="On hand (units)", value=f"{total_on_hand:,.0f}"),
+                                dict(label="Dead stock", value=f"{dead_units:,.0f}", delta=pct_of_on_hand(dead_units), delta_color="off"),
+                                dict(label="Slow moving", value=f"{slow_units:,.0f}", delta=pct_of_on_hand(slow_units), delta_color="off"),
+                                dict(label="Stock-out risk", value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs"),
                             ],
                         )
                     with movement_col:
                         metric_card(
                             f"Movement · last {window_months} months",
                             [
-                                dict(
-                                    label="Units sold",
-                                    value=f"{total_units:,.0f}",
-                                    help=f"{window_label(window_periods)} · avg {total_units / window_months:,.0f} per month",
-                                ),
-                                dict(
-                                    label="Days of supply",
-                                    value=f"{overall_dos:,.0f}" if pd.notna(overall_dos) else "n/a",
-                                    help="Total on hand ÷ average daily units sold in the window.",
-                                ),
-                                dict(
-                                    label="Turns (annualised)",
-                                    value=f"{overall_turns:.1f}×" if pd.notna(overall_turns) else "n/a",
-                                    help="Annualised units sold ÷ units on hand.",
-                                ),
+                                dict(label="Units sold", value=f"{total_units:,.0f}"),
+                                dict(label="Days of supply", value=f"{overall_dos:,.0f}" if pd.notna(overall_dos) else "n/a"),
+                                dict(label="Turns (annualised)", value=f"{overall_turns:.1f}×" if pd.notna(overall_turns) else "n/a"),
                             ],
                         )
 
-                    # --------------------------------------------------------
-                    # Charts
-                    # --------------------------------------------------------
-                    chart_left, chart_right = st.columns(2, gap="small")
-
-                    status_frame = (
-                        filtered.groupby("Status")
-                        .agg(units=("On hand", "sum"), skus=("SKU", "count"), value=("Est. stock value", "sum"))
-                        .reindex(STATUS_ORDER)
-                        .dropna(how="all")
-                        .reset_index()
-                    )
-                    status_frame = status_frame.loc[~status_frame["Status"].isin(["Inactive"])]
-                    present_statuses = [s for s in STATUS_ORDER if s in status_frame["Status"].tolist()]
-                    with chart_left:
-                        st.markdown("<p class='card-title'>On hand by stock status</p>", unsafe_allow_html=True)
-                        status_chart = (
-                            alt.Chart(status_frame)
-                            .mark_bar(size=22)
-                            .encode(
-                                y=alt.Y("Status:N", sort=present_statuses, title=None, axis=quiet_axis(labelFontSize=12)),
-                                x=alt.X("units:Q", title="Units on hand", axis=value_axis("~s")),
-                                color=alt.Color(
-                                    "Status:N",
-                                    scale=alt.Scale(domain=present_statuses, range=[STATUS_COLOURS[s] for s in present_statuses]),
-                                    legend=None,
-                                ),
-                                tooltip=[
-                                    alt.Tooltip("Status:N"),
-                                    alt.Tooltip("units:Q", title="Units on hand", format=",.0f"),
-                                    alt.Tooltip("skus:Q", title="SKUs", format=",.0f"),
-                                    alt.Tooltip("value:Q", title=value_label, format="$,.0f"),
-                                ],
-                            )
-                            .properties(height=max(140, 34 * len(status_frame) + 30))
-                            .configure_view(strokeWidth=0)
-                        )
-                        st.altair_chart(status_chart, **FULL_WIDTH)
-
-                    with chart_right:
-                        st.markdown("<p class='card-title'>Largest dead & slow-moving holdings</p>", unsafe_allow_html=True)
-                        laggards = (
-                            filtered.loc[filtered["Status"].isin(["Dead stock", "Slow moving"]) & (filtered["On hand"] > 0)]
-                            .nlargest(12, "On hand")
-                            .copy()
-                        )
-                        if laggards.empty:
-                            st.caption("No dead or slow-moving stock in this selection.")
-                        else:
-                            laggards["Item"] = laggards.apply(
-                                lambda row: f"{row['SKU']} · {row['Description'][:28]}" if row["Description"] else str(row["SKU"]),
-                                axis=1,
-                            )
-                            laggard_chart = (
-                                alt.Chart(laggards)
-                                .mark_bar(size=16)
-                                .encode(
-                                    y=alt.Y("Item:N", sort="-x", title=None, axis=quiet_axis(labelFontSize=11, labelLimit=220)),
-                                    x=alt.X("On hand:Q", title="Units on hand", axis=value_axis("~s")),
-                                    color=alt.Color(
-                                        "Status:N",
-                                        scale=alt.Scale(domain=["Dead stock", "Slow moving"], range=[STATUS_COLOURS["Dead stock"], STATUS_COLOURS["Slow moving"]]),
-                                        legend=alt.Legend(title=None, orient="top", direction="horizontal", padding=0, offset=4),
-                                    ),
-                                    tooltip=[
-                                        alt.Tooltip("SKU:N"),
-                                        alt.Tooltip("Description:N"),
-                                        alt.Tooltip("Status:N"),
-                                        alt.Tooltip("On hand:Q", format=",.0f"),
-                                        alt.Tooltip("Units sold:Q", title=f"Units sold ({window_months}m)", format=",.0f"),
-                                        alt.Tooltip("Days of supply:Q", format=",.0f"),
-                                        alt.Tooltip("Days since last sale:Q", format=",.0f"),
-                                        alt.Tooltip("Est. stock value:Q", title=value_label, format="$,.0f"),
-                                    ],
-                                )
-                                .properties(height=max(140, 22 * len(laggards) + 40))
-                                .configure_view(strokeWidth=0)
-                            )
-                            st.altair_chart(laggard_chart, **FULL_WIDTH)
-
-                    # --------------------------------------------------------
-                    # Tables (collapsed)
-                    # --------------------------------------------------------
                     sku_columns = [
                         "SKU", "Description", "Supplier", "Class", "Product group", "Status",
                         "On hand", "Free stock", "Units sold", "Avg monthly units", "Days of supply",
@@ -2099,24 +1696,19 @@ elif selected_tab == "Inventory Analysis":
                     ]
                     if "Open PO qty" in filtered.columns:
                         sku_columns += ["Open PO qty", "Days of supply incl. POs"]
-                    if "Sites with stock" in filtered.columns:
-                        sku_columns.append("Sites with stock")
                     sku_columns = [c for c in sku_columns if c in filtered.columns]
 
                     sku_column_config = {
                         "On hand": st.column_config.NumberColumn(format="%d"),
                         "Free stock": st.column_config.NumberColumn(format="%d"),
-                        "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
+                        "Units sold": st.column_config.NumberColumn(format="%d"),
                         "Avg monthly units": st.column_config.NumberColumn(format="%.1f"),
-                        "Days of supply": st.column_config.NumberColumn(format="%d", help="Blank when there were no sales in the window."),
-                        "Days of supply incl. POs": st.column_config.NumberColumn(format="%d"),
+                        "Days of supply": st.column_config.NumberColumn(format="%d"),
                         "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
                         "Last sale": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
                         "Days since last sale": st.column_config.NumberColumn(format="%d"),
-                        "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
-                        "Est. stock value": st.column_config.NumberColumn(value_label, format="$%.0f"),
-                        "Open PO qty": st.column_config.NumberColumn(format="%d"),
-                        "Sites with stock": st.column_config.NumberColumn(format="%d"),
+                        "Sales value": st.column_config.NumberColumn(format="$%.0f"),
+                        "Est. stock value": st.column_config.NumberColumn(format="$%.0f"),
                     }
 
                     def show_table(frame: pd.DataFrame, file_name: str, key: str) -> None:
@@ -2127,77 +1719,18 @@ elif selected_tab == "Inventory Analysis":
                             height=min(420, int(38 + 35 * len(frame)) + 3),
                             **FULL_WIDTH,
                         )
-                        st.download_button(
-                            "Download CSV",
-                            frame[sku_columns].to_csv(index=False).encode("utf-8"),
-                            file_name=file_name,
-                            mime="text/csv",
-                            key=key,
-                        )
+                        st.download_button("Download CSV", frame[sku_columns].to_csv(index=False).encode("utf-8"), file_name=file_name, mime="text/csv", key=key)
 
                     if group_by != "SKU":
                         summary = summarise_inventory(filtered, group_by, window_months, window_days)
                         with st.expander(f"📊 Summary by {group_by.lower()}", expanded=True):
-                            st.dataframe(
-                                summary,
-                                hide_index=True,
-                                column_config={
-                                    "On hand": st.column_config.NumberColumn(format="%d"),
-                                    "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
-                                    "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
-                                    "Dead units": st.column_config.NumberColumn(format="%d"),
-                                    "Slow units": st.column_config.NumberColumn(format="%d"),
-                                    "Dead stock %": st.column_config.NumberColumn(format="%.0f%%"),
-                                    "Days of supply": st.column_config.NumberColumn(format="%d"),
-                                    "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
-                                    "Est. stock value": st.column_config.NumberColumn(value_label, format="$%.0f"),
-                                },
-                                height=min(420, int(38 + 35 * len(summary)) + 3),
-                                **FULL_WIDTH,
-                            )
-                            st.download_button(
-                                "Download CSV",
-                                summary.to_csv(index=False).encode("utf-8"),
-                                file_name=f"inventory_by_{group_by.lower().replace(' ', '_')}.csv",
-                                mime="text/csv",
-                                key="inventory_download_summary",
-                            )
-
-                    laggard_table = filtered.loc[filtered["Status"].isin(["Dead stock", "Slow moving"])].sort_values(
-                        ["Status", "On hand"], ascending=[True, False]
-                    )
-                    with st.expander(
-                        f"🪦 Dead & slow-moving stock · {len(laggard_table):,} SKUs · {float(laggard_table['On hand'].sum()):,.0f} units",
-                        expanded=False,
-                    ):
-                        if laggard_table.empty:
-                            st.caption("Nothing to show.")
-                        else:
-                            show_table(laggard_table, "dead_and_slow_stock.csv", "inventory_download_laggards")
-
-                    risk_table = filtered.loc[filtered["Status"].isin(["Stock-out risk", "Out of stock"])].sort_values(
-                        ["Days of supply", "Units sold"], ascending=[True, False], na_position="first"
-                    )
-                    with st.expander(
-                        f"⚠️ Stock-out risk · {len(risk_table):,} SKUs", expanded=False
-                    ):
-                        if risk_table.empty:
-                            st.caption("Nothing to show.")
-                        else:
-                            show_table(risk_table, "stock_out_risk.csv", "inventory_download_risk")
+                            st.dataframe(summary, hide_index=True, height=300, **FULL_WIDTH)
 
                     with st.expander(f"📋 All SKUs · {len(filtered):,}", expanded=False):
                         show_table(filtered, "inventory_analysis.csv", "inventory_download_all")
 
-                    st.caption(
-                        "Days of supply = units on hand ÷ average daily units sold in the window · "
-                        "Turns = annualised units sold ÷ units on hand · "
-                        f"Dead stock = stock on hand with no sale for {int(dead_days)}+ days · "
-                        f"Slow moving = more than {int(slow_dos)} days of supply · "
-                        f"Stock-out risk = fewer than {int(risk_dos)} days of supply."
-                    )
         except Exception as e:
-            st.error(f"Something went wrong while rendering the inventory analysis: {e}")
+            st.error(f"Something went wrong while rendering inventory analysis: {e}")
 
 # =============================================================================
 # Options Data tab
@@ -2210,34 +1743,17 @@ elif selected_tab == "Options Data":
         head_left, head_right = st.columns([5, 2], gap="small", vertical_alignment="center")
         with head_left:
             st.subheader("Options data")
-            st.caption(
-                f"Showing {min(1000, len(df_options_filtered)):,} of "
-                f"{len(df_options_filtered):,} filtered rows "
-                f"({len(df_options):,} total options) · loaded from {csv_path.name}"
-            )
+            st.caption(f"Showing {min(1000, len(df_options_filtered)):,} of {len(df_options_filtered):,} filtered rows")
         with head_right:
-            st.download_button(
-                "Download full options data",
-                df_options.to_csv(index=False).encode("utf-8"),
-                file_name="options_data.csv",
-                mime="text/csv",
-                **FULL_WIDTH,
-            )
+            st.download_button("Download full options data", df_options.to_csv(index=False).encode("utf-8"), file_name="options_data.csv", mime="text/csv", **FULL_WIDTH)
 
         with st.container(border=True):
-            st.data_editor(
-                df_options_filtered.head(1000),
-                num_rows="dynamic",
-                **FULL_WIDTH,
-            )
+            st.data_editor(df_options_filtered.head(1000), num_rows="dynamic", **FULL_WIDTH)
 
     except FileNotFoundError:
-        st.warning(
-            "⚠️ 'options_data.csv' not found. "
-            "Please make sure your CSV file is in the Raw_data folder."
-        )
+        st.warning("⚠️ 'options_data.csv' not found under Raw_data.")
     except Exception as e:
-        st.error(f"Something went wrong while loading the data: {e}")
+        st.error(f"Something went wrong: {e}")
 
 # =============================================================================
 # Formatted Data tab
@@ -2246,30 +1762,19 @@ elif selected_tab == "Formatted Data":
     prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
-        st.info("Add required source files under Raw_data to view formatted tables.")
+        st.info("Add required source files to view formatted tables.")
     else:
         sheet_names = list(prepared_data.keys())
-
         head_left, head_right = st.columns([5, 2], gap="small", vertical_alignment="bottom")
         with head_left:
             selected_sheet = st.selectbox("Select table", sheet_names)
         df_sheet = prepared_data[selected_sheet]
         with head_right:
-            st.download_button(
-                f"Download {selected_sheet} CSV",
-                df_sheet.to_csv(index=False).encode("utf-8"),
-                file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv",
-                mime="text/csv",
-                **FULL_WIDTH,
-            )
+            st.download_button(f"Download {selected_sheet} CSV", df_sheet.to_csv(index=False).encode("utf-8"), file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv", mime="text/csv", **FULL_WIDTH)
 
         st.caption(f"Showing {min(1000, len(df_sheet)):,} of {len(df_sheet):,} rows")
         with st.container(border=True):
-            st.data_editor(
-                df_sheet.head(1000),
-                num_rows="dynamic",
-                **FULL_WIDTH,
-            )
+            st.data_editor(df_sheet.head(1000), num_rows="dynamic", **FULL_WIDTH)
 
 # =============================================================================
 # Document Status / Last Modified tab
@@ -2324,7 +1829,7 @@ elif selected_tab == "Document Status":
 
     stat_col1, stat_col2, stat_col3 = st.columns(3, gap="small")
     stat_col1.metric("Total Tracked Documents", len(df_docs))
-    stat_col2.metric("FilteredResults", len(filtered_docs))
+    stat_col2.metric("Filtered Results", len(filtered_docs))
     recent_count = len(df_docs[df_docs["Last Modified"] >= (pd.Timestamp.today() - pd.Timedelta(days=7))])
     stat_col3.metric("Modified in Last 7 Days", recent_count)
 
