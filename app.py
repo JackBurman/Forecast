@@ -61,10 +61,12 @@ FY_MONTHS = [
 base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
 csv_path = raw_data_path / "options_data.csv"
+inventory_folder_path = raw_data_path / "inventory"
+podash_folder_path = raw_data_path / "PODash"
 
 
 # =============================================================================
-# Data loading and cleaning (unchanged)
+# Data loading and cleaning
 # =============================================================================
 
 @st.cache_data
@@ -304,6 +306,29 @@ def load_raw_folder_data(
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     sources, source_names = forecast_engine.read_raw_data_folder(folder)
+
+    # Override Current Inventory from inventory/ folder if present
+    if inventory_folder_path.exists():
+        inv_files = [p for p in inventory_folder_path.glob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        if inv_files:
+            latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
+            try:
+                sources["Current Inventory"] = pd.read_excel(latest_inv) if latest_inv.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(latest_inv)
+                source_names.append(str(latest_inv.relative_to(base_dir)))
+            except Exception:
+                pass
+
+    # Override Purchase Orders from PODash/ folder if present
+    if podash_folder_path.exists():
+        po_files = [p for p in podash_folder_path.glob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        if po_files:
+            latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
+            try:
+                sources["Purchase Orders"] = pd.read_excel(latest_po) if latest_po.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(latest_po)
+                source_names.append(str(latest_po.relative_to(base_dir)))
+            except Exception:
+                pass
+
     formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
@@ -1020,8 +1045,8 @@ if selected_tab == "Forecast":
 
     if prepared_data is None:
         st.info(
-            "Add Inventory_report.xlsx, PODashboard.xlsx, options_data.csv, and the "
-            "historical/weekly sales workbooks under Raw_data/Sales Data."
+            "Add Inventory files under Raw_data/inventory, PO files under Raw_data/PODash, "
+            "options_data.csv, and historical/weekly sales workbooks under Raw_data/Sales Data."
         )
     else:
         try:
@@ -1197,7 +1222,7 @@ if selected_tab == "Forecast":
                     fy_fc = float(fc_series.reindex(this_year_periods).mean())
                 else:
                     ytd_act = float(actual_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
-                    ytd_fc = float(fc_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
+                    ytd_fc = float(fc_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
                     ytg_fc = float(fc_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
                     fy_act_fc = ytd_act + ytg_fc
                     fy_fc = float(fc_series.reindex(this_year_periods).sum())
@@ -1304,9 +1329,6 @@ if selected_tab == "Forecast":
                 # ------------------------------------------------------------
                 # Tier 2 — monthly comparison chart
                 # ------------------------------------------------------------
-                # In the FY view the engine is asked for one extra calendar
-                # year so that July–December of the first financial year is
-                # present, then the months are re-grouped into Jul–Jun years.
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
@@ -1355,7 +1377,6 @@ if selected_tab == "Forecast":
                     forecast_chart_data = pd.concat(forecast_frames, ignore_index=True)
                     forecast_periods = forecast_chart_data["Date"].dt.to_period("M")
                     forecast_chart_data["YearNumber"] = forecast_periods.map(lambda p: view_year(p, fiscal))
-                    # Keep the current and following year, as in the calendar view.
                     forecast_chart_data = forecast_chart_data.loc[
                         forecast_chart_data["YearNumber"] >= view_this_year
                     ].copy()
@@ -1542,7 +1563,6 @@ if selected_tab == "Forecast":
                 # ------------------------------------------------------------
                 if metric == "Sale":
                     target_80 = sale_target * 0.8
-
                     target_diff = fy_act_fc - sale_target
                     target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
 
@@ -1760,7 +1780,7 @@ elif selected_tab == "Inventory Analysis":
     prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
-        st.info("Add Inventory_report.xlsx and the sales workbooks under Raw_data to analyse inventory.")
+        st.info("Add Inventory files under Raw_data/inventory and the sales workbooks to analyse inventory.")
     else:
         try:
             sheets = prepared_data
@@ -2264,18 +2284,25 @@ elif selected_tab == "Document Status":
         for path in raw_data_path.rglob("*"):
             if path.is_file():
                 stat = path.stat()
+                category = "Raw Data / Source"
+                if "inventory" in path.parts:
+                    category = "Inventory Folder"
+                elif "PODash" in path.parts:
+                    category = "PO Dash Folder"
+                elif "Sales Data" in path.parts:
+                    category = "Sales Folder"
+                elif path.name == "options_data.csv":
+                    category = "Catalog"
+
                 doc_records.append({
                     "Document Name": path.name,
-                    "Category": "Raw Data / Source",
+                    "Category": category,
                     "Last Modified": pd.Timestamp(stat.st_mtime, unit="s"),
                     "Size (KB)": round(stat.st_size / 1024, 1),
                     "Status": "Active"
                 })
 
     default_docs = [
-        {"Document Name": "Inventory_report.xlsx", "Category": "Inventory", "Last Modified": pd.Timestamp("2026-10-24 07:00:00"), "Size (KB)": 1420.5, "Status": "Up to date"},
-        {"Document Name": "PODashboard.xlsx", "Category": "Purchasing", "Last Modified": pd.Timestamp("2026-10-25 08:30:00"), "Size (KB)": 980.2, "Status": "Up to date"},
-        {"Document Name": "options_data.csv", "Category": "Catalog", "Last Modified": pd.Timestamp("2026-10-26 06:15:00"), "Size (KB)": 3450.0, "Status": "Active"},
         {"Document Name": "Forecast_Engine.py", "Category": "System Code", "Last Modified": pd.Timestamp("2026-10-22 14:10:00"), "Size (KB)": 45.2, "Status": "Stable"},
         {"Document Name": "app.py", "Category": "System Code", "Last Modified": pd.Timestamp.today(), "Size (KB)": 112.4, "Status": "Running"}
     ]
@@ -2297,7 +2324,7 @@ elif selected_tab == "Document Status":
 
     stat_col1, stat_col2, stat_col3 = st.columns(3, gap="small")
     stat_col1.metric("Total Tracked Documents", len(df_docs))
-    stat_col2.metric("Filtered Results", len(filtered_docs))
+    stat_col2.metric("FilteredResults", len(filtered_docs))
     recent_count = len(df_docs[df_docs["Last Modified"] >= (pd.Timestamp.today() - pd.Timedelta(days=7))])
     stat_col3.metric("Modified in Last 7 Days", recent_count)
 
