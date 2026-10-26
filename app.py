@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 import forecast_engine  # type: ignore
+from inventory_charts import stock_health_breakdown, stock_health_by_group
 
 # =============================================================================
 # App setup
@@ -376,6 +377,8 @@ def detect_header_row(preview: pd.DataFrame) -> int:
 def read_tabular(path: Path) -> pd.DataFrame:
     """Read a CSV / Excel export, skipping any title rows above the header."""
     if path.suffix.lower() == ".csv":
+        # Title lines above the header have fewer fields than the data, which
+        # trips the default parser; read the preview as ragged rows instead.
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             lines = [handle.readline() for _ in range(20)]
         ragged = [line.rstrip("\r\n").split(",") for line in lines if line.strip()]
@@ -392,7 +395,12 @@ def read_tabular(path: Path) -> pd.DataFrame:
 
 
 def add_alias_columns(frame: pd.DataFrame, aliases: dict[str, list[str]], numeric: tuple[str, ...] = ()) -> pd.DataFrame:
-    """Add standard column names alongside the export's own headers."""
+    """Add standard column names alongside the export's own headers.
+
+    Original columns are never renamed, so whatever forecast_engine keyed on
+    in the original workbooks is still present; the aliases cover the names it
+    is known to look for.
+    """
     frame = frame.copy()
     frame.columns = [str(col).strip() for col in frame.columns]
     for alias, candidates in aliases.items():
@@ -430,6 +438,7 @@ def standardise_purchase_orders(frame: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def write_engine_placeholders() -> list[Path]:
+    """Create zero-row workbooks the engine's reader expects; returns what was created."""
     created = []
     for name, columns in ENGINE_PLACEHOLDERS.items():
         path = raw_data_path / name
@@ -446,6 +455,11 @@ def column_summary(frame: pd.DataFrame | None) -> str:
 
 
 def local_prepare_forecast_sheets(inputs: dict) -> dict:
+    """App-side stand-in for forecast_engine.prepare_forecast_sheets.
+
+    Adds the three derived sales columns the filters rely on (SKU Key, Supplier
+    Brand, Model) from the options data, and passes the other sheets through.
+    """
     sales = inputs["Sales Data"].copy()
     options = inputs.get("OptionsData")
     sales["SKU Key"] = sales["SKU"].astype("string")
@@ -475,6 +489,7 @@ def load_raw_folder_data(
     folder: str,
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
+    """Returns (sheets, source file names, notes to show the user)."""
     notes: list[str] = []
 
     placeholders = write_engine_placeholders()
@@ -494,6 +509,8 @@ def load_raw_folder_data(
         if key not in sources:
             raise KeyError(f"forecast_engine.read_raw_data_folder did not return '{key}'.")
 
+    # Live inventory / PO exports: newest file in each sub-folder, falling back
+    # to whatever the engine read from Raw_data itself.
     inventory_file = newest_file(inventory_folder_path)
     if inventory_file is not None:
         try:
@@ -543,6 +560,7 @@ def load_raw_folder_data(
 
 
 def load_prepared_data():
+    """Load Raw_data for a tab; returns (sheets, source_names) or (None, [])."""
     try:
         sheets, names, notes = load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
     except Exception as e:
@@ -552,6 +570,14 @@ def load_prepared_data():
         st.warning(note)
     return sheets, names
 
+
+# =============================================================================
+# Engine calls with app-side fallbacks
+#
+# The engine's helpers are used whenever they work. If one raises on the new
+# inventory / PO exports, the app computes the same quantity itself and says
+# so, rather than blanking the whole tab.
+# =============================================================================
 
 FILTER_COLUMNS = {
     "Location": "City",
@@ -565,6 +591,7 @@ FILTER_COLUMNS = {
 
 
 def engine_call(name: str, fallback, *args):
+    """Call forecast_engine.<name>(*args); on failure use fallback and return a note."""
     func = getattr(forecast_engine, name, None)
     if func is None:
         return fallback(*args), f"forecast_engine has no {name}; the app calculated it instead."
@@ -632,11 +659,12 @@ def column_or_empty(frame: pd.DataFrame, name: str) -> pd.Series:
 
 
 # =============================================================================
-# Forecast math
+# Forecast math (unchanged)
 # =============================================================================
 
 SEASON = 12
 GROWTH_FLOOR, GROWTH_CAP = 0.5, 1.2
+DEFAULT_GROWTH = 1.05
 
 
 def monthly_series(sales: pd.DataFrame, metric: str, before: pd.Timestamp | None = None) -> pd.Series:
@@ -853,7 +881,12 @@ def window_label(window: pd.PeriodIndex) -> str:
     return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
 
 
+# =============================================================================
+# Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
+# =============================================================================
+
 def fiscal_year_of(period: pd.Period) -> int:
+    """Australian FY ends 30 June and is named by its end year (FY2027 = Jul 2026 – Jun 2027)."""
     return period.year + 1 if period.month >= 7 else period.year
 
 
@@ -875,6 +908,7 @@ def label_year_number(label: str) -> int:
 
 
 def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFrame:
+    """Re-group a Month × calendar-year profile into Month × financial-year; values are moved, not recomputed."""
     long = profile.melt(id_vars="Month", var_name="Year", value_name="Value").dropna(subset=["Value"])
     if long.empty:
         return pd.DataFrame({"Month": FY_MONTHS})
@@ -896,6 +930,7 @@ STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out o
 
 @st.cache_data(show_spinner=False)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """One row per SKU with on-hand and free stock summed across sites."""
     frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
@@ -924,6 +959,7 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
+    """Per-SKU sales inside the window plus lifetime first/last sale dates."""
     dated = sales.dropna(subset=["Date"]).copy()
     key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
     dated["SKU"] = dated[key_column].map(sku_text)
@@ -960,6 +996,7 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
 
 
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
+    """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
     empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group"])
     if options is None or options.empty:
         return empty
@@ -979,6 +1016,7 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
+    """Open PO quantity per SKU; empty when the PO sheet has no SKU or quantity column."""
     if purchase_orders is None or purchase_orders.empty:
         return pd.Series(dtype=float)
     sku_col = detect_column(purchase_orders.columns, SKU_HEADERS)
@@ -1003,6 +1041,7 @@ def build_inventory_table(
     slow_dos: int,
     risk_dos: int,
 ) -> pd.DataFrame:
+    """SKU-level stock position, movement, days of supply, turns and status."""
     master = inventory_sku.merge(movement, on="SKU", how="outer")
     master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
     for column in ["Description", "Supplier", "Class", "Product group"]:
@@ -1095,6 +1134,7 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
 # =============================================================================
 
 def metric_card(title: str, tiles: list[dict]) -> None:
+    """A bordered card with a small heading and one st.metric per tile."""
     with st.container(border=True):
         st.markdown(f"<p class='card-title'>{title}</p>", unsafe_allow_html=True)
         columns = st.columns(len(tiles), gap="small")
@@ -1103,6 +1143,7 @@ def metric_card(title: str, tiles: list[dict]) -> None:
 
 
 def chart_formats(metric: str) -> tuple[str, str, str]:
+    """Axis format, tooltip format and axis title for a metric."""
     if metric in ["Sale", "Cost", "GP $"]:
         return "$~s", "$,.0f", f"{metric.replace(' $', '')} ($)"
     if metric == "GP%":
@@ -1344,6 +1385,8 @@ if selected_tab == "Forecast":
                 else:
                     rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
 
+                # The view only decides which twelve months make up "this year";
+                # the forecast series are used exactly as produced.
                 current_period = last_complete + 1
                 view_this_year = view_year(current_period, fiscal)
                 this_label = view_label(view_this_year, fiscal)
@@ -1404,6 +1447,7 @@ if selected_tab == "Forecast":
                     )
                 )
 
+                # Headline cards
                 card_left, card_right = st.columns([2, 3], gap="small")
                 with card_left:
                     metric_card(
@@ -1460,6 +1504,9 @@ if selected_tab == "Forecast":
                     ],
                 )
 
+                # Monthly comparison chart. In the FY view the engine is asked
+                # for one extra calendar year so July–December of the first
+                # financial year is present, then months are re-grouped.
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
                 annual_profile, note = engine_call(
                     "yearly_monthly_profile",
@@ -1678,6 +1725,7 @@ elif selected_tab == "Inventory Analysis":
                         {
                             str(value).strip()
                             for source in sources
+                            if source is not None
                             for value in source.dropna()
                             if str(value).strip() and str(value).strip().lower() != "nan"
                         },
@@ -1800,84 +1848,33 @@ elif selected_tab == "Inventory Analysis":
                             ],
                         )
 
-                    # =========================================================
-                    # Stock Health Visualisation Graphs
-                    # =========================================================
-                    st.markdown("<div style='height: 0.2rem;'></div>", unsafe_allow_html=True)
-                    st.subheader("Stock Health Breakdown")
-                    
-                    status_colors = {
-                        "Healthy": "#009e73",
-                        "Stock-out risk": "#e69f00",
-                        "Slow moving": "#56b4e9",
-                        "Dead stock": "#d55e00",
-                        "Out of stock": "#cc79a7",
-                        "Inactive": "#999999",
-                    }
-
-                    status_chart_data = (
-                        filtered.groupby("Status", as_index=False)
-                        .agg({"On hand": "sum", "Est. stock value": "sum", "SKU": "count"})
-                        .rename(columns={"SKU": "SKUs"})
-                    )
-                    status_chart_data["Status"] = pd.Categorical(
-                        status_chart_data["Status"], categories=STATUS_ORDER, ordered=True
-                    )
-                    status_chart_data = status_chart_data.sort_values("Status").dropna(subset=["Status"])
-
-                    stock_health_chart = (
-                        alt.Chart(status_chart_data)
-                        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-                        .encode(
-                            x=alt.X("Status:N", sort=STATUS_ORDER, title=None, axis=alt.Axis(labelAngle=0)),
-                            y=alt.Y("On hand:Q", title="On Hand (units)", axis=value_axis(",.0f")),
-                            color=alt.Color(
-                                "Status:N",
-                                scale=alt.Scale(
-                                    domain=list(status_colors.keys()),
-                                    range=list(status_colors.values()),
-                                ),
-                                legend=None,
-                            ),
-                            tooltip=[
-                                alt.Tooltip("Status:N", title="Status"),
-                                alt.Tooltip("On hand:Q", title="On Hand Units", format=",.0f"),
-                                alt.Tooltip("Est. stock value:Q", title="Stock Value", format="$,.0f"),
-                                alt.Tooltip("SKUs:Q", title="SKU Count", format=",.0f"),
-                            ],
+                    # Stock-health charts: status breakdown, and the status mix
+                    # across the attribute chosen in "Group by" (Supplier when
+                    # the view is per SKU).
+                    chart_group = group_by if group_by != "SKU" else "Supplier"
+                    control_left, control_mid, control_right = st.columns([3, 3, 2], gap="small", vertical_alignment="center")
+                    with control_left:
+                        measure_label = st.radio(
+                            "Measure", ["Units on hand", "SKUs", "Stock value"], index=0,
+                            horizontal=True, key="inventory_chart_measure", label_visibility="collapsed",
                         )
-                        .properties(height=260)
-                    )
-                    st.altair_chart(stock_health_chart, key="inventory_stock_health_chart", **FULL_WIDTH)
+                    with control_right:
+                        show_share = st.toggle("Show as % of group", value=False, key="inventory_chart_normalize")
+                    measure = {"Units on hand": "units", "SKUs": "skus", "Stock value": "value"}[measure_label]
 
-                    if group_by != "SKU":
-                        st.subheader(f"Stock Health by {group_by}")
-                        group_status_df = filtered.groupby([group_by, "Status"], as_index=False).agg({"On hand": "sum"})
-                        stacked_chart = (
-                            alt.Chart(group_status_df)
-                            .mark_bar()
-                            .encode(
-                                x=alt.X(f"{group_by}:N", title=None, sort="-y", axis=alt.Axis(labelAngle=-30)),
-                                y=alt.Y("On hand:Q", title="On Hand (units)", axis=value_axis(",.0f")),
-                                color=alt.Color(
-                                    "Status:N",
-                                    scale=alt.Scale(
-                                        domain=list(status_colors.keys()),
-                                        range=list(status_colors.values()),
-                                    ),
-                                    legend=alt.Legend(
-                                        title="Status", orient="top", direction="horizontal", symbolType="square",
-                                    ),
-                                ),
-                                tooltip=[
-                                    alt.Tooltip(f"{group_by}:N", title=group_by),
-                                    alt.Tooltip("Status:N", title="Status"),
-                                    alt.Tooltip("On hand:Q", title="On Hand Units", format=",.0f"),
-                                ],
-                            )
-                            .properties(height=300)
+                    chart_left, chart_right = st.columns([2, 3], gap="small")
+                    with chart_left:
+                        st.markdown("<p class='card-title'>Stock health</p>", unsafe_allow_html=True)
+                        st.altair_chart(stock_health_breakdown(filtered, measure=measure), **FULL_WIDTH)
+                    with chart_right:
+                        st.markdown(
+                            f"<p class='card-title'>Stock health by {chart_group.lower()} · top 15</p>",
+                            unsafe_allow_html=True,
                         )
-                        st.altair_chart(stacked_chart, key="inventory_group_status_chart", **FULL_WIDTH)
+                        st.altair_chart(
+                            stock_health_by_group(filtered, chart_group, measure=measure, top_n=15, normalize=show_share),
+                            **FULL_WIDTH,
+                        )
 
                     sku_columns = [
                         "SKU", "Description", "Supplier", "Class", "Product group", "Status",
