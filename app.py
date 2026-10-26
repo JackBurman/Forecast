@@ -930,7 +930,7 @@ def load_prepared_data():
 
 header_left, header_right = st.columns([6, 1], gap="small", vertical_alignment="center")
 with header_left:
-    st.title("📦 Forecasting & Purchasing System")
+    st.title("📦 Forecast, Invnetory & Purchasing")
 with header_right:
     if st.button("🔄 Refresh data", **FULL_WIDTH):
         load_csv.clear()
