@@ -326,26 +326,21 @@ def load_raw_folder_data(
             except Exception:
                 pass
 
-    # Automatically load the newest file inside inventory/ (.xls, .xlsx, or .csv) and normalise columns
+    # Automatically load the newest CSV file inside inventory/ and normalise columns
     if inventory_folder_path.exists():
-        inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"]
         if inv_files:
             latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
             try:
-                if latest_inv.suffix.lower() == ".csv":
-                    inv_df = pd.read_csv(latest_inv)
-                elif latest_inv.suffix.lower() == ".xls":
-                    inv_df = pd.read_excel(latest_inv, engine="xlrd")
-                else:
-                    inv_df = pd.read_excel(latest_inv)
+                inv_df = pd.read_csv(latest_inv)
                 
-                # Standardise header names so forecast_engine finds "Product Code" regardless of naming
+                # Standardise header names so forecast_engine finds "Stock Code" / "Product Code"
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
                 col_rename = {}
                 for col in inv_df.columns:
                     norm = normalise_header(col)
                     if norm in ["sku", "sku key", "stock code", "stockcode", "product code", "item code", "item number", "code", "item"]:
-                        col_rename[col] = "Product Code"
+                        col_rename[col] = "Stock Code"
                     elif norm in ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "qoh", "in stock", "stock", "quantity", "qty"]:
                         col_rename[col] = "On Hand"
                 inv_df = inv_df.rename(columns=col_rename)
@@ -355,20 +350,15 @@ def load_raw_folder_data(
             except Exception as e:
                 st.warning(f"Could not load inventory file {latest_inv.name}: {e}")
 
-    # Automatically load the newest file inside PODash/ (.csv, .xls, or .xlsx) and normalise columns
+    # Automatically load the newest CSV file inside PODash/ and normalise columns
     if podash_folder_path.exists():
-        po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
+        po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"]
         if po_files:
             latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
             try:
-                if latest_po.suffix.lower() == ".csv":
-                    po_df = pd.read_csv(latest_po)
-                elif latest_po.suffix.lower() == ".xls":
-                    po_df = pd.read_excel(latest_po, engine="xlrd")
-                else:
-                    po_df = pd.read_excel(latest_po)
+                po_df = pd.read_csv(latest_po)
                 
-                # Standardise header names so forecast_engine finds what it needs regardless of naming
+                # Standardise header names so forecast_engine finds what it needs
                 po_df.columns = [str(col).strip() for col in po_df.columns]
                 col_rename = {}
                 for col in po_df.columns:
