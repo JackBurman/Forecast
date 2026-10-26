@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Monkey-patch pandas.read_excel to default to openpyxl and avoid python-calamine import errors
+# Monkey-patch pandas.read_excel to safely handle header offset issues and empty/single-line preview sheets
 _orig_read_excel = pd.read_excel
 
 
@@ -16,7 +16,17 @@ def _patched_read_excel(*args, **kwargs):
   try:
     return _orig_read_excel(*args, **kwargs)
   except Exception as e:
-    if "python-calamine" in str(e) or "calamine" in str(e).lower():
+    err_str = str(e)
+    if "Passed header" in err_str or "lines in file" in err_str:
+      # If header skipping fails due to a short/single-line file/preview, fallback to header=0 or None
+      kwargs.pop("skiprows", None)
+      kwargs["header"] = 0
+      try:
+        return _orig_read_excel(*args, **kwargs)
+      except Exception:
+        kwargs["header"] = None
+        return _orig_read_excel(*args, **kwargs)
+    if "python-calamine" in err_str or "calamine" in err_str.lower():
       kwargs["engine"] = "openpyxl"
       return _orig_read_excel(*args, **kwargs)
     raise e
@@ -380,6 +390,8 @@ def detect_header_row(preview: pd.DataFrame) -> int:
     The first row holding a SKU-like header wins; otherwise the row with the
     most populated cells.
     """
+    if preview.empty:
+        return 0
     best_row, best_count = 0, -1
     for index, row in preview.iterrows():
         cells = [normalise_header(value) for value in row if pd.notna(value) and str(value).strip()]
@@ -395,8 +407,6 @@ def detect_header_row(preview: pd.DataFrame) -> int:
 def read_tabular(path: Path) -> pd.DataFrame:
     """Read a CSV / Excel export, skipping any title rows above the header."""
     if path.suffix.lower() == ".csv":
-        # Title lines above the header have fewer fields than the data, which
-        # trips the default parser; read the preview as ragged rows instead.
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             lines = [handle.readline() for _ in range(20)]
         ragged = [line.rstrip("\r\n").split(",") for line in lines if line.strip()]
@@ -405,9 +415,16 @@ def read_tabular(path: Path) -> pd.DataFrame:
         header_row = detect_header_row(preview)
         frame = pd.read_csv(path, skiprows=header_row, encoding="utf-8-sig", encoding_errors="replace", low_memory=False)
     else:
-        preview = pd.read_excel(path, header=None, nrows=20)
-        header_row = detect_header_row(preview)
-        frame = pd.read_excel(path, skiprows=header_row)
+        try:
+            preview = pd.read_excel(path, header=None, nrows=20)
+        except Exception:
+            preview = pd.DataFrame()
+        header_row = detect_header_row(preview) if not preview.empty else 0
+        try:
+            frame = pd.read_excel(path, skiprows=header_row)
+        except Exception:
+            # Fallback if rows/headers are sparse or short
+            frame = pd.read_excel(path, header=0)
     frame.columns = [str(col).strip() for col in frame.columns]
     return frame.dropna(how="all").reset_index(drop=True)
 
