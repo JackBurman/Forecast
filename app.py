@@ -38,40 +38,101 @@ st.markdown(
 
 def _streamlit_version() -> tuple[int, ...]:
     parts: list[int] = []
-    for piece in st.session_state.get("__version__", st.session_state.get("__version__", __import__("streamlit").__version__)).split(".")[:3]:
+    for piece in st.__version__.split(".")[:3]:
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
     return tuple(parts)
 
 
+# Streamlit 1.51+ replaced use_container_width=True with width="stretch".
 FULL_WIDTH = (
     {"width": "stretch"}
     if _streamlit_version() >= (1, 51)
     else {"use_container_width": True}
 )
 
-MONTH_NUMBER_TO_NAME = dict(enumerate(forecast_engine.MONTHS, start=1))
+MONTHS = list(forecast_engine.MONTHS)
+MONTH_NUMBER_TO_NAME = dict(enumerate(MONTHS, start=1))
 MONTH_NAME_TO_NUMBER = {name: number for number, name in MONTH_NUMBER_TO_NAME.items()}
-FY_MONTHS = [
-    "July", "August", "September", "October", "November", "December",
-    "January", "February", "March", "April", "May", "June"
-]
+FY_MONTHS = MONTHS[6:] + MONTHS[:6]
 
-# Data paths and cached loaders
+# Data paths
 base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
 csv_path = raw_data_path / "options_data.csv"
 inventory_folder_path = raw_data_path / "inventory"
 podash_folder_path = raw_data_path / "PODash"
 
+# Files forecast_engine.read_raw_data_folder expects to find. When the live
+# inventory / PO exports live in the sub-folders instead, zero-row
+# placeholders are written for the duration of the read and removed again.
+ENGINE_PLACEHOLDERS = {
+    "Inventory_report.xlsx": ["Stock Code", "Product Code", "On Hand", "Free Stock"],
+    "PODashboard.xlsx": ["Stock Code", "Product Code", "Date", "Open PO Qty"],
+}
+TABULAR_EXTENSIONS = {".csv", ".xls", ".xlsx"}
+
 
 # =============================================================================
-# Data loading and cleaning
+# Column detection
 # =============================================================================
+
+SKU_HEADERS = ["sku", "sku key", "stock code", "stockcode", "item code", "item number", "product code", "item", "code"]
+ON_HAND_HEADERS = ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "on hand qty", "qoh", "in stock", "stock qty", "stock", "quantity", "qty"]
+FREE_HEADERS = ["free", "free stock", "free qty", "qty free", "available", "available qty", "qty available", "unallocated"]
+OPEN_PO_HEADERS = ["open po qty", "open qty", "outstanding qty", "qty outstanding", "qty open", "balance qty", "po qty", "quantity", "qty"]
+DATE_HEADERS = ["date", "due date", "expected date", "eta", "po date", "order date"]
+
+INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
+    "sku": SKU_HEADERS,
+    "on_hand": ON_HAND_HEADERS,
+    "free": FREE_HEADERS,
+    "site": ["site", "location", "warehouse", "branch", "store", "showroom"],
+    "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
+    "description": ["description", "item description", "product description", "product name", "name", "product"],
+}
+INVENTORY_ROLE_LABELS = {
+    "sku": "SKU column",
+    "on_hand": "On-hand quantity column",
+    "free": "Free stock column",
+    "site": "Site / location column",
+    "value": "Stock value column",
+    "description": "Description column",
+}
+
 
 def normalise_header(text) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
 
+
+def detect_column(columns, candidates: list[str], exclude: tuple = ()) -> str | None:
+    """Best-matching column for a role: exact normalised match first, then substring."""
+    normalised = {col: normalise_header(col) for col in columns if col not in exclude}
+    for candidate in candidates:
+        for col, norm in normalised.items():
+            if norm == candidate:
+                return col
+    for candidate in candidates:
+        for col, norm in normalised.items():
+            if candidate in norm:
+                return col
+    return None
+
+
+def detect_inventory_columns(inventory: pd.DataFrame) -> dict[str, str | None]:
+    found: dict[str, str | None] = {}
+    used: list[str] = []
+    for role, candidates in INVENTORY_COLUMN_CANDIDATES.items():
+        col = detect_column(inventory.columns, candidates, exclude=tuple(used))
+        found[role] = col
+        if col:
+            used.append(col)
+    return found
+
+
+# =============================================================================
+# Data loading and cleaning
+# =============================================================================
 
 @st.cache_data
 def load_csv(path: str | Path) -> pd.DataFrame:
@@ -83,6 +144,7 @@ def load_csv(path: str | Path) -> pd.DataFrame:
 
 
 def to_number(series: pd.Series) -> pd.Series:
+    """Coerce '1,234.50', '$1,234', '45%', '(12)' or blanks to floats; junk becomes NaN."""
     text = (
         series.astype(str)
         .str.strip()
@@ -93,6 +155,7 @@ def to_number(series: pd.Series) -> pd.Series:
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
+    """Parse a column that may mix Excel serials, real datetimes and day-first text."""
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
     is_serial = series.map(
@@ -115,6 +178,7 @@ def parse_dates(series: pd.Series) -> pd.Series:
 
 
 def normalize_sku(value):
+    """Preserve numeric SKUs as integers and alphanumeric SKUs as text."""
     if pd.isna(value):
         return pd.NA
     text = str(value).strip()
@@ -126,8 +190,14 @@ def normalize_sku(value):
     return text
 
 
+def sku_text(value) -> str:
+    normalised = normalize_sku(value)
+    return "" if pd.isna(normalised) else str(normalised)
+
+
 @st.cache_data
 def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.DataFrame:
+    """Apply the Power Query-style transformation to the merged sales exports."""
     sales = df_sales.copy()
     sales.columns = [str(col).strip() for col in sales.columns]
 
@@ -139,17 +209,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     }
     sales = sales.rename(columns={k: v for k, v in rename_map.items() if k in sales.columns})
 
-    expected_columns = [
-        "Inv #",
-        "Date",
-        "Stock Code",
-        "Description",
-        "Qty",
-        "Total",
-        "Cost",
-        "GP%",
-        "GP $",
-    ]
+    expected_columns = ["Inv #", "Date", "Stock Code", "Description", "Qty", "Total", "Cost", "GP%", "GP $"]
     if not {"Inv #", "Date", "Stock Code"}.issubset(sales.columns):
         data_columns = [col for col in sales.columns if col != "_SourceFile"]
         if len(data_columns) != len(expected_columns):
@@ -161,6 +221,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
     sales = sales.dropna(how="all").reset_index(drop=True)
 
+    # Carry location labels down the sales export.
     sales["Location"] = pd.NA
     location_mask = (
         sales["Inv #"].astype(str).str.upper().str.startswith("LOCATION:", na=False)
@@ -188,6 +249,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
         sales["Stock Code"].astype(str).str.strip().str.replace("\r", "")
     )
 
+    # Enrich sales rows with product metadata.
     options_lookup = df_options.copy()
     options_lookup["SKU"] = options_lookup["Stock Code"].map(normalize_sku)
     options_lookup = options_lookup[
@@ -259,26 +321,10 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     sales = sales.drop_duplicates(subset=["Inv #", "SKU", "Sale"]).copy()
 
     final_columns = [
-        "City",
-        "Sales Channel",
-        "Sales Channel Net",
-        "Location",
-        "Inv #",
-        "Date",
-        "Month",
-        "Year",
-        "SKU",
-        "OptionsData.Supplier",
-        "OptionsData.Class",
-        "Description",
-        "OptionsData.Fourth Product Group",
-        "Qty",
-        "Sale",
-        "Cost",
-        "GP%",
-        "GP $",
+        "City", "Sales Channel", "Sales Channel Net", "Location", "Inv #", "Date", "Month", "Year",
+        "SKU", "OptionsData.Supplier", "OptionsData.Class", "Description",
+        "OptionsData.Fourth Product Group", "Qty", "Sale", "Cost", "GP%", "GP $",
     ]
-
     final_columns = [col for col in final_columns if col in sales.columns]
     sales = sales[final_columns]
     if "SKU" in sales.columns:
@@ -288,136 +334,331 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
 
 def raw_folder_manifest(folder: Path) -> tuple[tuple[str, int, int], ...]:
-    supported_extensions = {".csv", ".xls", ".xlsx"}
+    """Names, sizes and mtimes of every data file; a change invalidates the cache."""
+    if not folder.exists():
+        return ()
     files = sorted(
         path
         for path in folder.rglob("*")
-        if path.is_file() and path.suffix.lower() in supported_extensions
+        if path.is_file() and path.suffix.lower() in TABULAR_EXTENSIONS and path.name not in ENGINE_PLACEHOLDERS
     )
     return tuple(
-        (
-            str(path.relative_to(folder)),
-            path.stat().st_size,
-            path.stat().st_mtime_ns,
-        )
+        (str(path.relative_to(folder)), path.stat().st_size, path.stat().st_mtime_ns)
         for path in files
     )
+
+
+def newest_file(folder: Path) -> Path | None:
+    if not folder.exists():
+        return None
+    files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in TABULAR_EXTENSIONS]
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
+
+
+def detect_header_row(preview: pd.DataFrame) -> int:
+    """Row index of the header in an export that may start with title lines.
+
+    The first row holding a SKU-like header wins; otherwise the row with the
+    most populated cells.
+    """
+    best_row, best_count = 0, -1
+    for index, row in preview.iterrows():
+        cells = [normalise_header(value) for value in row if pd.notna(value) and str(value).strip()]
+        if not cells:
+            continue
+        if any(cell in SKU_HEADERS or any(key in cell for key in ("stock code", "product code", "sku", "item code")) for cell in cells):
+            return int(index)
+        if len(cells) > best_count:
+            best_row, best_count = int(index), len(cells)
+    return best_row
+
+
+def read_tabular(path: Path) -> pd.DataFrame:
+    """Read a CSV / Excel export, skipping any title rows above the header."""
+    if path.suffix.lower() == ".csv":
+        # Title lines above the header have fewer fields than the data, which
+        # trips the default parser; read the preview as ragged rows instead.
+        with open(path, encoding="utf-8-sig", errors="replace") as handle:
+            lines = [handle.readline() for _ in range(20)]
+        ragged = [line.rstrip("\r\n").split(",") for line in lines if line.strip()]
+        width = max((len(row) for row in ragged), default=1)
+        preview = pd.DataFrame([row + [None] * (width - len(row)) for row in ragged])
+        header_row = detect_header_row(preview)
+        frame = pd.read_csv(path, skiprows=header_row, encoding="utf-8-sig", encoding_errors="replace", low_memory=False)
+    else:
+        preview = pd.read_excel(path, header=None, nrows=20)
+        header_row = detect_header_row(preview)
+        frame = pd.read_excel(path, skiprows=header_row)
+    frame.columns = [str(col).strip() for col in frame.columns]
+    return frame.dropna(how="all").reset_index(drop=True)
+
+
+def add_alias_columns(frame: pd.DataFrame, aliases: dict[str, list[str]], numeric: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Add standard column names alongside the export's own headers.
+
+    Original columns are never renamed, so whatever forecast_engine keyed on
+    in the original workbooks is still present; the aliases cover the names it
+    is known to look for.
+    """
+    frame = frame.copy()
+    frame.columns = [str(col).strip() for col in frame.columns]
+    for alias, candidates in aliases.items():
+        if alias in frame.columns:
+            continue
+        source = detect_column(frame.columns, candidates)
+        if source is None:
+            frame[alias] = np.nan if alias in numeric else pd.Series(dtype=object)
+        elif alias in numeric:
+            frame[alias] = to_number(frame[source])
+        else:
+            frame[alias] = frame[source]
+    return frame
+
+
+def standardise_inventory(frame: pd.DataFrame | None) -> pd.DataFrame:
+    frame = pd.DataFrame() if frame is None else frame
+    frame = add_alias_columns(
+        frame,
+        {"Stock Code": SKU_HEADERS, "Product Code": SKU_HEADERS, "On Hand": ON_HAND_HEADERS, "Free Stock": FREE_HEADERS},
+        numeric=("On Hand", "Free Stock"),
+    )
+    if frame["Free Stock"].isna().all():
+        frame["Free Stock"] = frame["On Hand"]
+    return frame
+
+
+def standardise_purchase_orders(frame: pd.DataFrame | None) -> pd.DataFrame:
+    frame = pd.DataFrame() if frame is None else frame
+    return add_alias_columns(
+        frame,
+        {"Stock Code": SKU_HEADERS, "Product Code": SKU_HEADERS, "Date": DATE_HEADERS, "Open PO Qty": OPEN_PO_HEADERS},
+        numeric=("Open PO Qty",),
+    )
+
+
+def write_engine_placeholders() -> list[Path]:
+    """Create zero-row workbooks the engine's reader expects; returns what was created."""
+    created = []
+    for name, columns in ENGINE_PLACEHOLDERS.items():
+        path = raw_data_path / name
+        if not path.exists():
+            pd.DataFrame(columns=columns).to_excel(path, index=False)
+            created.append(path)
+    return created
+
+
+def column_summary(frame: pd.DataFrame | None) -> str:
+    if frame is None:
+        return "missing"
+    return f"{len(frame):,} rows · columns: {', '.join(map(str, frame.columns)) or '(none)'}"
+
+
+def local_prepare_forecast_sheets(inputs: dict) -> dict:
+    """App-side stand-in for forecast_engine.prepare_forecast_sheets.
+
+    Adds the three derived sales columns the filters rely on (SKU Key, Supplier
+    Brand, Model) from the options data, and passes the other sheets through.
+    """
+    sales = inputs["Sales Data"].copy()
+    options = inputs.get("OptionsData")
+    sales["SKU Key"] = sales["SKU"].astype("string")
+    sales["Supplier Brand"] = sales.get("OptionsData.Supplier")
+    sales["Model"] = sales.get("Description")
+    if options is not None and not options.empty:
+        sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
+        if sku_col:
+            lookup = options.assign(_key=options[sku_col].map(sku_text)).drop_duplicates("_key").set_index("_key")
+            keys = sales["SKU"].map(sku_text)
+            brand_col = detect_column(options.columns, ["supplier brand", "brand"], exclude=(sku_col,))
+            model_col = detect_column(options.columns, ["model"], exclude=(sku_col,))
+            if brand_col:
+                sales["Supplier Brand"] = keys.map(lookup[brand_col]).fillna(sales["Supplier Brand"])
+            if model_col:
+                sales["Model"] = keys.map(lookup[model_col]).fillna(sales["Model"])
+    return {
+        "Sales Data": sales,
+        "Current Inventory": inputs["Current Inventory"],
+        "Purchase Orders": inputs["Purchase Orders"],
+        "OptionsData": options,
+    }
 
 
 @st.cache_resource(show_spinner="Merging daily and historical files...")
 def load_raw_folder_data(
     folder: str,
     manifest: tuple[tuple[str, int, int], ...],
-) -> tuple[dict[str, pd.DataFrame], list[str]]:
-    # Create empty placeholders if forecast_engine looks for specific names internally
-    for dummy_name in ["Inventory_report.xlsx", "PODashboard.xlsx"]:
-        dummy_path = raw_data_path / dummy_name
-        if not dummy_path.exists():
-            pd.DataFrame().to_excel(dummy_path, index=False)
+) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
+    """Returns (sheets, source file names, notes to show the user)."""
+    notes: list[str] = []
 
+    placeholders = write_engine_placeholders()
     try:
         sources, source_names = forecast_engine.read_raw_data_folder(folder)
     except Exception as e:
-        raise RuntimeError(f"Failed inside forecast_engine.read_raw_data_folder for path '{folder}': {e}")
-
-    # Clean up the physical dummy files if they were newly created
-    for dummy_name in ["Inventory_report.xlsx", "PODashboard.xlsx"]:
-        dummy_path = raw_data_path / dummy_name
-        if dummy_path.exists() and dummy_path.stat().st_size == 0:
+        raise RuntimeError(f"forecast_engine.read_raw_data_folder failed for '{folder}': {e}") from e
+    finally:
+        for path in placeholders:
             try:
-                dummy_path.unlink()
-            except Exception:
+                path.unlink()
+            except OSError:
                 pass
+    source_names = [name for name in source_names if Path(name).name not in ENGINE_PLACEHOLDERS]
 
-    # Automatically load the newest CSV file inside inventory/ and normalise columns
-    if inventory_folder_path.exists():
-        inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"]
-        if inv_files:
-            latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
-            try:
-                inv_df = pd.read_csv(latest_inv, skiprows=1)
-                
-                # Standardise header names so forecast_engine finds "Stock Code" / "Product Code"
-                inv_df.columns = [str(col).strip() for col in inv_df.columns]
-                col_rename = {}
-                for col in inv_df.columns:
-                    norm = normalise_header(col)
-                    if norm in ["sku", "sku key", "stock code", "stockcode", "product code", "item code", "item number", "code", "item"]:
-                        col_rename[col] = "Stock Code"
-                    elif norm in ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "qoh", "in stock", "stock", "quantity", "qty"]:
-                        col_rename[col] = "On Hand"
-                inv_df = inv_df.rename(columns=col_rename)
+    for key in ("Sales Raw", "Options Data"):
+        if key not in sources:
+            raise KeyError(f"forecast_engine.read_raw_data_folder did not return '{key}'.")
 
-                if "Stock Code" not in inv_df.columns and "Product Code" not in inv_df.columns:
-                    raise KeyError(
-                        f"Inventory file '{latest_inv.name}' is missing a recognized product/stock code column. "
-                        f"Found columns: {list(inv_df.columns)}"
-                    )
+    # Live inventory / PO exports: newest file in each sub-folder, falling back
+    # to whatever the engine read from Raw_data itself.
+    inventory_file = newest_file(inventory_folder_path)
+    if inventory_file is not None:
+        try:
+            sources["Current Inventory"] = read_tabular(inventory_file)
+        except Exception as e:
+            raise RuntimeError(f"Could not read inventory export '{inventory_file.name}': {e}") from e
+        source_names.append(str(inventory_file.relative_to(raw_data_path)))
+    sources["Current Inventory"] = standardise_inventory(sources.get("Current Inventory"))
+    if sources["Current Inventory"].empty:
+        notes.append(
+            "No inventory export was found under Raw_data/inventory (or Raw_data/Inventory_report.xlsx), "
+            "so stock on hand is reported as zero."
+        )
 
-                sources["Current Inventory"] = inv_df
-                source_names.append(str(latest_inv.relative_to(base_dir)))
-            except Exception as e:
-                raise RuntimeError(f"Error loading inventory file from 'Raw_data/inventory/{latest_inv.name}': {e}")
+    po_file = newest_file(podash_folder_path)
+    if po_file is not None:
+        try:
+            sources["Purchase Orders"] = read_tabular(po_file)
+        except Exception as e:
+            raise RuntimeError(f"Could not read purchase order export '{po_file.name}': {e}") from e
+        source_names.append(str(po_file.relative_to(raw_data_path)))
+    sources["Purchase Orders"] = standardise_purchase_orders(sources.get("Purchase Orders"))
+    if sources["Purchase Orders"].empty:
+        notes.append(
+            "No purchase order export was found under Raw_data/PODash (or Raw_data/PODashboard.xlsx), "
+            "so open PO quantities are reported as zero."
+        )
 
-    # Automatically load the newest CSV file inside PODash/ and normalise columns
-    if podash_folder_path.exists():
-        po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"]
-        if po_files:
-            latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
-            try:
-                po_df = pd.read_csv(latest_po)
-                
-                # Standardise header names so forecast_engine finds what it needs
-                po_df.columns = [str(col).strip() for col in po_df.columns]
-                col_rename = {}
-                for col in po_df.columns:
-                    norm = normalise_header(col)
-                    if norm in ["sku", "stock code", "stockcode", "product code", "item code", "item number", "code", "item"]:
-                        col_rename[col] = "Product Code"
-                    elif norm in ["open po qty", "po qty", "quantity", "qty", "open qty", "outstanding qty"]:
-                        col_rename[col] = "Open PO Qty"
-                    elif norm in ["date", "po date", "order date", "due date"]:
-                        col_rename[col] = "Date"
-                po_df = po_df.rename(columns=col_rename)
-                
-                sources["Purchase Orders"] = po_df
-                source_names.append(str(latest_po.relative_to(base_dir)))
-            except Exception as e:
-                raise RuntimeError(f"Error loading Purchase Order file from 'Raw_data/PODash/{latest_po.name}': {e}")
-
-    if "Sales Raw" not in sources:
-        raise KeyError("Missing required 'Sales Raw' dataset from the raw data folder.")
-
-    try:
-        formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
-    except Exception as e:
-        raise RuntimeError(f"Failed during clean_sales_data execution: {e}")
-
-    curr_inv = sources.get("Current Inventory", pd.DataFrame())
-    if not curr_inv.empty:
-        if "Stock Code" not in curr_inv.columns and "Product Code" in curr_inv.columns:
-            curr_inv = curr_inv.rename(columns={"Product Code": "Stock Code"})
-
-    po_df = sources.get("Purchase Orders", pd.DataFrame())
-    if not po_df.empty:
-        if "Product Code" not in po_df.columns and "Stock Code" in po_df.columns:
-            po_df = po_df.rename(columns={"Stock Code": "Product Code"})
-
+    formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
-        "Current Inventory": curr_inv,
-        "Purchase Orders": po_df,
+        "Current Inventory": sources["Current Inventory"],
+        "Purchase Orders": sources["Purchase Orders"],
         "Sales Data": formatted_sales,
     }
-    
+
     try:
-        return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
+        sheets = forecast_engine.prepare_forecast_sheets(forecast_inputs)
     except Exception as e:
-        raise RuntimeError(f"Failed inside forecast_engine.prepare_forecast_sheets: {e}")
+        sheets = local_prepare_forecast_sheets(forecast_inputs)
+        notes.append(
+            f"forecast_engine.prepare_forecast_sheets failed ({type(e).__name__}: {e}); the app joined the sheets itself. "
+            f"Inventory sheet — {column_summary(forecast_inputs['Current Inventory'])}. "
+            f"Purchase orders — {column_summary(forecast_inputs['Purchase Orders'])}."
+        )
+    return sheets, source_names, notes
+
+
+def load_prepared_data():
+    """Load Raw_data for a tab; returns (sheets, source_names) or (None, [])."""
+    try:
+        sheets, names, notes = load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
+    except Exception as e:
+        st.error(f"Error loading Raw_data: {e}")
+        return None, []
+    for note in notes:
+        st.warning(note)
+    return sheets, names
 
 
 # =============================================================================
-# Forecast math
+# Engine calls with app-side fallbacks
+#
+# The engine's helpers are used whenever they work. If one raises on the new
+# inventory / PO exports, the app computes the same quantity itself and says
+# so, rather than blanking the whole tab.
+# =============================================================================
+
+FILTER_COLUMNS = {
+    "Location": "City",
+    "Sales Channel": "Sales Channel Net",
+    "Classification": "OptionsData.Fourth Product Group",
+    "Supplier": "Supplier Brand",
+    "Class": "OptionsData.Class",
+    "Model": "Model",
+    "SKU": "SKU Key",
+}
+
+
+def engine_call(name: str, fallback, *args):
+    """Call forecast_engine.<name>(*args); on failure use fallback and return a note."""
+    func = getattr(forecast_engine, name, None)
+    if func is None:
+        return fallback(*args), f"forecast_engine has no {name}; the app calculated it instead."
+    try:
+        return func(*args), None
+    except Exception as e:
+        return fallback(*args), f"forecast_engine.{name} failed ({type(e).__name__}: {e}); the app calculated it instead."
+
+
+def local_filter_sales(sales: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    out = sales
+    for key, value in filters.items():
+        column = FILTER_COLUMNS.get(key)
+        if value == "TOTAL" or column not in out.columns:
+            continue
+        text = out[column].astype("string").str.strip()
+        exact = text.eq(value)
+        out = out.loc[exact] if exact.any() else out.loc[text.str.contains(value, case=False, regex=False, na=False)]
+    return out
+
+
+def _filter_by_sku(frame: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    sku = filters.get("SKU", "TOTAL")
+    if sku != "TOTAL" and "Stock Code" in frame.columns:
+        return frame.loc[frame["Stock Code"].map(sku_text).eq(sku_text(sku))]
+    return frame
+
+
+def local_inventory_totals(inventory: pd.DataFrame, filters: dict) -> tuple[float, float]:
+    frame = _filter_by_sku(inventory, filters)
+    on_hand = to_number(frame["On Hand"]).sum() if "On Hand" in frame.columns else 0.0
+    free = to_number(frame["Free Stock"]).sum() if "Free Stock" in frame.columns else on_hand
+    return float(on_hand), float(free)
+
+
+def local_monthly_purchase_orders(purchase_orders: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["Date", "Open PO Qty"])
+    if purchase_orders is None or purchase_orders.empty or not {"Date", "Open PO Qty"} <= set(purchase_orders.columns):
+        return empty
+    frame = _filter_by_sku(purchase_orders, filters)
+    dates = parse_dates(frame["Date"])
+    quantities = to_number(frame["Open PO Qty"])
+    monthly = quantities.groupby(dates.dt.to_period("M")).sum()
+    if monthly.empty:
+        return empty
+    return pd.DataFrame({"Date": monthly.index.to_timestamp(), "Open PO Qty": monthly.to_numpy()})
+
+
+def local_yearly_monthly_profile(sales: pd.DataFrame, _forecast, metric: str, start: pd.Timestamp) -> pd.DataFrame:
+    dated = sales.dropna(subset=["Date"])
+    dated = dated.loc[dated["Date"] >= start]
+    if dated.empty or metric not in dated.columns:
+        return pd.DataFrame({"Month": MONTHS})
+    grouped = dated.groupby([dated["Date"].dt.month, dated["Date"].dt.year])[metric]
+    profile = (grouped.mean() if metric == "GP%" else grouped.sum()).unstack()
+    profile.index = [MONTH_NUMBER_TO_NAME[m] for m in profile.index]
+    profile = profile.reindex(MONTHS)
+    profile.columns.name = None
+    profile.index.name = "Month"
+    return profile.reset_index()
+
+
+def column_or_empty(frame: pd.DataFrame, name: str) -> pd.Series:
+    return frame[name] if name in frame.columns else pd.Series(pd.NA, index=frame.index, dtype="string")
+
+
+# =============================================================================
+# Forecast math (unchanged)
 # =============================================================================
 
 SEASON = 12
@@ -640,10 +881,11 @@ def window_label(window: pd.PeriodIndex) -> str:
 
 
 # =============================================================================
-# Year view
+# Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
 # =============================================================================
 
 def fiscal_year_of(period: pd.Period) -> int:
+    """Australian FY ends 30 June and is named by its end year (FY2027 = Jul 2026 – Jun 2027)."""
     return period.year + 1 if period.month >= 7 else period.year
 
 
@@ -665,6 +907,7 @@ def label_year_number(label: str) -> int:
 
 
 def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFrame:
+    """Re-group a Month × calendar-year profile into Month × financial-year; values are moved, not recomputed."""
     long = profile.melt(id_vars="Month", var_name="Year", value_name="Value").dropna(subset=["Value"])
     if long.empty:
         return pd.DataFrame({"Month": FY_MONTHS})
@@ -681,65 +924,12 @@ def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFram
 # Inventory analysis
 # =============================================================================
 
-INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
-    "sku": ["sku", "sku key", "stock code", "stockcode", "item code", "item number", "product code", "item", "code"],
-    "on_hand": ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "qoh", "in stock", "stock qty", "stock", "quantity", "qty"],
-    "free": ["free", "free stock", "free qty", "qty free", "available", "available qty", "qty available", "unallocated"],
-    "site": ["site", "location", "warehouse", "branch", "store", "showroom"],
-    "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
-    "description": ["description", "item description", "product description", "product name", "name", "product"],
-}
-INVENTORY_ROLE_LABELS = {
-    "sku": "SKU column",
-    "on_hand": "On-hand quantity column",
-    "free": "Free stock column",
-    "site": "Site / location column",
-    "value": "Stock value column",
-    "description": "Description column",
-}
-
 STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out of stock", "Inactive"]
-STATUS_COLOURS = {
-    "Dead stock": "#d55e00",
-    "Slow moving": "#e69f00",
-    "Stock-out risk": "#cc79a7",
-    "Healthy": "#009e73",
-    "Out of stock": "#0072b2",
-    "Inactive": "#9aa0a6",
-}
-
-
-def detect_column(columns, candidates: list[str], exclude: tuple = ()) -> str | None:
-    normalised = {col: normalise_header(col) for col in columns if col not in exclude}
-    for candidate in candidates:
-        for col, norm in normalised.items():
-            if norm == candidate:
-                return col
-    for candidate in candidates:
-        for col, norm in normalised.items():
-            if candidate in norm:
-                return col
-    return None
-
-
-def detect_inventory_columns(inventory: pd.DataFrame) -> dict[str, str | None]:
-    found: dict[str, str | None] = {}
-    used: list[str] = []
-    for role, candidates in INVENTORY_COLUMN_CANDIDATES.items():
-        col = detect_column(inventory.columns, candidates, exclude=tuple(used))
-        found[role] = col
-        if col:
-            used.append(col)
-    return found
-
-
-def sku_text(value) -> str:
-    normalised = normalize_sku(value)
-    return "" if pd.isna(normalised) else str(normalised)
 
 
 @st.cache_data(show_spinner=False)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """One row per SKU with on-hand and free stock summed across sites."""
     frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
@@ -768,6 +958,7 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
+    """Per-SKU sales inside the window plus lifetime first/last sale dates."""
     dated = sales.dropna(subset=["Date"]).copy()
     key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
     dated["SKU"] = dated[key_column].map(sku_text)
@@ -804,6 +995,7 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
 
 
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
+    """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
     empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group"])
     if options is None or options.empty:
         return empty
@@ -819,19 +1011,19 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     }.items():
         col = detect_column(options.columns, candidates, exclude=(sku_col,))
         frame[role] = options[col].astype(str).str.strip() if col else pd.NA
-    frame = frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
-    return frame
+    return frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
 
 
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
+    """Open PO quantity per SKU; empty when the PO sheet has no SKU or quantity column."""
     if purchase_orders is None or purchase_orders.empty:
         return pd.Series(dtype=float)
-    sku_col = detect_column(purchase_orders.columns, INVENTORY_COLUMN_CANDIDATES["sku"])
-    po_qty_col = detect_column(purchase_orders.columns, ["open po qty", "po qty", "quantity", "qty", "open qty"])
-    if sku_col is None or po_qty_col is None:
+    sku_col = detect_column(purchase_orders.columns, SKU_HEADERS)
+    qty_col = detect_column(purchase_orders.columns, OPEN_PO_HEADERS)
+    if sku_col is None or qty_col is None:
         return pd.Series(dtype=float)
     keyed = pd.DataFrame(
-        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders[po_qty_col]).fillna(0.0)}
+        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders[qty_col]).fillna(0.0)}
     )
     return keyed.loc[keyed["SKU"].ne("")].groupby("SKU")["Open PO qty"].sum()
 
@@ -848,6 +1040,7 @@ def build_inventory_table(
     slow_dos: int,
     risk_dos: int,
 ) -> pd.DataFrame:
+    """SKU-level stock position, movement, days of supply, turns and status."""
     master = inventory_sku.merge(movement, on="SKU", how="outer")
     master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
     for column in ["Description", "Supplier", "Class", "Product group"]:
@@ -865,7 +1058,7 @@ def build_inventory_table(
         master[column] = master[column].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
 
     for column in ["On hand", "Free stock", "Units sold", "Sales value", "COGS", "Months with sales"]:
-        master[column] = pd.to_numeric(master.get(column), errors="coerce").fillna(0.0) if column in master.columns else 0.0
+        master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0.0) if column in master.columns else 0.0
     if not open_po.empty:
         master["Open PO qty"] = master["SKU"].map(open_po).fillna(0.0)
 
@@ -940,6 +1133,7 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
 # =============================================================================
 
 def metric_card(title: str, tiles: list[dict]) -> None:
+    """A bordered card with a small heading and one st.metric per tile."""
     with st.container(border=True):
         st.markdown(f"<p class='card-title'>{title}</p>", unsafe_allow_html=True)
         columns = st.columns(len(tiles), gap="small")
@@ -948,6 +1142,7 @@ def metric_card(title: str, tiles: list[dict]) -> None:
 
 
 def chart_formats(metric: str) -> tuple[str, str, str]:
+    """Axis format, tooltip format and axis title for a metric."""
     if metric in ["Sale", "Cost", "GP $"]:
         return "$~s", "$,.0f", f"{metric.replace(' $', '')} ($)"
     if metric == "GP%":
@@ -992,12 +1187,8 @@ def filter_selectbox(label: str, series: pd.Series, default: str = "TOTAL") -> s
     return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
 
 
-def load_prepared_data():
-    try:
-        return load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
-    except Exception as e:
-        st.error(f"Error loading Raw_data: {e}")
-        return None, []
+def table_height(rows: int, cap: int = 420) -> int:
+    return min(cap, int(38 + 35 * rows) + 3)
 
 
 # =============================================================================
@@ -1053,26 +1244,14 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
             )
 
             if len(unique_values) <= 100:
-                selected_values = st.multiselect(
-                    column,
-                    unique_values,
-                    default=[],
-                    key=f"{key_base}_select",
-                )
+                selected_values = st.multiselect(column, unique_values, default=[], key=f"{key_base}_select")
                 if selected_values:
-                    filtered = filtered[
-                        filtered[column].astype("string").str.strip().isin(selected_values)
-                    ]
+                    filtered = filtered[filtered[column].astype("string").str.strip().isin(selected_values)]
             else:
-                search_value = st.text_input(
-                    f"{column} contains",
-                    key=f"{key_base}_text",
-                ).strip()
+                search_value = st.text_input(f"{column} contains", key=f"{key_base}_text").strip()
                 if search_value:
                     filtered = filtered[
-                        filtered[column]
-                        .astype("string")
-                        .str.contains(search_value, case=False, na=False, regex=False)
+                        filtered[column].astype("string").str.contains(search_value, case=False, na=False, regex=False)
                     ]
 
     return filtered
@@ -1110,52 +1289,29 @@ if selected_tab == "Forecast":
                 metric = st.selectbox("View", metric_options, index=0)
 
                 st.markdown("**Sales**")
-                selected_location = filter_selectbox("Location", sales_data["City"])
-                selected_channel = filter_selectbox(
-                    "Sales channel", sales_data["Sales Channel Net"]
-                )
+                selected_location = filter_selectbox("Location", column_or_empty(sales_data, "City"))
+                selected_channel = filter_selectbox("Sales channel", column_or_empty(sales_data, "Sales Channel Net"))
 
                 st.markdown("**Product**")
                 selected_classification = filter_selectbox(
-                    "Classification", sales_data["OptionsData.Fourth Product Group"]
+                    "Classification", column_or_empty(sales_data, "OptionsData.Fourth Product Group")
                 )
-                selected_supplier = filter_selectbox(
-                    "Supplier", sales_data["Supplier Brand"]
-                )
-                selected_class = filter_selectbox("Class", sales_data["OptionsData.Class"])
-                selected_model = filter_selectbox("Model", sales_data["Model"])
-                selected_sku = filter_selectbox("SKU", sales_data["SKU Key"])
+                selected_supplier = filter_selectbox("Supplier", column_or_empty(sales_data, "Supplier Brand"))
+                selected_class = filter_selectbox("Class", column_or_empty(sales_data, "OptionsData.Class"))
+                selected_model = filter_selectbox("Model", column_or_empty(sales_data, "Model"))
+                selected_sku = filter_selectbox("SKU", column_or_empty(sales_data, "SKU Key"))
 
                 with st.expander("Forecast settings", expanded=False):
                     history_from_year = st.number_input(
-                        "History from Year",
-                        min_value=2000,
-                        max_value=2100,
-                        value=2024,
-                        step=1,
+                        "History from Year", min_value=2000, max_value=2100, value=2024, step=1,
                     )
                     forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
-                    bias = st.number_input(
-                        "Forecast bias",
-                        min_value=0.0,
-                        max_value=5.0,
-                        value=1.0,
-                        step=0.05,
-                    )
-                    yoy_weight = st.slider(
-                        "YoY trend weight",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=0.5,
-                        step=0.05,
-                    )
+                    bias = st.number_input("Forecast bias", min_value=0.0, max_value=5.0, value=1.0, step=0.05)
+                    yoy_weight = st.slider("YoY trend weight", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
 
                 with st.expander("Target settings", expanded=False):
                     sale_target = st.number_input(
-                        "Sale Target ($)",
-                        min_value=0.0,
-                        value=70000000.0,
-                        step=1000000.0,
+                        "Sale Target ($)", min_value=0.0, value=70000000.0, step=1000000.0,
                     )
 
             filters = {
@@ -1167,7 +1323,10 @@ if selected_tab == "Forecast":
                 "Model": selected_model,
                 "SKU": selected_sku,
             }
-            selected_sales = forecast_engine.filter_sales(sales_data, filters).copy()
+            engine_notes: list[str] = []
+            selected_sales, note = engine_call("filter_sales", local_filter_sales, sales_data, filters)
+            engine_notes.append(note)
+            selected_sales = selected_sales.copy()
             if metric == "GP%" and not selected_sales.empty and "GP%" in selected_sales.columns:
                 selected_sales["GP%"] = selected_sales["GP%"].mean()
 
@@ -1179,12 +1338,14 @@ if selected_tab == "Forecast":
             actual_series = result["actual"]
             last_complete = result["last_complete"]
 
-            purchase_months = forecast_engine.monthly_purchase_orders(
-                sheets["Purchase Orders"], filters
+            purchase_months, note = engine_call(
+                "monthly_purchase_orders", local_monthly_purchase_orders, sheets["Purchase Orders"], filters
             )
-            on_hand, free_stock = forecast_engine.inventory_totals(
-                sheets["Current Inventory"], filters
+            engine_notes.append(note)
+            (on_hand, free_stock), note = engine_call(
+                "inventory_totals", local_inventory_totals, sheets["Current Inventory"], filters
             )
+            engine_notes.append(note)
 
             if result["actual"].empty:
                 st.warning("No completed months of dated sales match these selections.")
@@ -1208,12 +1369,8 @@ if selected_tab == "Forecast":
                     )
 
                 total_po = 0.0
-                if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
-                    purchase_months.columns
-                ):
-                    po_periods = pd.to_datetime(
-                        purchase_months["Date"], errors="coerce"
-                    ).dt.to_period("M")
+                if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(purchase_months.columns):
+                    po_periods = parse_dates(purchase_months["Date"]).dt.to_period("M")
                     po_by_period = purchase_months.groupby(po_periods)["Open PO Qty"].sum()
                     total_po = float(po_by_period[po_by_period.index <= rolling_window[-1]].sum())
 
@@ -1227,6 +1384,8 @@ if selected_tab == "Forecast":
                 else:
                     rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
 
+                # The view only decides which twelve months make up "this year";
+                # the forecast series are used exactly as produced.
                 current_period = last_complete + 1
                 view_this_year = view_year(current_period, fiscal)
                 this_label = view_label(view_this_year, fiscal)
@@ -1240,10 +1399,7 @@ if selected_tab == "Forecast":
                 fc_series = (
                     pd.concat(
                         [
-                            pd.Series(
-                                frame["Forecast"].values,
-                                index=pd.to_datetime(frame["Date"]).dt.to_period("M"),
-                            )
+                            pd.Series(frame["Forecast"].values, index=pd.to_datetime(frame["Date"]).dt.to_period("M"))
                             for frame in forecast_frames_for_series
                         ]
                     )
@@ -1259,7 +1415,7 @@ if selected_tab == "Forecast":
                     fy_fc = float(fc_series.reindex(this_year_periods).mean())
                 else:
                     ytd_act = float(actual_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
-                    ytd_fc = float(fc_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
+                    ytd_fc = float(fc_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
                     ytg_fc = float(fc_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
                     fy_act_fc = ytd_act + ytg_fc
                     fy_fc = float(fc_series.reindex(this_year_periods).sum())
@@ -1274,20 +1430,10 @@ if selected_tab == "Forecast":
 
                 prior_label = view_label(view_this_year - 1, fiscal)
                 prior_year_periods = view_year_periods(view_this_year - 1, fiscal)
-                prior_ytd_periods = [p - SEASON for p in ytd_periods]
-
                 if metric == "GP%":
-                    prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).mean()) if prior_ytd_periods else np.nan
-                    prior_fy_act = float(actual_series.reindex(prior_year_periods).mean()) if not prior_year_periods.empty else np.nan
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).mean())
                 else:
-                    prior_ytd_act = float(actual_series.reindex(prior_ytd_periods).sum()) if prior_ytd_periods else 0.0
-                    prior_fy_act = float(actual_series.reindex(prior_year_periods).sum()) if not prior_year_periods.empty else 0.0
-
-                py_ytd_diff = ytd_act - prior_ytd_act if pd.notna(ytd_act) and pd.notna(prior_ytd_act) else np.nan
-                py_ytd_pct = (py_ytd_diff / prior_ytd_act * 100) if pd.notna(py_ytd_diff) and prior_ytd_act != 0 else np.nan
-
-                py_fy_diff = fy_act_fc - prior_fy_act if pd.notna(fy_act_fc) and pd.notna(prior_fy_act) else np.nan
-                py_fy_pct = (py_fy_diff / prior_fy_act * 100) if pd.notna(py_fy_diff) and prior_fy_act != 0 else np.nan
+                    prior_fy_act = float(actual_series.reindex(prior_year_periods).sum())
 
                 year_start_label = this_year_periods[0].strftime("%b %Y")
                 ytd_end_label = ytd_periods[-1].strftime("%b %Y") if ytd_periods else "n/a"
@@ -1300,6 +1446,7 @@ if selected_tab == "Forecast":
                     )
                 )
 
+                # Headline cards
                 card_left, card_right = st.columns([2, 3], gap="small")
                 with card_left:
                     metric_card(
@@ -1352,26 +1499,27 @@ if selected_tab == "Forecast":
                             delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
                             help="YTD Actuals + YTG Forecast vs full-year forecast baseline.",
                         ),
-                        dict(
-                            label="Full Year Baseline Forecast",
-                            value=fmt_str(fy_fc),
-                            help=baseline_help,
-                        ),
+                        dict(label="Full Year Baseline Forecast", value=fmt_str(fy_fc), help=baseline_help),
                     ],
                 )
 
+                # Monthly comparison chart. In the FY view the engine is asked
+                # for one extra calendar year so July–December of the first
+                # financial year is present, then months are re-grouped.
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
-                annual_profile = forecast_engine.yearly_monthly_profile(
+                annual_profile, note = engine_call(
+                    "yearly_monthly_profile",
+                    local_yearly_monthly_profile,
                     selected_sales,
                     pd.DataFrame(columns=["Date", "Forecast"]),
                     metric,
                     profile_from,
                 )
+                engine_notes.append(note)
                 if fiscal:
                     annual_profile = fiscal_profile(annual_profile, int(history_from_year))
                 if metric == "GP%" and not annual_profile.empty:
-                    numeric_cols = [c for c in annual_profile.columns if c != "Month"]
-                    for col in numeric_cols:
+                    for col in [c for c in annual_profile.columns if c != "Month"]:
                         annual_profile[col] = annual_profile[col].mean()
 
                 year_columns = sorted(
@@ -1379,7 +1527,7 @@ if selected_tab == "Forecast":
                     key=lambda value: int(value),
                 )
                 year_labels = [view_label(int(column), fiscal) for column in year_columns]
-                month_sort_order = FY_MONTHS if fiscal else forecast_engine.MONTHS
+                month_sort_order = FY_MONTHS if fiscal else MONTHS
 
                 st.subheader(
                     "Monthly comparison by " + ("financial year (Jul–Jun)" if fiscal else "calendar year (Jan–Dec)"),
@@ -1404,16 +1552,10 @@ if selected_tab == "Forecast":
                     forecast_chart_data = forecast_chart_data.loc[
                         forecast_chart_data["YearNumber"] >= view_this_year
                     ].copy()
-                    forecast_chart_data["Year"] = forecast_chart_data["YearNumber"].map(
-                        lambda y: view_label(int(y), fiscal)
-                    )
-                    forecast_chart_data["Month"] = (
-                        forecast_chart_data["Date"].dt.month.map(MONTH_NUMBER_TO_NAME)
-                    )
+                    forecast_chart_data["Year"] = forecast_chart_data["YearNumber"].map(lambda y: view_label(int(y), fiscal))
+                    forecast_chart_data["Month"] = forecast_chart_data["Date"].dt.month.map(MONTH_NUMBER_TO_NAME)
                 else:
-                    forecast_chart_data = pd.DataFrame(
-                        columns=["Date", "Forecast", "YearNumber", "Year", "Month"]
-                    )
+                    forecast_chart_data = pd.DataFrame(columns=["Date", "Forecast", "YearNumber", "Year", "Month"])
                 forecast_plot_data = pd.DataFrame(
                     {
                         "Month": forecast_chart_data["Month"],
@@ -1423,34 +1565,14 @@ if selected_tab == "Forecast":
                     }
                 )
                 chart_data = pd.concat(
-                    [
-                        actual_chart_data[["Month", "Series", "Line Type", "Value"]],
-                        forecast_plot_data,
-                    ],
+                    [actual_chart_data[["Month", "Series", "Line Type", "Value"]], forecast_plot_data],
                     ignore_index=True,
                 )
-                forecast_series = sorted(
-                    forecast_plot_data["Series"].unique(),
-                    key=label_year_number,
-                )
+                forecast_series = sorted(forecast_plot_data["Series"].unique(), key=label_year_number)
                 series_order = list(dict.fromkeys(year_labels + forecast_series))
-                palette = [
-                    "#0072b2",
-                    "#e69f00",
-                    "#009e73",
-                    "#d55e00",
-                    "#cc79a7",
-                    "#56b4e9",
-                    "#f0e442",
-                    "#000000",
-                ]
-                series_colors = [
-                    palette[index % len(palette)] for index in range(len(series_order))
-                ]
+                palette = ["#0072b2", "#e69f00", "#009e73", "#d55e00", "#cc79a7", "#56b4e9", "#f0e442", "#000000"]
+                series_colors = [palette[index % len(palette)] for index in range(len(series_order))]
                 axis_format, value_format, y_title = chart_formats(metric)
-
-                if "legend_selection_state" not in st.session_state:
-                    st.session_state["legend_selection_state"] = None
 
                 legend_selection = alt.selection_point(
                     name="series_legend",
@@ -1472,33 +1594,19 @@ if selected_tab == "Forecast":
                     .mark_line(point=alt.OverlayMarkDef(size=28), strokeWidth=2)
                     .encode(
                         x=month_axis,
-                        y=alt.Y(
-                            "Value:Q",
-                            title=y_title,
-                            scale=alt.Scale(zero=False),
-                            axis=value_axis(axis_format),
-                        ),
+                        y=alt.Y("Value:Q", title=y_title, scale=alt.Scale(zero=False), axis=value_axis(axis_format)),
                         color=alt.Color(
                             "Series:N",
                             sort=series_order,
                             scale=alt.Scale(domain=series_order, range=series_colors),
                             legend=alt.Legend(
-                                title=None,
-                                orient="top",
-                                direction="horizontal",
-                                symbolType="stroke",
-                                symbolStrokeWidth=3,
-                                labelFontSize=11,
-                                padding=0,
-                                offset=6,
+                                title=None, orient="top", direction="horizontal", symbolType="stroke",
+                                symbolStrokeWidth=3, labelFontSize=11, padding=0, offset=6,
                             ),
                         ),
                         strokeDash=alt.StrokeDash(
                             "Line Type:N",
-                            scale=alt.Scale(
-                                domain=["Actual", "Forecast"],
-                                range=[[1, 0], [7, 4]],
-                            ),
+                            scale=alt.Scale(domain=["Actual", "Forecast"], range=[[1, 0], [7, 4]]),
                             legend=None,
                         ),
                         detail=alt.Detail("Series:N"),
@@ -1525,55 +1633,39 @@ if selected_tab == "Forecast":
                             tooltip_fields.append(
                                 alt.Tooltip(f"{field}:Q", title=view_label(int(year), fiscal), format=value_format)
                             )
-                    month_forecasts = forecast_chart_data.loc[
-                        forecast_chart_data["Month"].eq(month)
-                    ]
+                    month_forecasts = forecast_chart_data.loc[forecast_chart_data["Month"].eq(month)]
                     for year in sorted(month_forecasts["Year"].unique(), key=label_year_number):
-                        forecast_value = month_forecasts.loc[
-                            month_forecasts["Year"].eq(year), "Forecast"
-                        ]
+                        forecast_value = month_forecasts.loc[month_forecasts["Year"].eq(year), "Forecast"]
                         if forecast_value.empty or pd.isna(forecast_value.iloc[0]):
                             continue
                         field = f"forecast_{label_year_number(year)}"
                         tooltip_row[field] = float(forecast_value.iloc[0])
-                        tooltip_fields.append(
-                            alt.Tooltip(
-                                f"{field}:Q", title=f"Forecast {year}", format=value_format
-                            )
-                        )
+                        tooltip_fields.append(alt.Tooltip(f"{field}:Q", title=f"Forecast {year}", format=value_format))
                     if tooltip_fields:
                         month_hover_selection = alt.selection_point(
-                            name=f"hover_{month.lower()}",
-                            fields=["Month"],
-                            on="pointerover",
-                            clear="pointerout",
+                            name=f"hover_{month.lower()}", fields=["Month"], on="pointerover", clear="pointerout",
                         )
                         month_hover_charts.append(
                             alt.Chart(pd.DataFrame([tooltip_row]))
                             .mark_rule(color="#667085", strokeWidth=12)
                             .encode(
                                 x=month_axis,
-                                opacity=alt.condition(
-                                    month_hover_selection,
-                                    alt.value(0.18),
-                                    alt.value(0),
-                                    empty=False,
-                                ),
+                                opacity=alt.condition(month_hover_selection, alt.value(0.18), alt.value(0), empty=False),
                                 tooltip=tooltip_fields,
                             )
                             .add_params(month_hover_selection)
                         )
 
-                chart_event = st.altair_chart(
-                    alt.layer(yearly_chart, *month_hover_charts)
-                    .properties(height=360)
-                    .configure_view(strokeWidth=0),
+                st.altair_chart(
+                    alt.layer(yearly_chart, *month_hover_charts).properties(height=360).configure_view(strokeWidth=0),
                     key="forecast_monthly_chart",
                     on_select="rerun",
                     **FULL_WIDTH,
                 )
-                if chart_event and hasattr(chart_event, "selection"):
-                    st.session_state["legend_selection_state"] = chart_event.selection
+                st.caption(
+                    f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · Solid lines: actual · Dashed lines: forecast · "
+                    "Click a legend entry to show or hide a series · Hover a month to compare every year."
+                )
 
                 if metric == "Sale":
                     target_80 = sale_target * 0.8
@@ -1588,6 +1680,9 @@ if selected_tab == "Forecast":
                         t_col2.metric("100% Sale Target", f"${sale_target:,.0f}", delta=f"{target_pct:+.1f}% to Target")
                         t_col3.metric("80% Sale Target", f"${target_80:,.0f}", delta=f"{target_80_pct:+.1f}% to 80% Target")
                         t_col4.metric(f"{prior_label} Full Year Actuals", fmt_str(prior_fy_act))
+
+            for note in [n for n in engine_notes if n]:
+                st.warning(note)
 
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
@@ -1635,33 +1730,26 @@ elif selected_tab == "Inventory Analysis":
                         },
                         key=str.casefold,
                     )
-                    product_filters[label] = st.multiselect(
-                        label, values, default=[], key=f"inventory_filter_{label}"
-                    )
+                    product_filters[label] = st.multiselect(label, values, default=[], key=f"inventory_filter_{label}")
                 description_search = st.text_input(
-                    "SKU or description contains", key="inventory_filter_text"
+                    "SKU or description contains", key="inventory_filter_text",
+                    help="End with * to match a prefix, e.g. 123*",
                 ).strip()
 
                 with st.expander("Inventory settings", expanded=False):
                     window_months = st.selectbox(
-                        "Sales window (complete months)",
-                        [3, 6, 12],
-                        index=2,
-                        key="inventory_window_months",
+                        "Sales window (complete months)", [3, 6, 12], index=2, key="inventory_window_months",
                     )
                     dead_days = st.number_input(
-                        "Dead stock: no sale for (days)",
-                        min_value=30, max_value=1095, value=180, step=30,
+                        "Dead stock: no sale for (days)", min_value=30, max_value=1095, value=180, step=30,
                         key="inventory_dead_days",
                     )
                     slow_dos = st.number_input(
-                        "Slow moving: days of supply above",
-                        min_value=30, max_value=3650, value=365, step=30,
+                        "Slow moving: days of supply above", min_value=30, max_value=3650, value=365, step=30,
                         key="inventory_slow_dos",
                     )
                     risk_dos = st.number_input(
-                        "Stock-out risk: days of supply below",
-                        min_value=7, max_value=365, value=60, step=7,
+                        "Stock-out risk: days of supply below", min_value=7, max_value=365, value=60, step=7,
                         key="inventory_risk_dos",
                     )
 
@@ -1680,7 +1768,10 @@ elif selected_tab == "Inventory Analysis":
                         mapping[role] = None if choice == "(none)" else choice
 
             if not mapping["sku"] or not mapping["on_hand"]:
-                st.warning("The SKU and on-hand quantity columns of the inventory sheet could not be identified.")
+                st.warning(
+                    "The SKU and on-hand quantity columns of the inventory sheet could not be identified. "
+                    "Choose them under *Inventory column mapping* in the sidebar."
+                )
             else:
                 window_end = last_complete
                 window_start = last_complete - (window_months - 1)
@@ -1700,15 +1791,13 @@ elif selected_tab == "Inventory Analysis":
                     if chosen:
                         filtered = filtered.loc[filtered[label].isin(chosen)]
                 if description_search:
-                    search_pattern = description_search
-                    is_regex = False
-                    if search_pattern.endswith("*"):
-                        prefix = re.escape(search_pattern[:-1])
-                        search_pattern = f"^{prefix}"
-                        is_regex = True
+                    if description_search.endswith("*"):
+                        pattern, is_regex = f"^{re.escape(description_search[:-1])}", True
+                    else:
+                        pattern, is_regex = description_search, False
                     text_match = (
-                        filtered["SKU"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
-                        | filtered["Description"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
+                        filtered["SKU"].str.contains(pattern, case=False, regex=is_regex, na=False)
+                        | filtered["Description"].str.contains(pattern, case=False, regex=is_regex, na=False)
                     )
                     filtered = filtered.loc[text_match]
                 filtered = filtered.reset_index(drop=True)
@@ -1716,19 +1805,15 @@ elif selected_tab == "Inventory Analysis":
                 context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with group_col:
                     group_by = st.selectbox(
-                        "Group by",
-                        ["SKU", "Supplier", "Class", "Product group"],
-                        index=0,
-                        key="inventory_group_by",
-                        label_visibility="collapsed",
+                        "Group by", ["SKU", "Supplier", "Class", "Product group"], index=0,
+                        key="inventory_group_by", label_visibility="collapsed",
                     )
                 with context_col:
-                    st.caption(f"Sales window {window_label(window_periods)} · {len(filtered):,} SKUs")
+                    st.caption(f"Sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs")
 
                 if filtered.empty:
                     st.warning("No SKUs match these filters.")
                 else:
-                    in_stock = filtered.loc[filtered["On hand"] > 0]
                     total_on_hand = float(filtered["On hand"].sum())
                     total_units = float(filtered["Units sold"].sum())
                     dead_units = float(filtered["Dead units"].sum())
@@ -1737,7 +1822,6 @@ elif selected_tab == "Inventory Analysis":
                     overall_daily_rate = total_units / window_days if window_days else 0.0
                     overall_dos = total_on_hand / overall_daily_rate if overall_daily_rate > 0 else np.nan
                     overall_turns = (total_units * 12 / window_months) / total_on_hand if total_on_hand > 0 else np.nan
-                    stock_value = float(filtered["Est. stock value"].sum(skipna=True))
 
                     def pct_of_on_hand(units: float) -> str:
                         return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
@@ -1775,30 +1859,48 @@ elif selected_tab == "Inventory Analysis":
                     sku_column_config = {
                         "On hand": st.column_config.NumberColumn(format="%d"),
                         "Free stock": st.column_config.NumberColumn(format="%d"),
-                        "Units sold": st.column_config.NumberColumn(format="%d"),
+                        "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
                         "Avg monthly units": st.column_config.NumberColumn(format="%.1f"),
                         "Days of supply": st.column_config.NumberColumn(format="%d"),
+                        "Days of supply incl. POs": st.column_config.NumberColumn(format="%d"),
                         "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
                         "Last sale": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
                         "Days since last sale": st.column_config.NumberColumn(format="%d"),
-                        "Sales value": st.column_config.NumberColumn(format="$%.0f"),
+                        "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
                         "Est. stock value": st.column_config.NumberColumn(format="$%.0f"),
+                        "Open PO qty": st.column_config.NumberColumn(format="%d"),
                     }
 
                     def show_table(frame: pd.DataFrame, file_name: str, key: str) -> None:
                         st.dataframe(
-                            frame[sku_columns],
-                            hide_index=True,
-                            column_config=sku_column_config,
-                            height=min(420, int(38 + 35 * len(frame)) + 3),
-                            **FULL_WIDTH,
+                            frame[sku_columns], hide_index=True, column_config=sku_column_config,
+                            height=table_height(len(frame)), **FULL_WIDTH,
                         )
-                        st.download_button("Download CSV", frame[sku_columns].to_csv(index=False).encode("utf-8"), file_name=file_name, mime="text/csv", key=key)
+                        st.download_button(
+                            "Download CSV", frame[sku_columns].to_csv(index=False).encode("utf-8"),
+                            file_name=file_name, mime="text/csv", key=key,
+                        )
 
                     if group_by != "SKU":
                         summary = summarise_inventory(filtered, group_by, window_months, window_days)
                         with st.expander(f"📊 Summary by {group_by.lower()}", expanded=True):
-                            st.dataframe(summary, hide_index=True, height=300, **FULL_WIDTH)
+                            st.dataframe(
+                                summary,
+                                hide_index=True,
+                                column_config={
+                                    "On hand": st.column_config.NumberColumn(format="%d"),
+                                    "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
+                                    "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
+                                    "Dead units": st.column_config.NumberColumn(format="%d"),
+                                    "Slow units": st.column_config.NumberColumn(format="%d"),
+                                    "Dead stock %": st.column_config.NumberColumn(format="%.0f%%"),
+                                    "Days of supply": st.column_config.NumberColumn(format="%d"),
+                                    "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
+                                    "Est. stock value": st.column_config.NumberColumn(format="$%.0f"),
+                                },
+                                height=table_height(len(summary)),
+                                **FULL_WIDTH,
+                            )
 
                     with st.expander(f"📋 All SKUs · {len(filtered):,}", expanded=False):
                         show_table(filtered, "inventory_analysis.csv", "inventory_download_all")
@@ -1817,9 +1919,15 @@ elif selected_tab == "Options Data":
         head_left, head_right = st.columns([5, 2], gap="small", vertical_alignment="center")
         with head_left:
             st.subheader("Options data")
-            st.caption(f"Showing {min(1000, len(df_options_filtered)):,} of {len(df_options_filtered):,} filtered rows")
+            st.caption(
+                f"Showing {min(1000, len(df_options_filtered)):,} of {len(df_options_filtered):,} filtered rows "
+                f"({len(df_options):,} total options)"
+            )
         with head_right:
-            st.download_button("Download full options data", df_options.to_csv(index=False).encode("utf-8"), file_name="options_data.csv", mime="text/csv", **FULL_WIDTH)
+            st.download_button(
+                "Download full options data", df_options.to_csv(index=False).encode("utf-8"),
+                file_name="options_data.csv", mime="text/csv", **FULL_WIDTH,
+            )
 
         with st.container(border=True):
             st.data_editor(df_options_filtered.head(1000), num_rows="dynamic", **FULL_WIDTH)
@@ -1844,49 +1952,55 @@ elif selected_tab == "Formatted Data":
             selected_sheet = st.selectbox("Select table", sheet_names)
         df_sheet = prepared_data[selected_sheet]
         with head_right:
-            st.download_button(f"Download {selected_sheet} CSV", df_sheet.to_csv(index=False).encode("utf-8"), file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv", mime="text/csv", **FULL_WIDTH)
+            st.download_button(
+                f"Download {selected_sheet} CSV", df_sheet.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_sheet.lower().replace(' ', '_')}.csv", mime="text/csv", **FULL_WIDTH,
+            )
 
         st.caption(f"Showing {min(1000, len(df_sheet)):,} of {len(df_sheet):,} rows")
         with st.container(border=True):
             st.data_editor(df_sheet.head(1000), num_rows="dynamic", **FULL_WIDTH)
 
 # =============================================================================
-# Document Status / Last Modified tab
+# Document Status tab
 # =============================================================================
 elif selected_tab == "Document Status":
     st.subheader("📄 Document Last Modified Tracker")
-    st.caption("Overview of all system and project documents, their categories, statuses, and last modification timestamps.")
+    st.caption("Every data file under Raw_data plus the application code, with real modification times.")
+
+    def document_record(path: Path, category: str) -> dict:
+        stat = path.stat()
+        modified = pd.Timestamp(stat.st_mtime, unit="s")
+        age_days = (pd.Timestamp.now() - modified).days
+        status = "Updated today" if age_days < 1 else ("Updated this week" if age_days < 7 else "Older than 7 days")
+        return {
+            "Document Name": path.name,
+            "Category": category,
+            "Last Modified": modified,
+            "Size (KB)": round(stat.st_size / 1024, 1),
+            "Status": status,
+        }
 
     doc_records = []
-    
     if raw_data_path.exists():
         for path in raw_data_path.rglob("*"):
-            if path.is_file():
-                stat = path.stat()
+            if not path.is_file() or path.name in ENGINE_PLACEHOLDERS:
+                continue
+            if "inventory" in path.parts:
+                category = "Inventory Folder"
+            elif "PODash" in path.parts:
+                category = "PO Dash Folder"
+            elif "Sales Data" in path.parts:
+                category = "Sales Folder"
+            elif path.name == "options_data.csv":
+                category = "Catalog"
+            else:
                 category = "Raw Data / Source"
-                if "inventory" in path.parts:
-                    category = "Inventory Folder"
-                elif "PODash" in path.parts:
-                    category = "PO Dash Folder"
-                elif "Sales Data" in path.parts:
-                    category = "Sales Folder"
-                elif path.name == "options_data.csv":
-                    category = "Catalog"
+            doc_records.append(document_record(path, category))
+    for path in sorted(base_dir.glob("*.py")):
+        doc_records.append(document_record(path, "System Code"))
 
-                doc_records.append({
-                    "Document Name": path.name,
-                    "Category": category,
-                    "Last Modified": pd.Timestamp(stat.st_mtime, unit="s"),
-                    "Size (KB)": round(stat.st_size / 1024, 1),
-                    "Status": "Active"
-                })
-
-    default_docs = [
-        {"Document Name": "Forecast_Engine.py", "Category": "System Code", "Last Modified": pd.Timestamp("2026-10-22 14:10:00"), "Size (KB)": 45.2, "Status": "Stable"},
-        {"Document Name": "app.py", "Category": "System Code", "Last Modified": pd.Timestamp.today(), "Size (KB)": 112.4, "Status": "Running"}
-    ]
-
-    df_docs = pd.DataFrame(doc_records if doc_records else default_docs)
+    df_docs = pd.DataFrame(doc_records, columns=["Document Name", "Category", "Last Modified", "Size (KB)", "Status"])
 
     f_col1, f_col2 = st.columns([3, 2], gap="small")
     with f_col1:
@@ -1900,22 +2014,21 @@ elif selected_tab == "Document Status":
         filtered_docs = filtered_docs[filtered_docs["Document Name"].str.contains(doc_search, case=False, na=False)]
     if selected_cat != "ALL":
         filtered_docs = filtered_docs[filtered_docs["Category"] == selected_cat]
+    filtered_docs = filtered_docs.sort_values("Last Modified", ascending=False)
 
     stat_col1, stat_col2, stat_col3 = st.columns(3, gap="small")
     stat_col1.metric("Total Tracked Documents", len(df_docs))
     stat_col2.metric("Filtered Results", len(filtered_docs))
-    recent_count = len(df_docs[df_docs["Last Modified"] >= (pd.Timestamp.today() - pd.Timedelta(days=7))])
+    recent_count = int((df_docs["Last Modified"] >= (pd.Timestamp.now() - pd.Timedelta(days=7))).sum())
     stat_col3.metric("Modified in Last 7 Days", recent_count)
-
-    st.markdown("---")
 
     st.dataframe(
         filtered_docs,
         hide_index=True,
         column_config={
             "Last Modified": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
-            "Size (KB)": st.column_config.NumberColumn(format="%.1f KB")
+            "Size (KB)": st.column_config.NumberColumn(format="%.1f KB"),
         },
-        height=min(450, int(38 + 35 * len(filtered_docs)) + 3),
-        **FULL_WIDTH
+        height=table_height(len(filtered_docs), cap=450),
+        **FULL_WIDTH,
     )
