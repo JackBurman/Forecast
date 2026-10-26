@@ -315,7 +315,10 @@ def load_raw_folder_data(
         if not dummy_path.exists():
             pd.DataFrame().to_excel(dummy_path, index=False)
 
-    sources, source_names = forecast_engine.read_raw_data_folder(folder)
+    try:
+        sources, source_names = forecast_engine.read_raw_data_folder(folder)
+    except Exception as e:
+        raise RuntimeError(f"Failed inside forecast_engine.read_raw_data_folder for path '{folder}': {e}")
 
     # Clean up the physical dummy files if they were newly created
     for dummy_name in ["Inventory_report.xlsx", "PODashboard.xlsx"]:
@@ -345,10 +348,16 @@ def load_raw_folder_data(
                         col_rename[col] = "On Hand"
                 inv_df = inv_df.rename(columns=col_rename)
 
+                if "Stock Code" not in inv_df.columns and "Product Code" not in inv_df.columns:
+                    raise KeyError(
+                        f"Inventory file '{latest_inv.name}' is missing a recognized product/stock code column. "
+                        f"Found columns: {list(inv_df.columns)}"
+                    )
+
                 sources["Current Inventory"] = inv_df
                 source_names.append(str(latest_inv.relative_to(base_dir)))
             except Exception as e:
-                st.warning(f"Could not load inventory file {latest_inv.name}: {e}")
+                raise RuntimeError(f"Error loading inventory file from 'Raw_data/inventory/{latest_inv.name}': {e}")
 
     # Automatically load the newest CSV file inside PODash/ and normalise columns
     if podash_folder_path.exists():
@@ -374,16 +383,27 @@ def load_raw_folder_data(
                 sources["Purchase Orders"] = po_df
                 source_names.append(str(latest_po.relative_to(base_dir)))
             except Exception as e:
-                st.warning(f"Could not load PO file {latest_po.name}: {e}")
+                raise RuntimeError(f"Error loading Purchase Order file from 'Raw_data/PODash/{latest_po.name}': {e}")
 
-    formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
+    if "Sales Raw" not in sources:
+        raise KeyError("Missing required 'Sales Raw' dataset from the raw data folder.")
+
+    try:
+        formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
+    except Exception as e:
+        raise RuntimeError(f"Failed during clean_sales_data execution: {e}")
+
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
         "Current Inventory": sources.get("Current Inventory", pd.DataFrame()),
         "Purchase Orders": sources.get("Purchase Orders", pd.DataFrame()),
         "Sales Data": formatted_sales,
     }
-    return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
+    
+    try:
+        return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
+    except Exception as e:
+        raise RuntimeError(f"Failed inside forecast_engine.prepare_forecast_sheets: {e}")
 
 
 # =============================================================================
@@ -966,7 +986,7 @@ def load_prepared_data():
     try:
         return load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
     except Exception as e:
-        st.error(f"Could not load files from Raw_data: {e}")
+        st.error(f"Error loading Raw_data: {e}")
         return None, []
 
 
