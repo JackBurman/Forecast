@@ -6,6 +6,24 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Monkey-patch pandas.read_excel to default to openpyxl and avoid python-calamine import errors
+_orig_read_excel = pd.read_excel
+
+
+def _patched_read_excel(*args, **kwargs):
+  if "engine" not in kwargs:
+    kwargs["engine"] = "openpyxl"
+  try:
+    return _orig_read_excel(*args, **kwargs)
+  except Exception as e:
+    if "python-calamine" in str(e) or "calamine" in str(e).lower():
+      kwargs["engine"] = "openpyxl"
+      return _orig_read_excel(*args, **kwargs)
+    raise e
+
+
+pd.read_excel = _patched_read_excel
+
 import forecast_engine  # type: ignore
 from inventory_charts import stock_health_breakdown, stock_health_by_group
 
