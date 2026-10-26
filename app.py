@@ -326,18 +326,31 @@ def load_raw_folder_data(
             except Exception:
                 pass
 
-    # Automatically load the newest file inside inventory/ (.xls, .xlsx, or .csv)
+    # Automatically load the newest file inside inventory/ (.xls, .xlsx, or .csv) and normalise columns
     if inventory_folder_path.exists():
         inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if inv_files:
             latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
             try:
                 if latest_inv.suffix.lower() == ".csv":
-                    sources["Current Inventory"] = pd.read_csv(latest_inv)
+                    inv_df = pd.read_csv(latest_inv)
                 elif latest_inv.suffix.lower() == ".xls":
-                    sources["Current Inventory"] = pd.read_excel(latest_inv, engine="xlrd")
+                    inv_df = pd.read_excel(latest_inv, engine="xlrd")
                 else:
-                    sources["Current Inventory"] = pd.read_excel(latest_inv)
+                    inv_df = pd.read_excel(latest_inv)
+                
+                # Standardise header names so forecast_engine finds "Product Code" regardless of naming
+                inv_df.columns = [str(col).strip() for col in inv_df.columns]
+                col_rename = {}
+                for col in inv_df.columns:
+                    norm = normalise_header(col)
+                    if norm in ["sku", "sku key", "stock code", "stockcode", "product code", "item code", "item number", "code", "item"]:
+                        col_rename[col] = "Product Code"
+                    elif norm in ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "qoh", "in stock", "stock", "quantity", "qty"]:
+                        col_rename[col] = "On Hand"
+                inv_df = inv_df.rename(columns=col_rename)
+
+                sources["Current Inventory"] = inv_df
                 source_names.append(str(latest_inv.relative_to(base_dir)))
             except Exception as e:
                 st.warning(f"Could not load inventory file {latest_inv.name}: {e}")
