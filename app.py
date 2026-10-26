@@ -11,7 +11,7 @@ import forecast_engine  # type: ignore
 # =============================================================================
 # App setup
 # =============================================================================
-st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
+st.set_page_config(page_title="Forecasting, Purchasing and Inventory", layout="wide")
 
 # Layout-only styling: tighter page frame, compact metric tiles, card headings.
 st.markdown(
