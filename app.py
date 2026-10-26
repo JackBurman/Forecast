@@ -393,10 +393,20 @@ def load_raw_folder_data(
     except Exception as e:
         raise RuntimeError(f"Failed during clean_sales_data execution: {e}")
 
+    curr_inv = sources.get("Current Inventory", pd.DataFrame())
+    if not curr_inv.empty:
+        if "Stock Code" not in curr_inv.columns and "Product Code" in curr_inv.columns:
+            curr_inv = curr_inv.rename(columns={"Product Code": "Stock Code"})
+
+    po_df = sources.get("Purchase Orders", pd.DataFrame())
+    if not po_df.empty:
+        if "Product Code" not in po_df.columns and "Stock Code" in po_df.columns:
+            po_df = po_df.rename(columns={"Stock Code": "Product Code"})
+
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
-        "Current Inventory": sources.get("Current Inventory", pd.DataFrame()),
-        "Purchase Orders": sources.get("Purchase Orders", pd.DataFrame()),
+        "Current Inventory": curr_inv,
+        "Purchase Orders": po_df,
         "Sales Data": formatted_sales,
     }
     
