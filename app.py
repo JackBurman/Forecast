@@ -305,35 +305,60 @@ def load_raw_folder_data(
     folder: str,
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    # Create empty placeholders if forecast_engine looks for specific names internally
+    for dummy_name in ["Inventory_report.xlsx", "PODashboard.xlsx"]:
+        dummy_path = raw_data_path / dummy_name
+        if not dummy_path.exists():
+            pd.DataFrame().to_excel(dummy_path, index=False)
+
     sources, source_names = forecast_engine.read_raw_data_folder(folder)
 
-    # Automatically grab the newest file inside inventory/ regardless of its name
+    # Clean up the physical dummy files if they were newly created
+    for dummy_name in ["Inventory_report.xlsx", "PODashboard.xlsx"]:
+        dummy_path = raw_data_path / dummy_name
+        if dummy_path.exists() and dummy_path.stat().st_size == 0:
+            try:
+                dummy_path.unlink()
+            except Exception:
+                pass
+
+    # Automatically load the newest file inside inventory/ (.xls, .xlsx, or .csv)
     if inventory_folder_path.exists():
         inv_files = [p for p in inventory_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if inv_files:
             latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
             try:
-                sources["Current Inventory"] = pd.read_excel(latest_inv) if latest_inv.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(latest_inv)
+                if latest_inv.suffix.lower() == ".csv":
+                    sources["Current Inventory"] = pd.read_csv(latest_inv)
+                elif latest_inv.suffix.lower() == ".xls":
+                    sources["Current Inventory"] = pd.read_excel(latest_inv, engine="xlrd")
+                else:
+                    sources["Current Inventory"] = pd.read_excel(latest_inv)
                 source_names.append(str(latest_inv.relative_to(base_dir)))
-            except Exception:
-                pass
+            except Exception as e:
+                st.warning(f"Could not load inventory file {latest_inv.name}: {e}")
 
-    # Automatically grab the newest file inside PODash/ regardless of its name
+    # Automatically load the newest file inside PODash/ (.csv, .xls, or .xlsx)
     if podash_folder_path.exists():
         po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if po_files:
             latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
             try:
-                sources["Purchase Orders"] = pd.read_excel(latest_po) if latest_po.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(latest_po)
+                if latest_po.suffix.lower() == ".csv":
+                    sources["Purchase Orders"] = pd.read_csv(latest_po)
+                elif latest_po.suffix.lower() == ".xls":
+                    sources["Purchase Orders"] = pd.read_excel(latest_po, engine="xlrd")
+                else:
+                    sources["Purchase Orders"] = pd.read_excel(latest_po)
                 source_names.append(str(latest_po.relative_to(base_dir)))
-            except Exception:
-                pass
+            except Exception as e:
+                st.warning(f"Could not load PO file {latest_po.name}: {e}")
 
     formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
         "OptionsData": sources["Options Data"],
-        "Current Inventory": sources["Current Inventory"],
-        "Purchase Orders": sources["Purchase Orders"],
+        "Current Inventory": sources.get("Current Inventory", pd.DataFrame()),
+        "Purchase Orders": sources.get("Purchase Orders", pd.DataFrame()),
         "Sales Data": formatted_sales,
     }
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
@@ -563,7 +588,7 @@ def window_label(window: pd.PeriodIndex) -> str:
 
 
 # =============================================================================
-# Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
+# Year view
 # =============================================================================
 
 def fiscal_year_of(period: pd.Period) -> int:
@@ -1525,7 +1550,7 @@ elif selected_tab == "Inventory Analysis":
     prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
-        st.info("Add files under Raw_data/inventory and sales workbooks to analyse inventory.")
+        st.info("Add inventory files under Raw_data/inventory and sales workbooks to analyse inventory.")
     else:
         try:
             sheets = prepared_data
