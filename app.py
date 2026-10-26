@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import altair as alt
 import numpy as np
@@ -7,60 +8,27 @@ import streamlit as st
 
 import forecast_engine  # type: ignore
 
+# =============================================================================
 # App setup
+# =============================================================================
 st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 
 # Layout-only styling: tighter page frame, compact metric tiles, card headings.
-# Everything here is cosmetic; no data or calculations depend on it.
 st.markdown(
     """
     <style>
-        /* Tighter page frame so the headline cards and chart fit one screen */
-        .block-container {
-            padding-top: 1.2rem;
-            padding-bottom: 1rem;
-        }
-        /* Less vertical gap between stacked elements (default is 1rem) */
-        [data-testid="stVerticalBlock"] {
-            gap: 0.6rem;
-        }
-        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-            gap: 0.45rem;
-        }
-        /* Smaller page title */
-        h1 {
-            font-size: 1.8rem !important;
-            padding-top: 0.2rem !important;
-            padding-bottom: 0.2rem !important;
-        }
-        h2, h3 {
-            padding-top: 0.3rem !important;
-            padding-bottom: 0.2rem !important;
-        }
-        /* Compact metric tiles */
-        [data-testid="stMetric"] {
-            padding: 0.1rem 0;
-        }
-        [data-testid="stMetricLabel"] p {
-            font-size: 0.78rem;
-            line-height: 1.2;
-            white-space: normal;
-        }
-        [data-testid="stMetricValue"] {
-            font-size: 1.5rem;
-            line-height: 1.2;
-        }
-        [data-testid="stMetricDelta"] {
-            font-size: 0.78rem;
-        }
-        /* Card headings */
+        .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+        [data-testid="stVerticalBlock"] { gap: 0.6rem; }
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
+        h1 { font-size: 1.8rem !important; padding-top: 0.2rem !important; padding-bottom: 0.2rem !important; }
+        h2, h3 { padding-top: 0.3rem !important; padding-bottom: 0.2rem !important; }
+        [data-testid="stMetric"] { padding: 0.1rem 0; }
+        [data-testid="stMetricLabel"] p { font-size: 0.78rem; line-height: 1.2; white-space: normal; }
+        [data-testid="stMetricValue"] { font-size: 1.5rem; line-height: 1.2; }
+        [data-testid="stMetricDelta"] { font-size: 0.78rem; }
         .card-title {
-            font-size: 0.72rem;
-            font-weight: 600;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-            opacity: 0.65;
-            margin: 0 0 0.15rem 0;
+            font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+            text-transform: uppercase; opacity: 0.65; margin: 0 0 0.15rem 0;
         }
     </style>
     """,
@@ -83,6 +51,7 @@ FULL_WIDTH = (
 )
 
 MONTH_NUMBER_TO_NAME = dict(enumerate(forecast_engine.MONTHS, start=1))
+MONTH_NAME_TO_NUMBER = {name: number for number, name in MONTH_NUMBER_TO_NAME.items()}
 FY_MONTHS = [
     "July", "August", "September", "October", "November", "December",
     "January", "February", "March", "April", "May", "June"
@@ -93,6 +62,10 @@ base_dir = Path(__file__).resolve().parent
 raw_data_path = base_dir / "Raw_data"
 csv_path = raw_data_path / "options_data.csv"
 
+
+# =============================================================================
+# Data loading and cleaning (unchanged)
+# =============================================================================
 
 @st.cache_data
 def load_csv(path: str | Path) -> pd.DataFrame:
@@ -341,6 +314,10 @@ def load_raw_folder_data(
     return forecast_engine.prepare_forecast_sheets(forecast_inputs), source_names
 
 
+# =============================================================================
+# Forecast math (unchanged)
+# =============================================================================
+
 SEASON = 12
 GROWTH_FLOOR, GROWTH_CAP = 0.5, 1.2
 DEFAULT_GROWTH = 1.05
@@ -560,9 +537,324 @@ def window_label(window: pd.PeriodIndex) -> str:
     return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
+#
+# These helpers only decide which twelve months make up a "year" and what it
+# is called. The forecast values themselves are untouched; the FY view reads
+# them by month from the same two forecast series.
+# =============================================================================
+
+def fiscal_year_of(period: pd.Period) -> int:
+    """Australian FY ends 30 June and is named by its end year (FY2027 = Jul 2026 – Jun 2027)."""
+    return period.year + 1 if period.month >= 7 else period.year
+
+
+def view_year(period: pd.Period, fiscal: bool) -> int:
+    return fiscal_year_of(period) if fiscal else period.year
+
+
+def view_year_periods(year: int, fiscal: bool) -> pd.PeriodIndex:
+    start = f"{year - 1}-07" if fiscal else f"{year}-01"
+    return pd.period_range(start, periods=SEASON, freq="M")
+
+
+def view_label(year: int, fiscal: bool) -> str:
+    return f"FY{year}" if fiscal else str(year)
+
+
+def label_year_number(label: str) -> int:
+    return int(re.sub(r"\D", "", str(label)))
+
+
+def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFrame:
+    """Re-group a Month × calendar-year profile into a Month × financial-year profile.
+
+    Values are moved, never recomputed: July–December of calendar year Y become
+    FY(Y+1), January–June stay in FY(Y).
+    """
+    long = profile.melt(id_vars="Month", var_name="Year", value_name="Value").dropna(subset=["Value"])
+    if long.empty:
+        return pd.DataFrame({"Month": FY_MONTHS})
+    month_number = long["Month"].map(MONTH_NAME_TO_NUMBER)
+    calendar_year = long["Year"].astype(int)
+    long = long.assign(FY=np.where(month_number >= 7, calendar_year + 1, calendar_year))
+    long = long.loc[long["FY"] >= first_fiscal_year]
+    pivot = long.pivot(index="Month", columns="FY", values="Value").reindex(FY_MONTHS)
+    pivot.columns.name = None
+    return pivot.reset_index()
+
+
+# =============================================================================
+# Inventory analysis
+# =============================================================================
+
+INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
+    "sku": ["sku", "sku key", "stock code", "stockcode", "item code", "item number", "product code", "item", "code"],
+    "on_hand": ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "on hand qty", "qoh", "in stock", "stock qty", "stock", "quantity", "qty"],
+    "free": ["free", "free stock", "free qty", "qty free", "available", "available qty", "qty available", "unallocated"],
+    "site": ["site", "location", "warehouse", "branch", "store", "showroom"],
+    "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
+    "description": ["description", "item description", "product description", "product name", "name", "product"],
+}
+INVENTORY_ROLE_LABELS = {
+    "sku": "SKU column",
+    "on_hand": "On-hand quantity column",
+    "free": "Free stock column",
+    "site": "Site / location column",
+    "value": "Stock value column",
+    "description": "Description column",
+}
+
+STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out of stock", "Inactive"]
+STATUS_COLOURS = {
+    "Dead stock": "#d55e00",
+    "Slow moving": "#e69f00",
+    "Stock-out risk": "#cc79a7",
+    "Healthy": "#009e73",
+    "Out of stock": "#0072b2",
+    "Inactive": "#9aa0a6",
+}
+
+
+def normalise_header(text) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def detect_column(columns, candidates: list[str], exclude: tuple = ()) -> str | None:
+    """Best-matching column for a role: exact normalised match first, then substring."""
+    normalised = {col: normalise_header(col) for col in columns if col not in exclude}
+    for candidate in candidates:
+        for col, norm in normalised.items():
+            if norm == candidate:
+                return col
+    for candidate in candidates:
+        for col, norm in normalised.items():
+            if candidate in norm:
+                return col
+    return None
+
+
+def detect_inventory_columns(inventory: pd.DataFrame) -> dict[str, str | None]:
+    found: dict[str, str | None] = {}
+    used: list[str] = []
+    for role, candidates in INVENTORY_COLUMN_CANDIDATES.items():
+        col = detect_column(inventory.columns, candidates, exclude=tuple(used))
+        found[role] = col
+        if col:
+            used.append(col)
+    return found
+
+
+def sku_text(value) -> str:
+    normalised = normalize_sku(value)
+    return "" if pd.isna(normalised) else str(normalised)
+
+
+@st.cache_data(show_spinner=False)
+def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """One row per SKU with on-hand and free stock summed across sites."""
+    frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
+    frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
+    frame["Free stock"] = (
+        to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
+    )
+    if mapping.get("value"):
+        frame["Stock value"] = to_number(inventory[mapping["value"]]).fillna(0.0)
+    if mapping.get("site"):
+        frame["Site"] = inventory[mapping["site"]].astype(str).str.strip()
+    if mapping.get("description"):
+        frame["Inventory description"] = inventory[mapping["description"]].astype(str).str.strip()
+    frame = frame.loc[frame["SKU"].ne("")]
+
+    aggregations = {"On hand": "sum", "Free stock": "sum"}
+    if "Stock value" in frame.columns:
+        aggregations["Stock value"] = "sum"
+    if "Inventory description" in frame.columns:
+        aggregations["Inventory description"] = "first"
+    grouped = frame.groupby("SKU").agg(aggregations)
+    if "Site" in frame.columns:
+        grouped["Sites with stock"] = (
+            frame.loc[frame["On hand"] > 0].groupby("SKU")["Site"].nunique().reindex(grouped.index).fillna(0).astype(int)
+        )
+    return grouped.reset_index()
+
+
+@st.cache_data(show_spinner=False)
+def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
+    """Per-SKU sales inside the window plus lifetime first/last sale dates."""
+    dated = sales.dropna(subset=["Date"]).copy()
+    key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
+    dated["SKU"] = dated[key_column].map(sku_text)
+    dated = dated.loc[dated["SKU"].ne("")]
+    if dated.empty:
+        return pd.DataFrame(columns=["SKU", "Units sold", "Sales value", "COGS", "Months with sales", "Last sale", "First sale"])
+
+    period = dated["Date"].dt.to_period("M")
+    start, end = pd.Period(window_start, freq="M"), pd.Period(window_end, freq="M")
+    in_window = dated.loc[(period >= start) & (period <= end)].copy()
+    in_window["Period"] = in_window["Date"].dt.to_period("M")
+
+    aggregations = {"Units sold": ("Qty", "sum"), "Months with sales": ("Period", "nunique")}
+    if "Sale" in in_window.columns:
+        aggregations["Sales value"] = ("Sale", "sum")
+    if "Cost" in in_window.columns:
+        aggregations["COGS"] = ("Cost", "sum")
+    window = in_window.groupby("SKU").agg(**aggregations)
+    history = dated.groupby("SKU").agg(**{"Last sale": ("Date", "max"), "First sale": ("Date", "min")})
+
+    attribute_map = {
+        "Description": "Description",
+        "OptionsData.Supplier": "Supplier",
+        "OptionsData.Class": "Class",
+        "OptionsData.Fourth Product Group": "Product group",
+    }
+    present = {src: dst for src, dst in attribute_map.items() if src in dated.columns}
+    attributes = (
+        dated.sort_values("Date").groupby("SKU")[list(present)].last().rename(columns=present)
+        if present
+        else pd.DataFrame(index=history.index)
+    )
+    return window.join(history, how="outer").join(attributes, how="left").reset_index()
+
+
+def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
+    """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
+    empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group"])
+    if options is None or options.empty:
+        return empty
+    sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
+    if sku_col is None:
+        return empty
+    frame = pd.DataFrame({"SKU": options[sku_col].map(sku_text)})
+    for role, candidates in {
+        "Description": INVENTORY_COLUMN_CANDIDATES["description"],
+        "Supplier": ["supplier", "supplier brand", "brand", "vendor"],
+        "Class": ["class"],
+        "Product group": ["fourth product group", "product group", "category"],
+    }.items():
+        col = detect_column(options.columns, candidates, exclude=(sku_col,))
+        frame[role] = options[col].astype(str).str.strip() if col else pd.NA
+    frame = frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
+    return frame
+
+
+def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
+    """Open PO quantity per SKU when the PO sheet carries a SKU column; empty otherwise."""
+    if purchase_orders is None or purchase_orders.empty or "Open PO Qty" not in purchase_orders.columns:
+        return pd.Series(dtype=float)
+    sku_col = detect_column(purchase_orders.columns, INVENTORY_COLUMN_CANDIDATES["sku"])
+    if sku_col is None:
+        return pd.Series(dtype=float)
+    keyed = pd.DataFrame(
+        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders["Open PO Qty"]).fillna(0.0)}
+    )
+    return keyed.loc[keyed["SKU"].ne("")].groupby("SKU")["Open PO qty"].sum()
+
+
+def build_inventory_table(
+    inventory_sku: pd.DataFrame,
+    movement: pd.DataFrame,
+    attributes: pd.DataFrame,
+    open_po: pd.Series,
+    window_months: int,
+    window_days: int,
+    today: pd.Timestamp,
+    dead_days: int,
+    slow_dos: int,
+    risk_dos: int,
+) -> pd.DataFrame:
+    """SKU-level stock position, movement, days of supply, turns and status."""
+    master = inventory_sku.merge(movement, on="SKU", how="outer")
+    master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
+    for column in ["Description", "Supplier", "Class", "Product group"]:
+        option_column = f"{column} (options)"
+        if option_column in master.columns:
+            master[column] = master[column].where(master[column].notna(), master[option_column]) if column in master.columns else master[option_column]
+            master = master.drop(columns=[option_column])
+        elif column not in master.columns:
+            master[column] = pd.NA
+    if "Inventory description" in master.columns:
+        master["Description"] = master["Description"].where(master["Description"].notna(), master["Inventory description"])
+        master = master.drop(columns=["Inventory description"])
+    master["Description"] = master["Description"].fillna("").astype(str)
+    for column in ["Supplier", "Class", "Product group"]:
+        master[column] = master[column].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
+
+    for column in ["On hand", "Free stock", "Units sold", "Sales value", "COGS", "Months with sales"]:
+        master[column] = pd.to_numeric(master.get(column), errors="coerce").fillna(0.0) if column in master.columns else 0.0
+    if not open_po.empty:
+        master["Open PO qty"] = master["SKU"].map(open_po).fillna(0.0)
+
+    master["Avg monthly units"] = master["Units sold"] / window_months
+    daily_rate = master["Units sold"] / window_days
+    with np.errstate(divide="ignore", invalid="ignore"):
+        master["Days of supply"] = np.where(daily_rate > 0, master["On hand"] / daily_rate, np.inf)
+        master["Turns (annualised)"] = np.where(
+            master["On hand"] > 0, (master["Units sold"] * 12 / window_months) / master["On hand"], np.nan
+        )
+        unit_cost = np.where(master["Units sold"] > 0, master["COGS"] / master["Units sold"], np.nan)
+        if "Open PO qty" in master.columns:
+            master["Days of supply incl. POs"] = np.where(
+                daily_rate > 0, (master["On hand"] + master["Open PO qty"]) / daily_rate, np.inf
+            )
+    master["Est. stock value"] = (
+        master["Stock value"] if "Stock value" in master.columns else master["On hand"] * unit_cost
+    )
+
+    last_sale = pd.to_datetime(master["Last sale"], errors="coerce")
+    master["Last sale"] = last_sale
+    master["Days since last sale"] = (today - last_sale).dt.days
+
+    on_hand = master["On hand"]
+    dos = master["Days of supply"]
+    never_or_stale = last_sale.isna() | (master["Days since last sale"] > dead_days)
+    master["Status"] = np.select(
+        [
+            (on_hand <= 0) & (master["Units sold"] > 0),
+            on_hand <= 0,
+            (on_hand > 0) & never_or_stale,
+            (on_hand > 0) & (dos > slow_dos),
+            (on_hand > 0) & (dos < risk_dos),
+        ],
+        ["Out of stock", "Inactive", "Dead stock", "Slow moving", "Stock-out risk"],
+        default="Healthy",
+    )
+    master["Dead units"] = np.where(master["Status"] == "Dead stock", on_hand, 0.0)
+    master["Slow units"] = np.where(master["Status"] == "Slow moving", on_hand, 0.0)
+    master["Days of supply"] = master["Days of supply"].replace(np.inf, np.nan)
+    if "Days of supply incl. POs" in master.columns:
+        master["Days of supply incl. POs"] = master["Days of supply incl. POs"].replace(np.inf, np.nan)
+    return master.sort_values("On hand", ascending=False).reset_index(drop=True)
+
+
+def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: int, window_days: int) -> pd.DataFrame:
+    grouped = master.groupby(group_column).agg(
+        **{
+            "SKUs": ("SKU", "nunique"),
+            "SKUs with stock": ("On hand", lambda s: int((s > 0).sum())),
+            "On hand": ("On hand", "sum"),
+            "Units sold": ("Units sold", "sum"),
+            "Sales value": ("Sales value", "sum"),
+            "Dead units": ("Dead units", "sum"),
+            "Slow units": ("Slow units", "sum"),
+            "Stock-out risk SKUs": ("Status", lambda s: int((s == "Stock-out risk").sum())),
+            "Est. stock value": ("Est. stock value", "sum"),
+        }
+    )
+    daily_rate = grouped["Units sold"] / window_days
+    with np.errstate(divide="ignore", invalid="ignore"):
+        grouped["Days of supply"] = np.where(daily_rate > 0, grouped["On hand"] / daily_rate, np.nan)
+        grouped["Turns (annualised)"] = np.where(
+            grouped["On hand"] > 0, (grouped["Units sold"] * 12 / window_months) / grouped["On hand"], np.nan
+        )
+        grouped["Dead stock %"] = np.where(grouped["On hand"] > 0, grouped["Dead units"] / grouped["On hand"] * 100, np.nan)
+    return grouped.sort_values("On hand", ascending=False).reset_index()
+
+
+# =============================================================================
 # Layout helpers (presentation only)
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 def metric_card(title: str, tiles: list[dict]) -> None:
     """A bordered card with a small heading and one st.metric per tile."""
@@ -582,9 +874,59 @@ def chart_formats(metric: str) -> tuple[str, str, str]:
     return "~s", ",.0f", "Qty (units)"
 
 
-# ---------------------------------------------------------------------------
-# Page header
-# ---------------------------------------------------------------------------
+def quiet_axis(**overrides) -> alt.Axis:
+    settings = dict(grid=False, ticks=False, domain=False, labelPadding=6)
+    settings.update(overrides)
+    return alt.Axis(**settings)
+
+
+def value_axis(fmt: str, **overrides) -> alt.Axis:
+    settings = dict(
+        format=fmt, grid=True, gridOpacity=0.35, gridDash=[2, 3], tickCount=5,
+        ticks=False, domain=False, titleFontWeight="normal", titlePadding=10,
+    )
+    settings.update(overrides)
+    return alt.Axis(**settings)
+
+
+def choices_for(series: pd.Series) -> list[str]:
+    values = sorted(
+        {str(value).strip() for value in series.dropna() if str(value).strip()},
+        key=str.casefold,
+    )
+    return ["TOTAL", *values]
+
+
+def filter_selectbox(label: str, series: pd.Series, default: str = "TOTAL") -> str:
+    if series.nunique(dropna=True) > 1500:
+        starting_value = "" if default == "TOTAL" else default
+        typed_value = st.text_input(
+            f"{label} contains",
+            value=starting_value,
+            key=f"forecast_{label}",
+        ).strip()
+        return typed_value or "TOTAL"
+    choices = choices_for(series)
+    index = choices.index(default) if default in choices else 0
+    return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
+
+
+def number_or_blank(value, fmt: str) -> str:
+    return "" if pd.isna(value) else format(value, fmt)
+
+
+def load_prepared_data():
+    """Load the Raw_data folder; returns (sheets, source_names) or (None, [])."""
+    try:
+        return load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
+    except Exception as e:
+        st.error(f"Could not load files from Raw_data: {e}")
+        return None, []
+
+
+# =============================================================================
+# Page header, sidebar and navigation
+# =============================================================================
 
 header_left, header_right = st.columns([6, 1], gap="small", vertical_alignment="center")
 with header_left:
@@ -662,7 +1004,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 selected_tab = st.radio(
     "View",
-    ["Forecast", "Options Data", "Formatted Data"],
+    ["Forecast", "Inventory Analysis", "Options Data", "Formatted Data"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -670,13 +1012,11 @@ selected_tab = st.radio(
 prepared_data = None
 source_names = []
 
+# =============================================================================
+# Forecast tab
+# =============================================================================
 if selected_tab == "Forecast":
-    try:
-        prepared_data, source_names = load_raw_folder_data(
-            str(raw_data_path), raw_folder_manifest(raw_data_path)
-        )
-    except Exception as e:
-        st.error(f"Could not load files from Raw_data: {e}")
+    prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
         st.info(
@@ -688,30 +1028,8 @@ if selected_tab == "Forecast":
             sheets = prepared_data
             sales_data = sheets["Sales Data"]
 
-            def choices_for(series: pd.Series) -> list[str]:
-                values = sorted(
-                    {str(value).strip() for value in series.dropna() if str(value).strip()},
-                    key=str.casefold,
-                )
-                return ["TOTAL", *values]
-
-            def filter_selectbox(
-                label: str, series: pd.Series, default: str = "TOTAL"
-            ) -> str:
-                if series.nunique(dropna=True) > 1500:
-                    starting_value = "" if default == "TOTAL" else default
-                    typed_value = st.text_input(
-                        f"{label} contains",
-                        value=starting_value,
-                        key=f"forecast_{label}",
-                    ).strip()
-                    return typed_value or "TOTAL"
-                choices = choices_for(series)
-                index = choices.index(default) if default in choices else 0
-                return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
-
-            # Sidebar: the metric and the filters stay visible; tuning
-            # parameters and the target live in collapsed expanders.
+            # Sidebar: metric and filters stay visible; tuning parameters and
+            # the target live in collapsed expanders.
             with st.sidebar:
                 st.header("Forecast filters")
                 metric_options = ["Qty", "Sale", "Cost", "GP%", "GP $"]
@@ -741,7 +1059,7 @@ if selected_tab == "Forecast":
                         max_value=2100,
                         value=2024,
                         step=1,
-                        help="First year of actuals shown on the chart.",
+                        help="First year of actuals shown on the chart (a financial year when the FY view is selected).",
                     )
                     forecast_from = pd.Timestamp(f"{history_from_year}-01-01")
                     bias = st.number_input(
@@ -802,8 +1120,30 @@ if selected_tab == "Forecast":
                 st.warning("No completed months of dated sales match these selections.")
             else:
                 # ------------------------------------------------------------
-                # Calculations (unchanged) — all computed up front so the
-                # layout below can place them freely.
+                # Year view selector + context line
+                # ------------------------------------------------------------
+                context_col, view_col = st.columns([5, 2], gap="small", vertical_alignment="center")
+                with view_col:
+                    year_view = st.selectbox(
+                        "Year Type View",
+                        ["Calendar Year (Jan-Dec)", "Financial Year (Jul-Jun)"],
+                        index=0,
+                        key="year_type_view_select",
+                        label_visibility="collapsed",
+                    )
+                fiscal = "Financial Year" in year_view
+                active_filters = [f"{name}: {value}" for name, value in filters.items() if value != "TOTAL"]
+                with context_col:
+                    st.caption(
+                        f"Actuals complete through {last_complete.strftime('%b %Y')} · "
+                        f"{len(selected_sales):,} sales rows in selection · "
+                        + (" · ".join(active_filters) if active_filters else "all locations, channels and products")
+                    )
+
+                # ------------------------------------------------------------
+                # Calculations. The forecast series are used exactly as
+                # produced; the view only decides which twelve months form
+                # "this year" and "last year".
                 # ------------------------------------------------------------
                 total_po = 0.0
                 if not purchase_months.empty and {"Date", "Open PO Qty"} <= set(
@@ -825,28 +1165,42 @@ if selected_tab == "Forecast":
                 else:
                     rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
 
-                # Forecast vs actual (YTD, YTG, full year)
-                this_year_periods = pd.period_range(f"{this_year}-01", periods=SEASON, freq="M")
+                current_period = last_complete + 1
+                view_this_year = view_year(current_period, fiscal)
+                this_label = view_label(view_this_year, fiscal)
+                this_year_periods = view_year_periods(view_this_year, fiscal)
                 ytd_periods = [p for p in this_year_periods if p <= last_complete]
                 ytg_periods = [p for p in this_year_periods if p > last_complete]
 
-                fc_this_series = pd.Series(
-                    forecast_this_year["Forecast"].values,
-                    index=pd.to_datetime(forecast_this_year["Date"]).dt.to_period("M")
-                ) if not forecast_this_year.empty else pd.Series(dtype=float)
+                forecast_frames_for_series = [
+                    frame for frame in (forecast_this_year, forecast_next_year) if not frame.empty
+                ]
+                fc_series = (
+                    pd.concat(
+                        [
+                            pd.Series(
+                                frame["Forecast"].values,
+                                index=pd.to_datetime(frame["Date"]).dt.to_period("M"),
+                            )
+                            for frame in forecast_frames_for_series
+                        ]
+                    )
+                    if forecast_frames_for_series
+                    else pd.Series(dtype=float)
+                )
 
                 if metric == "GP%":
                     ytd_act = float(actual_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
-                    ytd_fc = float(fc_this_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
-                    ytg_fc = float(fc_this_series.reindex(ytg_periods).mean()) if ytg_periods else np.nan
-                    fy_act_fc = float(pd.concat([actual_series.reindex(ytd_periods), fc_this_series.reindex(ytg_periods)]).mean())
-                    fy_fc = float(fc_this_series.reindex(this_year_periods).mean())
+                    ytd_fc = float(fc_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
+                    ytg_fc = float(fc_series.reindex(ytg_periods).mean()) if ytg_periods else np.nan
+                    fy_act_fc = float(pd.concat([actual_series.reindex(ytd_periods), fc_series.reindex(ytg_periods)]).mean())
+                    fy_fc = float(fc_series.reindex(this_year_periods).mean())
                 else:
                     ytd_act = float(actual_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
-                    ytd_fc = float(fc_this_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
-                    ytg_fc = float(fc_this_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
+                    ytd_fc = float(fc_series.reindex(ytd_periods).sum()) if ytd_periods else 0.0
+                    ytg_fc = float(fc_series.reindex(ytg_periods).sum()) if ytg_periods else 0.0
                     fy_act_fc = ytd_act + ytg_fc
-                    fy_fc = float(fc_this_series.reindex(this_year_periods).sum())
+                    fy_fc = float(fc_series.reindex(this_year_periods).sum())
 
                 ytd_diff = ytd_act - ytd_fc if pd.notna(ytd_act) and pd.notna(ytd_fc) else np.nan
                 ytd_pct = (ytd_diff / ytd_fc * 100) if pd.notna(ytd_diff) and ytd_fc != 0 else np.nan
@@ -856,9 +1210,8 @@ if selected_tab == "Forecast":
 
                 fmt_str = lambda x: f"{x:.1f}%" if metric == "GP%" else f"{forecast_label_prefix}{x:,.0f}"
 
-                # This year vs previous year
-                prior_year = this_year - 1
-                prior_year_periods = pd.period_range(f"{prior_year}-01", periods=SEASON, freq="M")
+                prior_label = view_label(view_this_year - 1, fiscal)
+                prior_year_periods = view_year_periods(view_this_year - 1, fiscal)
                 prior_ytd_periods = [p - SEASON for p in ytd_periods]
 
                 if metric == "GP%":
@@ -873,6 +1226,17 @@ if selected_tab == "Forecast":
 
                 py_fy_diff = fy_act_fc - prior_fy_act if pd.notna(fy_act_fc) and pd.notna(prior_fy_act) else np.nan
                 py_fy_pct = (py_fy_diff / prior_fy_act * 100) if pd.notna(py_fy_diff) and prior_fy_act != 0 else np.nan
+
+                year_start_label = this_year_periods[0].strftime("%b %Y")
+                ytd_end_label = ytd_periods[-1].strftime("%b %Y") if ytd_periods else "n/a"
+                baseline_help = (
+                    f"Blended forecast for all 12 months of {this_label}"
+                    + (
+                        f" (Jul–Dec from the {this_year} forecast, Jan–Jun from the {this_year + 1} forecast)."
+                        if fiscal
+                        else "."
+                    )
+                )
 
                 # ------------------------------------------------------------
                 # Tier 1 — headline cards
@@ -910,29 +1274,29 @@ if selected_tab == "Forecast":
                     )
 
                 metric_card(
-                    f"{this_year} forecast vs actual",
+                    f"{this_label} forecast vs actual",
                     [
                         dict(
                             label="YTD Actual vs Forecast",
                             value=fmt_str(ytd_act),
                             delta=f"{ytd_diff:+.0f} ({ytd_pct:+.1f}%)" if pd.notna(ytd_diff) else "n/a",
-                            help=f"Actuals from Jan {this_year} to {last_complete.strftime('%b %Y')} vs blended forecast.",
+                            help=f"Actuals from {year_start_label} to {ytd_end_label} vs blended forecast.",
                         ),
                         dict(
                             label="YTG Forecast Remaining",
                             value=fmt_str(ytg_fc),
-                            help=f"Blended forecast for remaining months of {this_year}.",
+                            help=f"Blended forecast for remaining months of {this_label}.",
                         ),
                         dict(
                             label="Full Year Outlook (Actual + Forecast)",
                             value=fmt_str(fy_act_fc),
                             delta=f"{fy_diff:+.0f} ({fy_pct:+.1f}%) vs Baseline" if pd.notna(fy_diff) else "n/a",
-                            help="YTD Actuals + YTG Forecast vs original full-year forecast baseline.",
+                            help="YTD Actuals + YTG Forecast vs full-year forecast baseline.",
                         ),
                         dict(
                             label="Full Year Baseline Forecast",
                             value=fmt_str(fy_fc),
-                            help=f"Original full-year blended forecast for {this_year}.",
+                            help=baseline_help,
                         ),
                     ],
                 )
@@ -940,12 +1304,18 @@ if selected_tab == "Forecast":
                 # ------------------------------------------------------------
                 # Tier 2 — monthly comparison chart
                 # ------------------------------------------------------------
+                # In the FY view the engine is asked for one extra calendar
+                # year so that July–December of the first financial year is
+                # present, then the months are re-grouped into Jul–Jun years.
+                profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
                 annual_profile = forecast_engine.yearly_monthly_profile(
                     selected_sales,
                     pd.DataFrame(columns=["Date", "Forecast"]),
                     metric,
-                    forecast_from,
+                    profile_from,
                 )
+                if fiscal:
+                    annual_profile = fiscal_profile(annual_profile, int(history_from_year))
                 if metric == "GP%" and not annual_profile.empty:
                     numeric_cols = [c for c in annual_profile.columns if c != "Month"]
                     for col in numeric_cols:
@@ -955,35 +1325,24 @@ if selected_tab == "Forecast":
                     (column for column in annual_profile.columns if column != "Month"),
                     key=lambda value: int(value),
                 )
-                year_labels = [str(column) for column in year_columns]
+                year_labels = [view_label(int(column), fiscal) for column in year_columns]
+                month_sort_order = FY_MONTHS if fiscal else forecast_engine.MONTHS
 
-                chart_title_col, chart_control_col = st.columns(
-                    [5, 2], gap="small", vertical_alignment="bottom"
+                st.subheader(
+                    "Monthly comparison by " + ("financial year (Jul–Jun)" if fiscal else "calendar year (Jan–Dec)"),
+                    help=(
+                        f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
+                        f"blended with the year-on-year trend. "
+                        f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
+                        f"blended with the year-on-year trend."
+                        + (" In the FY view the two forecasts are read by month into Jul–Jun years." if fiscal else "")
+                    ),
                 )
-                with chart_control_col:
-                    year_view = st.selectbox(
-                        "Year Type View",
-                        ["Calendar Year (Jan-Dec)", "Financial Year (Jul-Jun)"],
-                        index=0,
-                        key="year_type_view_select",
-                        label_visibility="collapsed",
-                    )
-                month_sort_order = FY_MONTHS if "Financial Year" in year_view else forecast_engine.MONTHS
-                with chart_title_col:
-                    st.subheader(
-                        "Monthly comparison by year",
-                        help=(
-                            f"Forecast {this_year} = ETS fitted to history before Jan {this_year}, "
-                            f"blended with the year-on-year trend. "
-                            f"Forecast {this_year + 1} = ETS fitted to history up to most recent sale, "
-                            f"blended with the year-on-year trend."
-                        ),
-                    )
 
                 actual_chart_data = annual_profile.melt(
                     id_vars="Month", var_name="Year", value_name="Value"
                 ).dropna(subset=["Value"])
-                actual_chart_data["Series"] = actual_chart_data["Year"].astype(str)
+                actual_chart_data["Series"] = actual_chart_data["Year"].map(lambda y: view_label(int(y), fiscal))
                 actual_chart_data["Line Type"] = "Actual"
 
                 forecast_frames = [
@@ -994,15 +1353,21 @@ if selected_tab == "Forecast":
                 forecast_frames = [frame for frame in forecast_frames if not frame.empty]
                 if forecast_frames:
                     forecast_chart_data = pd.concat(forecast_frames, ignore_index=True)
-                    forecast_chart_data["Year"] = (
-                        forecast_chart_data["Date"].dt.year.astype(str)
+                    forecast_periods = forecast_chart_data["Date"].dt.to_period("M")
+                    forecast_chart_data["YearNumber"] = forecast_periods.map(lambda p: view_year(p, fiscal))
+                    # Keep the current and following year, as in the calendar view.
+                    forecast_chart_data = forecast_chart_data.loc[
+                        forecast_chart_data["YearNumber"] >= view_this_year
+                    ].copy()
+                    forecast_chart_data["Year"] = forecast_chart_data["YearNumber"].map(
+                        lambda y: view_label(int(y), fiscal)
                     )
                     forecast_chart_data["Month"] = (
                         forecast_chart_data["Date"].dt.month.map(MONTH_NUMBER_TO_NAME)
                     )
                 else:
                     forecast_chart_data = pd.DataFrame(
-                        columns=["Date", "Forecast", "Year", "Month"]
+                        columns=["Date", "Forecast", "YearNumber", "Year", "Month"]
                     )
                 forecast_plot_data = pd.DataFrame(
                     {
@@ -1021,7 +1386,7 @@ if selected_tab == "Forecast":
                 )
                 forecast_series = sorted(
                     forecast_plot_data["Series"].unique(),
-                    key=lambda series: int(series.removeprefix("Forecast ")),
+                    key=label_year_number,
                 )
                 series_order = list(dict.fromkeys(year_labels + forecast_series))
                 palette = [
@@ -1050,19 +1415,11 @@ if selected_tab == "Forecast":
                     clear=False,
                 )
 
-                # Shared month axis: three-letter labels, no title, no grid.
                 month_axis = alt.X(
                     "Month:N",
                     sort=month_sort_order,
                     title=None,
-                    axis=alt.Axis(
-                        labelAngle=0,
-                        labelExpr="slice(datum.label, 0, 3)",
-                        grid=False,
-                        ticks=False,
-                        domain=False,
-                        labelPadding=6,
-                    ),
+                    axis=quiet_axis(labelAngle=0, labelExpr="slice(datum.label, 0, 3)"),
                 )
 
                 yearly_chart = (
@@ -1074,17 +1431,7 @@ if selected_tab == "Forecast":
                             "Value:Q",
                             title=y_title,
                             scale=alt.Scale(zero=False),
-                            axis=alt.Axis(
-                                format=axis_format,
-                                grid=True,
-                                gridOpacity=0.35,
-                                gridDash=[2, 3],
-                                tickCount=5,
-                                ticks=False,
-                                domain=False,
-                                titleFontWeight="normal",
-                                titlePadding=10,
-                            ),
+                            axis=value_axis(axis_format),
                         ),
                         color=alt.Color(
                             "Series:N",
@@ -1131,18 +1478,18 @@ if selected_tab == "Forecast":
                             field = f"year_{year}"
                             tooltip_row[field] = float(value)
                             tooltip_fields.append(
-                                alt.Tooltip(f"{field}:Q", title=str(year), format=value_format)
+                                alt.Tooltip(f"{field}:Q", title=view_label(int(year), fiscal), format=value_format)
                             )
                     month_forecasts = forecast_chart_data.loc[
                         forecast_chart_data["Month"].eq(month)
                     ]
-                    for year in sorted(month_forecasts["Year"].unique()):
+                    for year in sorted(month_forecasts["Year"].unique(), key=label_year_number):
                         forecast_value = month_forecasts.loc[
                             month_forecasts["Year"].eq(year), "Forecast"
                         ]
                         if forecast_value.empty or pd.isna(forecast_value.iloc[0]):
                             continue
-                        field = f"forecast_{year}"
+                        field = f"forecast_{label_year_number(year)}"
                         tooltip_row[field] = float(forecast_value.iloc[0])
                         tooltip_fields.append(
                             alt.Tooltip(
@@ -1184,7 +1531,7 @@ if selected_tab == "Forecast":
                     st.session_state["legend_selection_state"] = chart_event.selection
 
                 st.caption(
-                    f"{'FY Jul–Jun' if 'Financial Year' in year_view else 'Calendar Jan–Dec'} · "
+                    f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · "
                     "Solid lines: actual · Dashed lines: forecast · "
                     "Click a legend entry to show or hide a series · "
                     "Hover a month to compare every year."
@@ -1205,7 +1552,7 @@ if selected_tab == "Forecast":
                     prior_target_diff = prior_fy_act - sale_target
                     prior_target_pct = (prior_target_diff / sale_target) * 100 if sale_target > 0 else 0.0
 
-                    with st.expander("🎯 Target & performance comparison", expanded=False):
+                    with st.expander(f"🎯 Target & performance comparison · {this_label}", expanded=False):
                         t_col1, t_col2, t_col3, t_col4 = st.columns(4, gap="small")
 
                         t_col1.metric(
@@ -1227,24 +1574,24 @@ if selected_tab == "Forecast":
                             help="80% threshold of the custom Sale Target.",
                         )
                         t_col4.metric(
-                            f"{prior_year} Full Year Actuals",
+                            f"{prior_label} Full Year Actuals",
                             fmt_str(prior_fy_act),
-                            help=f"Total actual performance across all 12 months of {prior_year}.",
+                            help=f"Total actual performance across all 12 months of {prior_label}.",
                         )
 
+                        category_order = [f"{prior_label} Actuals", f"{this_label} Outlook"]
                         target_df = pd.DataFrame([
                             {
-                                "Category": f"{prior_year} Actuals",
+                                "Category": category_order[0],
                                 "Value": prior_fy_act,
                                 "Label": f"${prior_fy_act:,.0f} ({prior_target_pct:+.1f}% vs Target)"
                             },
                             {
-                                "Category": f"{this_year} Outlook",
+                                "Category": category_order[1],
                                 "Value": fy_act_fc,
                                 "Label": f"${fy_act_fc:,.0f} ({target_pct:+.1f}% vs Target)"
                             },
                         ])
-                        category_order = [f"{prior_year} Actuals", f"{this_year} Outlook"]
 
                         horizontal_bar_chart = (
                             alt.Chart(target_df)
@@ -1254,21 +1601,13 @@ if selected_tab == "Forecast":
                                     "Category:N",
                                     sort=category_order,
                                     title=None,
-                                    axis=alt.Axis(labelFontSize=12, ticks=False, domain=False),
+                                    axis=quiet_axis(labelFontSize=12),
                                 ),
                                 x=alt.X(
                                     "Value:Q",
                                     title=None,
                                     scale=alt.Scale(zero=True),
-                                    axis=alt.Axis(
-                                        format="$~s",
-                                        grid=True,
-                                        gridOpacity=0.35,
-                                        gridDash=[2, 3],
-                                        tickCount=5,
-                                        ticks=False,
-                                        domain=False,
-                                    ),
+                                    axis=value_axis("$~s"),
                                 ),
                                 color=alt.Color(
                                     "Category:N",
@@ -1336,30 +1675,35 @@ if selected_tab == "Forecast":
                             **FULL_WIDTH,
                         )
 
-                with st.expander(f"📈 Performance: {this_year} vs {prior_year}", expanded=False):
+                with st.expander(f"📈 Performance: {this_label} vs {prior_label}", expanded=False):
                     p_col1, p_col2, p_col3, p_col4 = st.columns(4, gap="small")
 
                     p_col1.metric(
-                        f"{this_year} YTD Actuals",
+                        f"{this_label} YTD Actuals",
                         fmt_str(ytd_act),
-                        delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_year}" if pd.notna(py_ytd_diff) else "n/a",
-                        help=f"Actual performance through {last_complete.strftime('%b %Y')} compared to same period in {prior_year}.",
+                        delta=f"{py_ytd_diff:+.0f} ({py_ytd_pct:+.1f}%) vs {prior_label}" if pd.notna(py_ytd_diff) else "n/a",
+                        help=f"Actual performance through {ytd_end_label} compared to same period in {prior_label}.",
                     )
                     p_col2.metric(
-                        f"{prior_year} Same-Period YTD",
+                        f"{prior_label} Same-Period YTD",
                         fmt_str(prior_ytd_act),
-                        help=f"Actuals from Jan {prior_year} through {last_complete.strftime('%b')} {prior_year}.",
+                        help=(
+                            f"Actuals from {prior_ytd_periods[0].strftime('%b %Y')} through "
+                            f"{prior_ytd_periods[-1].strftime('%b %Y')}."
+                            if prior_ytd_periods
+                            else "No completed months yet this year."
+                        ),
                     )
                     p_col3.metric(
-                        f"{this_year} Full Year Outlook",
+                        f"{this_label} Full Year Outlook",
                         fmt_str(fy_act_fc),
-                        delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_year} Total" if pd.notna(py_fy_diff) else "n/a",
-                        help=f"Full year {this_year} projected outlook vs total actual performance in {prior_year}.",
+                        delta=f"{py_fy_diff:+.0f} ({py_fy_pct:+.1f}%) vs {prior_label} Total" if pd.notna(py_fy_diff) else "n/a",
+                        help=f"Full year {this_label} projected outlook vs total actual performance in {prior_label}.",
                     )
                     p_col4.metric(
-                        f"{prior_year} Full Year Actuals",
+                        f"{prior_label} Full Year Actuals",
                         fmt_str(prior_fy_act),
-                        help=f"Total actual performance across all 12 months of {prior_year}.",
+                        help=f"Total actual performance across all 12 months of {prior_label}.",
                     )
 
                 graph_table = (
@@ -1395,7 +1739,6 @@ if selected_tab == "Forecast":
                     formatted_graph_table["Total"] = formatted_graph_table["Total"].apply(
                         lambda x: (f"{x:.1f}%" if metric == "GP%" else (f"${x:,.0f}" if metric in ["Sale", "Cost", "GP $"] else f"{x:,.0f}")) if pd.notna(x) else ""
                     )
-                # Three-letter month headers to match the chart; data unchanged.
                 formatted_graph_table = formatted_graph_table.rename(
                     columns={month: month[:3] for month in month_sort_order}
                 )
@@ -1410,6 +1753,427 @@ if selected_tab == "Forecast":
         except Exception as e:
             st.error(f"Something went wrong while rendering the forecast: {e}")
 
+# =============================================================================
+# Inventory Analysis tab
+# =============================================================================
+elif selected_tab == "Inventory Analysis":
+    prepared_data, source_names = load_prepared_data()
+
+    if prepared_data is None:
+        st.info("Add Inventory_report.xlsx and the sales workbooks under Raw_data to analyse inventory.")
+    else:
+        try:
+            sheets = prepared_data
+            sales_data = sheets["Sales Data"]
+            inventory_raw = sheets["Current Inventory"]
+            options_raw = sheets.get("OptionsData")
+            purchase_orders_raw = sheets.get("Purchase Orders")
+
+            today = pd.Timestamp.today().normalize()
+            current_period = today.to_period("M")
+            last_complete = current_period - 1
+
+            attributes = option_attributes(options_raw)
+            detected = detect_inventory_columns(inventory_raw)
+
+            # Sidebar: product filters, then analysis settings and column mapping.
+            with st.sidebar:
+                st.header("Inventory filters")
+                st.markdown("**Product**")
+                filter_sources = {
+                    "Supplier": [attributes["Supplier"], sales_data.get("OptionsData.Supplier")],
+                    "Class": [attributes["Class"], sales_data.get("OptionsData.Class")],
+                    "Product group": [attributes["Product group"], sales_data.get("OptionsData.Fourth Product Group")],
+                }
+                product_filters: dict[str, list[str]] = {}
+                for label, sources in filter_sources.items():
+                    values = sorted(
+                        {
+                            str(value).strip()
+                            for source in sources
+                            if source is not None
+                            for value in source.dropna()
+                            if str(value).strip() and str(value).strip().lower() != "nan"
+                        },
+                        key=str.casefold,
+                    )
+                    product_filters[label] = st.multiselect(
+                        label, values, default=[], key=f"inventory_filter_{label}"
+                    )
+                description_search = st.text_input(
+                    "SKU or description contains", key="inventory_filter_text"
+                ).strip()
+
+                with st.expander("Inventory settings", expanded=False):
+                    window_months = st.selectbox(
+                        "Sales window (complete months)",
+                        [3, 6, 12],
+                        index=2,
+                        key="inventory_window_months",
+                        help="Movement, days of supply and turns use sales in this many complete months.",
+                    )
+                    dead_days = st.number_input(
+                        "Dead stock: no sale for (days)",
+                        min_value=30, max_value=1095, value=180, step=30,
+                        key="inventory_dead_days",
+                    )
+                    slow_dos = st.number_input(
+                        "Slow moving: days of supply above",
+                        min_value=30, max_value=3650, value=365, step=30,
+                        key="inventory_slow_dos",
+                    )
+                    risk_dos = st.number_input(
+                        "Stock-out risk: days of supply below",
+                        min_value=7, max_value=365, value=60, step=7,
+                        key="inventory_risk_dos",
+                    )
+
+                mapping_needed = detected["sku"] is None or detected["on_hand"] is None
+                with st.expander("Inventory column mapping", expanded=mapping_needed):
+                    st.caption("Detected automatically from the inventory sheet; change if a column is wrong.")
+                    column_options = ["(none)"] + [str(col) for col in inventory_raw.columns]
+                    mapping: dict[str, str | None] = {}
+                    for role, label in INVENTORY_ROLE_LABELS.items():
+                        default = str(detected[role]) if detected[role] is not None else "(none)"
+                        choice = st.selectbox(
+                            label,
+                            column_options,
+                            index=column_options.index(default) if default in column_options else 0,
+                            key=f"inventory_map_{role}",
+                        )
+                        mapping[role] = None if choice == "(none)" else choice
+
+            if not mapping["sku"] or not mapping["on_hand"]:
+                st.warning(
+                    "The SKU and on-hand quantity columns of the inventory sheet could not be identified. "
+                    "Choose them under *Inventory column mapping* in the sidebar."
+                )
+            else:
+                window_end = last_complete
+                window_start = last_complete - (window_months - 1)
+                window_periods = pd.period_range(window_start, window_end, freq="M")
+                window_days = int(sum(period.days_in_month for period in window_periods))
+
+                inventory_sku = inventory_by_sku(inventory_raw, mapping)
+                movement = sku_movement(sales_data, str(window_start), str(window_end))
+                open_po = open_po_by_sku(purchase_orders_raw)
+                master = build_inventory_table(
+                    inventory_sku, movement, attributes, open_po,
+                    window_months, window_days, today, int(dead_days), int(slow_dos), int(risk_dos),
+                )
+
+                filtered = master
+                for label, chosen in product_filters.items():
+                    if chosen:
+                        filtered = filtered.loc[filtered[label].isin(chosen)]
+                if description_search:
+                    text_match = (
+                        filtered["SKU"].str.contains(description_search, case=False, regex=False)
+                        | filtered["Description"].str.contains(description_search, case=False, regex=False)
+                    )
+                    filtered = filtered.loc[text_match]
+                filtered = filtered.reset_index(drop=True)
+
+                # ------------------------------------------------------------
+                # Header row: context + group-by
+                # ------------------------------------------------------------
+                inventory_file = next((name for name in source_names if "inventory" in str(name).lower()), None)
+                snapshot_label = ""
+                if inventory_file and (raw_data_path / inventory_file).exists():
+                    snapshot_label = f" · stock as at {pd.Timestamp((raw_data_path / inventory_file).stat().st_mtime, unit='s'):%d %b %Y}"
+                active = [f"{k}: {', '.join(v)}" for k, v in product_filters.items() if v]
+                if description_search:
+                    active.append(f"text: {description_search}")
+
+                context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
+                with group_col:
+                    group_by = st.selectbox(
+                        "Group by",
+                        ["SKU", "Supplier", "Class", "Product group"],
+                        index=0,
+                        key="inventory_group_by",
+                        label_visibility="collapsed",
+                    )
+                with context_col:
+                    st.caption(
+                        f"Sales window {window_label(window_periods)} ({window_days} days)"
+                        f"{snapshot_label} · {len(filtered):,} SKUs"
+                        + (" · " + " · ".join(active) if active else "")
+                    )
+
+                if filtered.empty:
+                    st.warning("No SKUs match these filters.")
+                else:
+                    # --------------------------------------------------------
+                    # Headline cards
+                    # --------------------------------------------------------
+                    in_stock = filtered.loc[filtered["On hand"] > 0]
+                    total_on_hand = float(filtered["On hand"].sum())
+                    total_units = float(filtered["Units sold"].sum())
+                    dead_units = float(filtered["Dead units"].sum())
+                    slow_units = float(filtered["Slow units"].sum())
+                    status_counts = filtered["Status"].value_counts()
+                    overall_daily_rate = total_units / window_days if window_days else 0.0
+                    overall_dos = total_on_hand / overall_daily_rate if overall_daily_rate > 0 else np.nan
+                    overall_turns = (total_units * 12 / window_months) / total_on_hand if total_on_hand > 0 else np.nan
+                    stock_value = float(filtered["Est. stock value"].sum(skipna=True))
+                    dead_value = float(filtered.loc[filtered["Status"] == "Dead stock", "Est. stock value"].sum(skipna=True))
+                    value_label = "Stock value" if "Stock value" in filtered.columns else "Est. stock value"
+                    value_help = (
+                        "From the inventory sheet's value column."
+                        if "Stock value" in filtered.columns
+                        else "On hand × average unit cost from sales in the window; blank for SKUs with no sales."
+                    )
+
+                    def pct_of_on_hand(units: float) -> str:
+                        return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
+
+                    health_col, movement_col = st.columns([3, 2], gap="small")
+                    with health_col:
+                        metric_card(
+                            "Stock health",
+                            [
+                                dict(
+                                    label="On hand (units)",
+                                    value=f"{total_on_hand:,.0f}",
+                                    help=f"{len(in_stock):,} SKUs with stock · {value_label.lower()} ${stock_value:,.0f}",
+                                ),
+                                dict(
+                                    label="Dead stock",
+                                    value=f"{dead_units:,.0f}",
+                                    delta=pct_of_on_hand(dead_units),
+                                    delta_color="off",
+                                    help=f"{int(status_counts.get('Dead stock', 0))} SKUs with stock and no sale in {int(dead_days)} days · ${dead_value:,.0f} ({value_label.lower()})",
+                                ),
+                                dict(
+                                    label="Slow moving",
+                                    value=f"{slow_units:,.0f}",
+                                    delta=pct_of_on_hand(slow_units),
+                                    delta_color="off",
+                                    help=f"{int(status_counts.get('Slow moving', 0))} SKUs with more than {int(slow_dos)} days of supply.",
+                                ),
+                                dict(
+                                    label="Stock-out risk",
+                                    value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs",
+                                    help=f"Fewer than {int(risk_dos)} days of supply · plus {int(status_counts.get('Out of stock', 0))} SKUs already out of stock with recent sales.",
+                                ),
+                            ],
+                        )
+                    with movement_col:
+                        metric_card(
+                            f"Movement · last {window_months} months",
+                            [
+                                dict(
+                                    label="Units sold",
+                                    value=f"{total_units:,.0f}",
+                                    help=f"{window_label(window_periods)} · avg {total_units / window_months:,.0f} per month",
+                                ),
+                                dict(
+                                    label="Days of supply",
+                                    value=f"{overall_dos:,.0f}" if pd.notna(overall_dos) else "n/a",
+                                    help="Total on hand ÷ average daily units sold in the window.",
+                                ),
+                                dict(
+                                    label="Turns (annualised)",
+                                    value=f"{overall_turns:.1f}×" if pd.notna(overall_turns) else "n/a",
+                                    help="Annualised units sold ÷ units on hand.",
+                                ),
+                            ],
+                        )
+
+                    # --------------------------------------------------------
+                    # Charts
+                    # --------------------------------------------------------
+                    chart_left, chart_right = st.columns(2, gap="small")
+
+                    status_frame = (
+                        filtered.groupby("Status")
+                        .agg(units=("On hand", "sum"), skus=("SKU", "count"), value=("Est. stock value", "sum"))
+                        .reindex(STATUS_ORDER)
+                        .dropna(how="all")
+                        .reset_index()
+                    )
+                    status_frame = status_frame.loc[~status_frame["Status"].isin(["Inactive"])]
+                    present_statuses = [s for s in STATUS_ORDER if s in status_frame["Status"].tolist()]
+                    with chart_left:
+                        st.markdown("<p class='card-title'>On hand by stock status</p>", unsafe_allow_html=True)
+                        status_chart = (
+                            alt.Chart(status_frame)
+                            .mark_bar(size=22)
+                            .encode(
+                                y=alt.Y("Status:N", sort=present_statuses, title=None, axis=quiet_axis(labelFontSize=12)),
+                                x=alt.X("units:Q", title="Units on hand", axis=value_axis("~s")),
+                                color=alt.Color(
+                                    "Status:N",
+                                    scale=alt.Scale(domain=present_statuses, range=[STATUS_COLOURS[s] for s in present_statuses]),
+                                    legend=None,
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("Status:N"),
+                                    alt.Tooltip("units:Q", title="Units on hand", format=",.0f"),
+                                    alt.Tooltip("skus:Q", title="SKUs", format=",.0f"),
+                                    alt.Tooltip("value:Q", title=value_label, format="$,.0f"),
+                                ],
+                            )
+                            .properties(height=max(140, 34 * len(status_frame) + 30))
+                            .configure_view(strokeWidth=0)
+                        )
+                        st.altair_chart(status_chart, **FULL_WIDTH)
+
+                    with chart_right:
+                        st.markdown("<p class='card-title'>Largest dead & slow-moving holdings</p>", unsafe_allow_html=True)
+                        laggards = (
+                            filtered.loc[filtered["Status"].isin(["Dead stock", "Slow moving"]) & (filtered["On hand"] > 0)]
+                            .nlargest(12, "On hand")
+                            .copy()
+                        )
+                        if laggards.empty:
+                            st.caption("No dead or slow-moving stock in this selection.")
+                        else:
+                            laggards["Item"] = laggards.apply(
+                                lambda row: f"{row['SKU']} · {row['Description'][:28]}" if row["Description"] else str(row["SKU"]),
+                                axis=1,
+                            )
+                            laggard_chart = (
+                                alt.Chart(laggards)
+                                .mark_bar(size=16)
+                                .encode(
+                                    y=alt.Y("Item:N", sort="-x", title=None, axis=quiet_axis(labelFontSize=11, labelLimit=220)),
+                                    x=alt.X("On hand:Q", title="Units on hand", axis=value_axis("~s")),
+                                    color=alt.Color(
+                                        "Status:N",
+                                        scale=alt.Scale(domain=["Dead stock", "Slow moving"], range=[STATUS_COLOURS["Dead stock"], STATUS_COLOURS["Slow moving"]]),
+                                        legend=alt.Legend(title=None, orient="top", direction="horizontal", padding=0, offset=4),
+                                    ),
+                                    tooltip=[
+                                        alt.Tooltip("SKU:N"),
+                                        alt.Tooltip("Description:N"),
+                                        alt.Tooltip("Status:N"),
+                                        alt.Tooltip("On hand:Q", format=",.0f"),
+                                        alt.Tooltip("Units sold:Q", title=f"Units sold ({window_months}m)", format=",.0f"),
+                                        alt.Tooltip("Days of supply:Q", format=",.0f"),
+                                        alt.Tooltip("Days since last sale:Q", format=",.0f"),
+                                        alt.Tooltip("Est. stock value:Q", title=value_label, format="$,.0f"),
+                                    ],
+                                )
+                                .properties(height=max(140, 22 * len(laggards) + 40))
+                                .configure_view(strokeWidth=0)
+                            )
+                            st.altair_chart(laggard_chart, **FULL_WIDTH)
+
+                    # --------------------------------------------------------
+                    # Tables (collapsed)
+                    # --------------------------------------------------------
+                    sku_columns = [
+                        "SKU", "Description", "Supplier", "Class", "Product group", "Status",
+                        "On hand", "Free stock", "Units sold", "Avg monthly units", "Days of supply",
+                        "Turns (annualised)", "Last sale", "Days since last sale", "Sales value", "Est. stock value",
+                    ]
+                    if "Open PO qty" in filtered.columns:
+                        sku_columns += ["Open PO qty", "Days of supply incl. POs"]
+                    if "Sites with stock" in filtered.columns:
+                        sku_columns.append("Sites with stock")
+                    sku_columns = [c for c in sku_columns if c in filtered.columns]
+
+                    sku_column_config = {
+                        "On hand": st.column_config.NumberColumn(format="%d"),
+                        "Free stock": st.column_config.NumberColumn(format="%d"),
+                        "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
+                        "Avg monthly units": st.column_config.NumberColumn(format="%.1f"),
+                        "Days of supply": st.column_config.NumberColumn(format="%d", help="Blank when there were no sales in the window."),
+                        "Days of supply incl. POs": st.column_config.NumberColumn(format="%d"),
+                        "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
+                        "Last sale": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                        "Days since last sale": st.column_config.NumberColumn(format="%d"),
+                        "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
+                        "Est. stock value": st.column_config.NumberColumn(value_label, format="$%.0f"),
+                        "Open PO qty": st.column_config.NumberColumn(format="%d"),
+                        "Sites with stock": st.column_config.NumberColumn(format="%d"),
+                    }
+
+                    def show_table(frame: pd.DataFrame, file_name: str, key: str) -> None:
+                        st.dataframe(
+                            frame[sku_columns],
+                            hide_index=True,
+                            column_config=sku_column_config,
+                            height=min(420, int(38 + 35 * len(frame)) + 3),
+                            **FULL_WIDTH,
+                        )
+                        st.download_button(
+                            "Download CSV",
+                            frame[sku_columns].to_csv(index=False).encode("utf-8"),
+                            file_name=file_name,
+                            mime="text/csv",
+                            key=key,
+                        )
+
+                    if group_by != "SKU":
+                        summary = summarise_inventory(filtered, group_by, window_months, window_days)
+                        with st.expander(f"📊 Summary by {group_by.lower()}", expanded=True):
+                            st.dataframe(
+                                summary,
+                                hide_index=True,
+                                column_config={
+                                    "On hand": st.column_config.NumberColumn(format="%d"),
+                                    "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
+                                    "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
+                                    "Dead units": st.column_config.NumberColumn(format="%d"),
+                                    "Slow units": st.column_config.NumberColumn(format="%d"),
+                                    "Dead stock %": st.column_config.NumberColumn(format="%.0f%%"),
+                                    "Days of supply": st.column_config.NumberColumn(format="%d"),
+                                    "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
+                                    "Est. stock value": st.column_config.NumberColumn(value_label, format="$%.0f"),
+                                },
+                                height=min(420, int(38 + 35 * len(summary)) + 3),
+                                **FULL_WIDTH,
+                            )
+                            st.download_button(
+                                "Download CSV",
+                                summary.to_csv(index=False).encode("utf-8"),
+                                file_name=f"inventory_by_{group_by.lower().replace(' ', '_')}.csv",
+                                mime="text/csv",
+                                key="inventory_download_summary",
+                            )
+
+                    laggard_table = filtered.loc[filtered["Status"].isin(["Dead stock", "Slow moving"])].sort_values(
+                        ["Status", "On hand"], ascending=[True, False]
+                    )
+                    with st.expander(
+                        f"🪦 Dead & slow-moving stock · {len(laggard_table):,} SKUs · {float(laggard_table['On hand'].sum()):,.0f} units",
+                        expanded=False,
+                    ):
+                        if laggard_table.empty:
+                            st.caption("Nothing to show.")
+                        else:
+                            show_table(laggard_table, "dead_and_slow_stock.csv", "inventory_download_laggards")
+
+                    risk_table = filtered.loc[filtered["Status"].isin(["Stock-out risk", "Out of stock"])].sort_values(
+                        ["Days of supply", "Units sold"], ascending=[True, False], na_position="first"
+                    )
+                    with st.expander(
+                        f"⚠️ Stock-out risk · {len(risk_table):,} SKUs", expanded=False
+                    ):
+                        if risk_table.empty:
+                            st.caption("Nothing to show.")
+                        else:
+                            show_table(risk_table, "stock_out_risk.csv", "inventory_download_risk")
+
+                    with st.expander(f"📋 All SKUs · {len(filtered):,}", expanded=False):
+                        show_table(filtered, "inventory_analysis.csv", "inventory_download_all")
+
+                    st.caption(
+                        "Days of supply = units on hand ÷ average daily units sold in the window · "
+                        "Turns = annualised units sold ÷ units on hand · "
+                        f"Dead stock = stock on hand with no sale for {int(dead_days)}+ days · "
+                        f"Slow moving = more than {int(slow_dos)} days of supply · "
+                        f"Stock-out risk = fewer than {int(risk_dos)} days of supply."
+                    )
+        except Exception as e:
+            st.error(f"Something went wrong while rendering the inventory analysis: {e}")
+
+# =============================================================================
+# Options Data tab
+# =============================================================================
 elif selected_tab == "Options Data":
     try:
         df_options = load_csv(str(csv_path))
@@ -1447,13 +2211,11 @@ elif selected_tab == "Options Data":
     except Exception as e:
         st.error(f"Something went wrong while loading the data: {e}")
 
+# =============================================================================
+# Formatted Data tab
+# =============================================================================
 elif selected_tab == "Formatted Data":
-    try:
-        prepared_data, source_names = load_raw_folder_data(
-            str(raw_data_path), raw_folder_manifest(raw_data_path)
-        )
-    except Exception as e:
-        st.error(f"Could not load files from Raw_data: {e}")
+    prepared_data, source_names = load_prepared_data()
 
     if prepared_data is None:
         st.info("Add required source files under Raw_data to view formatted tables.")
