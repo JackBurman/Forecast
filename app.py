@@ -69,6 +69,10 @@ podash_folder_path = raw_data_path / "PODash"
 # Data loading and cleaning
 # =============================================================================
 
+def normalise_header(text) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
 @st.cache_data
 def load_csv(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(
@@ -338,18 +342,33 @@ def load_raw_folder_data(
             except Exception as e:
                 st.warning(f"Could not load inventory file {latest_inv.name}: {e}")
 
-    # Automatically load the newest file inside PODash/ (.csv, .xls, or .xlsx)
+    # Automatically load the newest file inside PODash/ (.csv, .xls, or .xlsx) and normalise columns
     if podash_folder_path.exists():
         po_files = [p for p in podash_folder_path.rglob("*") if p.is_file() and p.suffix.lower() in {".csv", ".xls", ".xlsx"}]
         if po_files:
             latest_po = max(po_files, key=lambda p: p.stat().st_mtime)
             try:
                 if latest_po.suffix.lower() == ".csv":
-                    sources["Purchase Orders"] = pd.read_csv(latest_po)
+                    po_df = pd.read_csv(latest_po)
                 elif latest_po.suffix.lower() == ".xls":
-                    sources["Purchase Orders"] = pd.read_excel(latest_po, engine="xlrd")
+                    po_df = pd.read_excel(latest_po, engine="xlrd")
                 else:
-                    sources["Purchase Orders"] = pd.read_excel(latest_po)
+                    po_df = pd.read_excel(latest_po)
+                
+                # Standardise header names so forecast_engine finds what it needs regardless of naming
+                po_df.columns = [str(col).strip() for col in po_df.columns]
+                col_rename = {}
+                for col in po_df.columns:
+                    norm = normalise_header(col)
+                    if norm in ["sku", "stock code", "stockcode", "product code", "item code", "item number", "code", "item"]:
+                        col_rename[col] = "Product Code"
+                    elif norm in ["open po qty", "po qty", "quantity", "qty", "open qty", "outstanding qty"]:
+                        col_rename[col] = "Open PO Qty"
+                    elif norm in ["date", "po date", "order date", "due date"]:
+                        col_rename[col] = "Date"
+                po_df = po_df.rename(columns=col_rename)
+                
+                sources["Purchase Orders"] = po_df
                 source_names.append(str(latest_po.relative_to(base_dir)))
             except Exception as e:
                 st.warning(f"Could not load PO file {latest_po.name}: {e}")
@@ -365,7 +384,7 @@ def load_raw_folder_data(
 
 
 # =============================================================================
-# Forecast math (unchanged)
+# Forecast math
 # =============================================================================
 
 SEASON = 12
@@ -657,10 +676,6 @@ STATUS_COLOURS = {
 }
 
 
-def normalise_header(text) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
-
-
 def detect_column(columns, candidates: list[str], exclude: tuple = ()) -> str | None:
     normalised = {col: normalise_header(col) for col in columns if col not in exclude}
     for candidate in candidates:
@@ -776,13 +791,14 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
-    if purchase_orders is None or purchase_orders.empty or "Open PO Qty" not in purchase_orders.columns:
+    if purchase_orders is None or purchase_orders.empty:
         return pd.Series(dtype=float)
     sku_col = detect_column(purchase_orders.columns, INVENTORY_COLUMN_CANDIDATES["sku"])
-    if sku_col is None:
+    po_qty_col = detect_column(purchase_orders.columns, ["open po qty", "po qty", "quantity", "qty", "open qty"])
+    if sku_col is None or po_qty_col is None:
         return pd.Series(dtype=float)
     keyed = pd.DataFrame(
-        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders["Open PO Qty"]).fillna(0.0)}
+        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders[po_qty_col]).fillna(0.0)}
     )
     return keyed.loc[keyed["SKU"].ne("")].groupby("SKU")["Open PO qty"].sum()
 
