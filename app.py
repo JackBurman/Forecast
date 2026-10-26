@@ -335,7 +335,7 @@ def load_raw_folder_data(
         if inv_files:
             latest_inv = max(inv_files, key=lambda p: p.stat().st_mtime)
             try:
-                inv_df = pd.read_csv(latest_inv)
+                inv_df = pd.read_csv(latest_inv, skiprows=1)
                 
                 # Standardise header names so forecast_engine finds "Stock Code" / "Product Code"
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
@@ -673,7 +673,7 @@ def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFram
 
 INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "sku": ["sku", "sku key", "stock code", "stockcode", "item code", "item number", "product code", "item", "code"],
-    "on_hand": ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "on hand qty", "qoh", "in stock", "stock qty", "stock", "quantity", "qty"],
+    "on_hand": ["on hand", "onhand", "qty on hand", "quantity on hand", "stock on hand", "soh", "qoh", "in stock", "stock qty", "stock", "quantity", "qty"],
     "free": ["free", "free stock", "free qty", "qty free", "available", "available qty", "qty available", "unallocated"],
     "site": ["site", "location", "warehouse", "branch", "store", "showroom"],
     "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
