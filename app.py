@@ -17,7 +17,7 @@ st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+        .block-container { padding-top: 1.6rem; padding-bottom: 1rem; }
         [data-testid="stVerticalBlock"] { gap: 0.6rem; }
         [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
         h1 { font-size: 1.8rem !important; padding-top: 0.2rem !important; padding-bottom: 0.2rem !important; }
