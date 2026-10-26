@@ -6,34 +6,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Monkey-patch pandas.read_excel to safely handle header offset issues and empty/single-line preview sheets
-_orig_read_excel = pd.read_excel
-
-
-def _patched_read_excel(*args, **kwargs):
-  if "engine" not in kwargs:
-    kwargs["engine"] = "openpyxl"
-  try:
-    return _orig_read_excel(*args, **kwargs)
-  except Exception as e:
-    err_str = str(e)
-    if "Passed header" in err_str or "lines in file" in err_str:
-      # If header skipping fails due to a short/single-line file/preview, fallback to header=0 or None
-      kwargs.pop("skiprows", None)
-      kwargs["header"] = 0
-      try:
-        return _orig_read_excel(*args, **kwargs)
-      except Exception:
-        kwargs["header"] = None
-        return _orig_read_excel(*args, **kwargs)
-    if "python-calamine" in err_str or "calamine" in err_str.lower():
-      kwargs["engine"] = "openpyxl"
-      return _orig_read_excel(*args, **kwargs)
-    raise e
-
-
-pd.read_excel = _patched_read_excel
-
 import forecast_engine  # type: ignore
 from inventory_charts import stock_health_breakdown, stock_health_by_group
 
@@ -384,6 +356,130 @@ def newest_file(folder: Path) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
+# -----------------------------------------------------------------------------
+# Workbook reading by content, not by extension
+#
+# ERP exports are often not what their extension says: a ".xlsx" that is a
+# legacy BIFF ".xls", an "Excel" file that is really an HTML table, a CSV with
+# a .xls name, or - on Streamlit Community Cloud - a Git LFS pointer instead of
+# the workbook. Reading by extension (or forcing one engine) fails on these
+# with messages like "File is not a zip file". The first bytes of the file say
+# what it really is, so the reader below sniffs them and picks the right
+# parser, and the loader checks every workbook up front so a bad file is named
+# rather than surfacing as a cryptic error from inside forecast_engine.
+# -----------------------------------------------------------------------------
+
+ZIP_MAGIC = b"PK\x03\x04"
+BIFF_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+LFS_MAGIC = b"version https://git-lfs"
+WORKBOOK_PROBLEMS = {
+    "empty": "the file is empty (0 bytes)",
+    "lfs-pointer": (
+        "the file is a Git LFS pointer, not the workbook itself. Streamlit Community Cloud does not fetch "
+        "LFS objects: commit the real file (git lfs untrack <file>; git add --renormalize <file>) "
+        "or load the data from external storage"
+    ),
+    "unknown": "the file is not a recognisable workbook (neither an .xlsx package nor a legacy .xls)",
+    "xls-no-xlrd": "the file is a legacy .xls workbook and the 'xlrd' package is not installed; add xlrd to requirements.txt",
+}
+
+
+def sniff_workbook(path: Path) -> str:
+    """What a spreadsheet file really contains: xlsx, xls, html, csv, lfs-pointer, empty or unknown."""
+    if path.stat().st_size == 0:
+        return "empty"
+    with open(path, "rb") as handle:
+        head = handle.read(512)
+    if head.startswith(ZIP_MAGIC):
+        return "xlsx"
+    if head.startswith(BIFF_MAGIC):
+        return "xls"
+    if head.startswith(LFS_MAGIC):
+        return "lfs-pointer"
+    if head.lstrip()[:1] == b"<":
+        return "html"
+    try:
+        head.decode("utf-8")
+        return "csv"
+    except UnicodeDecodeError:
+        return "unknown"
+
+
+def xlrd_available() -> bool:
+    try:
+        import xlrd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def workbook_problem(path: Path) -> str | None:
+    """A sentence describing why the file cannot be read, or None when it can."""
+    kind = sniff_workbook(path)
+    if kind == "xls" and not xlrd_available():
+        kind = "xls-no-xlrd"
+    return WORKBOOK_PROBLEMS.get(kind)
+
+
+_pandas_read_excel = pd.read_excel
+
+
+def read_workbook(path: Path, *args, **kwargs) -> pd.DataFrame:
+    """pd.read_excel that chooses the parser from the file's content."""
+    kind = sniff_workbook(path)
+    if kind == "xlsx":
+        return _pandas_read_excel(path, *args, engine="openpyxl", **kwargs)
+    if kind == "xls":
+        if not xlrd_available():
+            raise ImportError(f"Cannot read '{path.name}': {WORKBOOK_PROBLEMS['xls-no-xlrd']}")
+        return _pandas_read_excel(path, *args, engine="xlrd", **kwargs)
+    if kind == "html":
+        tables = pd.read_html(path, header=kwargs.get("header", 0))
+        if not tables:
+            raise ValueError(f"Cannot read '{path.name}': the HTML export contains no table")
+        frame = tables[0]
+        skiprows = kwargs.get("skiprows")
+        if isinstance(skiprows, int) and skiprows > 0:
+            frame = frame.iloc[skiprows:].reset_index(drop=True)
+        return frame.head(kwargs["nrows"]) if kwargs.get("nrows") else frame
+    if kind == "csv":
+        return pd.read_csv(
+            path, header=kwargs.get("header", 0), skiprows=kwargs.get("skiprows"), nrows=kwargs.get("nrows"),
+            encoding="utf-8-sig", encoding_errors="replace", low_memory=False,
+        )
+    raise ValueError(f"Cannot read '{path.name}': {WORKBOOK_PROBLEMS[kind]}")
+
+
+def _read_excel_by_content(io, *args, **kwargs):
+    """Route file-path reads through read_workbook; anything else goes to pandas untouched.
+
+    forecast_engine reads the Raw_data workbooks with pd.read_excel, so this is
+    the one place its reads can be made content-aware without editing it. An
+    explicit engine= argument is always respected.
+    """
+    if "engine" not in kwargs and isinstance(io, (str, Path)):
+        path = Path(io)
+        if path.is_file() and path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
+            return read_workbook(path, *args, **kwargs)
+    return _pandas_read_excel(io, *args, **kwargs)
+
+
+pd.read_excel = _read_excel_by_content
+
+
+def workbook_problems(folder: Path) -> list[str]:
+    """Every .xls/.xlsx under the folder that cannot be read, with the reason."""
+    problems = []
+    if not folder.exists():
+        return problems
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
+            problem = workbook_problem(path)
+            if problem:
+                problems.append(f"{path.relative_to(folder)} — {problem}")
+    return problems
+
+
 def detect_header_row(preview: pd.DataFrame) -> int:
     """Row index of the header in an export that may start with title lines.
 
@@ -407,6 +503,8 @@ def detect_header_row(preview: pd.DataFrame) -> int:
 def read_tabular(path: Path) -> pd.DataFrame:
     """Read a CSV / Excel export, skipping any title rows above the header."""
     if path.suffix.lower() == ".csv":
+        # Title lines above the header have fewer fields than the data, which
+        # trips the default parser; read the preview as ragged rows instead.
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             lines = [handle.readline() for _ in range(20)]
         ragged = [line.rstrip("\r\n").split(",") for line in lines if line.strip()]
@@ -415,16 +513,13 @@ def read_tabular(path: Path) -> pd.DataFrame:
         header_row = detect_header_row(preview)
         frame = pd.read_csv(path, skiprows=header_row, encoding="utf-8-sig", encoding_errors="replace", low_memory=False)
     else:
+        preview = read_workbook(path, header=None, nrows=20)
+        header_row = detect_header_row(preview)
         try:
-            preview = pd.read_excel(path, header=None, nrows=20)
-        except Exception:
-            preview = pd.DataFrame()
-        header_row = detect_header_row(preview) if not preview.empty else 0
-        try:
-            frame = pd.read_excel(path, skiprows=header_row)
-        except Exception:
-            # Fallback if rows/headers are sparse or short
-            frame = pd.read_excel(path, header=0)
+            frame = read_workbook(path, skiprows=header_row)
+        except ValueError:
+            # Sheet shorter than the detected offset (e.g. a one-line export).
+            frame = read_workbook(path, header=0)
     frame.columns = [str(col).strip() for col in frame.columns]
     return frame.dropna(how="all").reset_index(drop=True)
 
@@ -473,11 +568,15 @@ def standardise_purchase_orders(frame: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def write_engine_placeholders() -> list[Path]:
-    """Create zero-row workbooks the engine's reader expects; returns what was created."""
+    """Create zero-row workbooks the engine's reader expects; returns what was created.
+
+    A zero-byte file of the same name (left behind by an earlier version of the
+    loader, or created with `touch`) is not a workbook and is replaced too.
+    """
     created = []
     for name, columns in ENGINE_PLACEHOLDERS.items():
         path = raw_data_path / name
-        if not path.exists():
+        if not path.exists() or path.stat().st_size == 0:
             pd.DataFrame(columns=columns).to_excel(path, index=False)
             created.append(path)
     return created
@@ -529,7 +628,15 @@ def load_raw_folder_data(
 
     placeholders = write_engine_placeholders()
     try:
+        problems = workbook_problems(raw_data_path)
+        if problems:
+            raise RuntimeError(
+                "These spreadsheet files under Raw_data cannot be read:\n\n"
+                + "\n".join(f"- {problem}" for problem in problems)
+            )
         sources, source_names = forecast_engine.read_raw_data_folder(folder)
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"forecast_engine.read_raw_data_folder failed for '{folder}': {e}") from e
     finally:
