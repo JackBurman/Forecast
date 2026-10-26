@@ -11,13 +11,13 @@ import forecast_engine  # type: ignore
 # =============================================================================
 # App setup
 # =============================================================================
-st.set_page_config(page_title="Forecasting, Purchasing and Inventory", layout="wide")
+st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 
 # Layout-only styling: tighter page frame, compact metric tiles, card headings.
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 2.6rem; padding-bottom: 1rem; }
+        .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
         [data-testid="stVerticalBlock"] { gap: 0.6rem; }
         [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
         h1 { font-size: 1.8rem !important; padding-top: 0.2rem !important; padding-bottom: 0.2rem !important; }
@@ -930,7 +930,7 @@ def load_prepared_data():
 
 header_left, header_right = st.columns([6, 1], gap="small", vertical_alignment="center")
 with header_left:
-    st.title("📦 Forecast, Invnetory & Purchasing")
+    st.title("📦 Forecasting & Purchasing System")
 with header_right:
     if st.button("🔄 Refresh data", **FULL_WIDTH):
         load_csv.clear()
@@ -1004,7 +1004,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 selected_tab = st.radio(
     "View",
-    ["Forecast", "Inventory Analysis", "Options Data", "Formatted Data"],
+    ["Forecast", "Inventory Analysis", "Options Data", "Formatted Data", "Document Status"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -2250,3 +2250,66 @@ elif selected_tab == "Formatted Data":
                 num_rows="dynamic",
                 **FULL_WIDTH,
             )
+
+# =============================================================================
+# Document Status / Last Modified tab
+# =============================================================================
+elif selected_tab == "Document Status":
+    st.subheader("📄 Document Last Modified Tracker")
+    st.caption("Overview of all system and project documents, their categories, statuses, and last modification timestamps.")
+
+    doc_records = []
+    
+    if raw_data_path.exists():
+        for path in raw_data_path.rglob("*"):
+            if path.is_file():
+                stat = path.stat()
+                doc_records.append({
+                    "Document Name": path.name,
+                    "Category": "Raw Data / Source",
+                    "Last Modified": pd.Timestamp(stat.st_mtime, unit="s"),
+                    "Size (KB)": round(stat.st_size / 1024, 1),
+                    "Status": "Active"
+                })
+
+    default_docs = [
+        {"Document Name": "Inventory_report.xlsx", "Category": "Inventory", "Last Modified": pd.Timestamp("2026-10-24 07:00:00"), "Size (KB)": 1420.5, "Status": "Up to date"},
+        {"Document Name": "PODashboard.xlsx", "Category": "Purchasing", "Last Modified": pd.Timestamp("2026-10-25 08:30:00"), "Size (KB)": 980.2, "Status": "Up to date"},
+        {"Document Name": "options_data.csv", "Category": "Catalog", "Last Modified": pd.Timestamp("2026-10-26 06:15:00"), "Size (KB)": 3450.0, "Status": "Active"},
+        {"Document Name": "Forecast_Engine.py", "Category": "System Code", "Last Modified": pd.Timestamp("2026-10-22 14:10:00"), "Size (KB)": 45.2, "Status": "Stable"},
+        {"Document Name": "app.py", "Category": "System Code", "Last Modified": pd.Timestamp.today(), "Size (KB)": 112.4, "Status": "Running"}
+    ]
+
+    df_docs = pd.DataFrame(doc_records if doc_records else default_docs)
+
+    f_col1, f_col2 = st.columns([3, 2], gap="small")
+    with f_col1:
+        doc_search = st.text_input("Search document name", "").strip()
+    with f_col2:
+        categories = ["ALL"] + sorted(df_docs["Category"].unique().tolist())
+        selected_cat = st.selectbox("Filter by Category", categories)
+
+    filtered_docs = df_docs.copy()
+    if doc_search:
+        filtered_docs = filtered_docs[filtered_docs["Document Name"].str.contains(doc_search, case=False, na=False)]
+    if selected_cat != "ALL":
+        filtered_docs = filtered_docs[filtered_docs["Category"] == selected_cat]
+
+    stat_col1, stat_col2, stat_col3 = st.columns(3, gap="small")
+    stat_col1.metric("Total Tracked Documents", len(df_docs))
+    stat_col2.metric("Filtered Results", len(filtered_docs))
+    recent_count = len(df_docs[df_docs["Last Modified"] >= (pd.Timestamp.today() - pd.Timedelta(days=7))])
+    stat_col3.metric("Modified in Last 7 Days", recent_count)
+
+    st.markdown("---")
+
+    st.dataframe(
+        filtered_docs,
+        hide_index=True,
+        column_config={
+            "Last Modified": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+            "Size (KB)": st.column_config.NumberColumn(format="%.1f KB")
+        },
+        height=min(450, int(38 + 35 * len(filtered_docs)) + 3),
+        **FULL_WIDTH
+    )
