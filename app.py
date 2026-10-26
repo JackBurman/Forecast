@@ -38,7 +38,7 @@ st.markdown(
 
 def _streamlit_version() -> tuple[int, ...]:
     parts: list[int] = []
-    for piece in st.session_state.get("__version__", st.session_state.get("__version__", st.__version__)).split(".")[:3]:
+    for piece in st.session_state.get("__version__", st.session_state.get("__version__", __import__("streamlit").__version__)).split(".")[:3]:
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
     return tuple(parts)
@@ -1867,9 +1867,17 @@ elif selected_tab == "Inventory Analysis":
                     if chosen:
                         filtered = filtered.loc[filtered[label].isin(chosen)]
                 if description_search:
+                    search_pattern = description_search
+                    is_regex = False
+                    
+                    if search_pattern.endswith("*"):
+                        prefix = re.escape(search_pattern[:-1])
+                        search_pattern = f"^{prefix}"
+                        is_regex = True
+
                     text_match = (
-                        filtered["SKU"].str.contains(description_search, case=False, regex=False)
-                        | filtered["Description"].str.contains(description_search, case=False, regex=False)
+                        filtered["SKU"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
+                        | filtered["Description"].str.contains(search_pattern, case=False, regex=is_regex, na=False)
                     )
                     filtered = filtered.loc[text_match]
                 filtered = filtered.reset_index(drop=True)
