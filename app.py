@@ -18,10 +18,10 @@ st.set_page_config(page_title="Forecasting & Purchasing System", layout="wide")
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 4.2rem; padding-bottom: 1rem; }
+        .block-container { padding-top: 3.2rem; padding-bottom: 1rem; }
         [data-testid="stVerticalBlock"] { gap: 0.6rem; }
         [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
-        h1 { font-size: 1.8rem !important; padding-top: 0.2rem !important; padding-bottom: 0.2rem !important; }
+        h1 { font-size: 1.8rem !important; padding-top: -1.2rem !important; padding-bottom: 0.2rem !important; }
         h2, h3 { padding-top: 0.3rem !important; padding-bottom: 0.2rem !important; }
         [data-testid="stMetric"] { padding: 0.1rem 0; }
         [data-testid="stMetricLabel"] p { font-size: 0.78rem; line-height: 1.2; white-space: normal; }
