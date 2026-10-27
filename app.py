@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import json
 import re
@@ -160,24 +161,36 @@ def to_number(series: pd.Series) -> pd.Series:
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
-    """Parse a column that may mix Excel serials, real datetimes and day-first text."""
-    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    """Parse a column that may mix Excel serials, real datetimes and day-first text.
 
-    is_serial = series.map(
-        lambda value: (pd.api.types.is_integer(value) or pd.api.types.is_float(value))
-        and pd.notna(value)
-    ).astype(bool)
+    Already-datetime columns pass straight through. Text is parsed with pandas'
+    vectorised single-format path first; only the values that fail fall back to
+    the slow per-element mixed-format parser.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if series.empty:
+        return result
+
+    kinds = series.map(type)
+    is_serial = series.notna() & kinds.isin([int, float, np.int64, np.float64, np.int32, np.float32]) & ~kinds.eq(bool)
     if is_serial.any():
         days = series[is_serial].astype(float).astype(int)
-        result.loc[is_serial] = pd.to_datetime("1899-12-30") + pd.to_timedelta(
-            days, unit="D"
-        )
+        result.loc[is_serial] = pd.to_datetime("1899-12-30") + pd.to_timedelta(days, unit="D")
 
-    is_text = ~is_serial & series.notna()
+    is_stamp = series.notna() & kinds.isin([pd.Timestamp, datetime, np.datetime64])
+    if is_stamp.any():
+        result.loc[is_stamp] = pd.to_datetime(series[is_stamp], errors="coerce")
+
+    is_text = series.notna() & ~is_serial & ~is_stamp
     if is_text.any():
-        result.loc[is_text] = pd.to_datetime(
-            series[is_text], dayfirst=True, errors="coerce", format="mixed"
-        )
+        text = series[is_text].astype(str).str.strip()
+        fast = pd.to_datetime(text, dayfirst=True, errors="coerce")
+        missing = fast.isna() & text.ne("")
+        if missing.any():
+            fast.loc[missing] = pd.to_datetime(text[missing], dayfirst=True, errors="coerce", format="mixed")
+        result.loc[is_text] = fast
 
     return result
 
@@ -200,7 +213,56 @@ def sku_text(value) -> str:
     return "" if pd.isna(normalised) else str(normalised)
 
 
-@st.cache_data
+def map_unique(series: pd.Series, func) -> pd.Series:
+    """Apply a Python function once per distinct value instead of once per row.
+
+    Exports have thousands of rows but far fewer distinct codes, so this turns
+    a 200k-call loop into a few-thousand-call loop.
+    """
+    uniques = series.unique()
+    lookup = {value: func(value) for value in uniques}
+    return series.map(lookup)
+
+
+# -----------------------------------------------------------------------------
+# Cache keys for big frames
+#
+# st.cache_data hashes every DataFrame argument by content on every call, which
+# for a 200k-row sales sheet costs more than the cached work. The loader tags
+# each sheet with a token derived from the files it was built from; cached
+# functions hash that token (plus the shape, so a filtered copy never collides)
+# and fall back to a content hash for untagged frames.
+# -----------------------------------------------------------------------------
+
+def frame_cache_key(frame: pd.DataFrame):
+    token = frame.attrs.get("cache_token")
+    if token is not None:
+        return (token, frame.shape)
+    return pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()
+
+
+BY_TOKEN = {"hash_funcs": {pd.DataFrame: frame_cache_key, pd.Series: lambda s: frame_cache_key(s.to_frame())}}
+
+
+def tag_frames(sheets: dict, token: str) -> dict:
+    for name, frame in sheets.items():
+        if isinstance(frame, pd.DataFrame):
+            frame.attrs["cache_token"] = f"{token}:{name}"
+    return sheets
+
+
+@st.cache_data(show_spinner=False, max_entries=64, **BY_TOKEN)
+def column_choices(frame: pd.DataFrame, column: str) -> list[str]:
+    """Sorted distinct non-blank values of a column, computed from the distinct values only."""
+    if column not in frame.columns:
+        return []
+    values = frame[column].dropna().unique()
+    cleaned = {str(value).strip() for value in values}
+    cleaned.discard("")
+    cleaned.discard("nan")
+    return sorted(cleaned, key=str.casefold)
+
+
 def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.DataFrame:
     """Apply the Power Query-style transformation to the merged sales exports."""
     sales = df_sales.copy()
@@ -242,7 +304,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     else:
         sales["Location"] = sales["Location"].ffill()
 
-    sales["SKU"] = sales["Stock Code"].map(normalize_sku)
+    sales["SKU"] = map_unique(sales["Stock Code"], normalize_sku)
 
     grand_total_mask = sales["Date"].astype(str).str.upper().str.contains(
         "GRAND TOTAL", na=False
@@ -256,7 +318,7 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
     # Enrich sales rows with product metadata.
     options_lookup = df_options.copy()
-    options_lookup["SKU"] = options_lookup["Stock Code"].map(normalize_sku)
+    options_lookup["SKU"] = map_unique(options_lookup["Stock Code"], normalize_sku)
     options_lookup = options_lookup[
         ["SKU", "Supplier", "Class", "Fourth Product Group"]
     ].drop_duplicates(subset=["SKU"])
@@ -335,6 +397,10 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     if "SKU" in sales.columns:
         sales["SKU"] = sales["SKU"].astype("string")
     sales = sales.sort_values("Date", ascending=False).reset_index(drop=True)
+    # A handful of distinct values repeated over every row: store once each.
+    for column in ["City", "Sales Channel", "Sales Channel Net", "Location", "Month"]:
+        if column in sales.columns:
+            sales[column] = sales[column].astype("category")
     return sales
 
 
@@ -747,7 +813,7 @@ def load_raw_folder_data(
             f"Purchase orders — {column_summary(forecast_inputs['Purchase Orders'])}."
         )
 
-    # Loan / transfer document lines: newest file under Raw_data/Loan. Not an
+    # Loan / transfer document lines: newest file under Raw_data/loan. Not an
     # engine input, so it rides alongside the engine's sheets.
     loan_file = newest_file(loan_folder_path)
     if loan_file is not None:
@@ -759,7 +825,8 @@ def load_raw_folder_data(
             notes.append(f"Could not read the loan file '{loan_file.name}': {e}")
     else:
         sheets["Loans"] = pd.DataFrame()
-    return sheets, source_names, notes
+    token = f"{len(manifest)}:{hash(manifest) & 0xFFFFFFFFFFFF:x}"
+    return tag_frames(sheets, token), source_names, notes
 
 
 def load_prepared_data():
@@ -855,10 +922,6 @@ def local_yearly_monthly_profile(sales: pd.DataFrame, _forecast, metric: str, st
     profile.columns.name = None
     profile.index.name = "Month"
     return profile.reset_index()
-
-
-def column_or_empty(frame: pd.DataFrame, name: str) -> pd.Series:
-    return frame[name] if name in frame.columns else pd.Series(pd.NA, index=frame.index, dtype="string")
 
 
 # =============================================================================
@@ -1305,7 +1368,7 @@ def units_by_site(inventory: pd.DataFrame, mapping: dict) -> pd.Series:
     """Units on hand per site code across the whole export (all SKUs)."""
     if not mapping.get("site") or not mapping.get("on_hand"):
         return pd.Series(dtype=float)
-    codes = inventory[mapping["site"]].map(normalise_site_code)
+    codes = map_unique(inventory[mapping["site"]], normalise_site_code)
     units = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     return units.groupby(codes).sum()
 
@@ -1317,11 +1380,12 @@ def company_wide_totals(inventory: pd.DataFrame, mapping: dict, site_mapping: di
     has one and the SKU's resolved average option cost otherwise. Allocated
     units are on hand minus free (stock committed to sales orders).
     """
-    frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
+    frame = pd.DataFrame({"SKU": map_unique(inventory[mapping["sku"]], sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free"] = to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
     if mapping.get("site"):
-        frame["Category"] = inventory[mapping["site"]].map(normalise_site_code).map(lambda code: category_for(code, site_mapping))
+        sites = map_unique(inventory[mapping["site"]], normalise_site_code)
+        frame["Category"] = map_unique(sites, lambda code: category_for(code, site_mapping))
     else:
         frame["Category"] = "Warehouse"
     row_cost = to_number(inventory[mapping["cost"]]) if mapping.get("cost") else pd.Series(np.nan, index=frame.index)
@@ -1435,12 +1499,12 @@ def classify_loan_lines(
         values = loans[col].astype(str).str.strip()
         return values.where(loans[col].notna() & ~values.str.lower().isin(["", "nan", "none", "null"]), "")
 
-    frame = pd.DataFrame({"SKU": loans[mapping["sku"]].map(sku_text)})
+    frame = pd.DataFrame({"SKU": map_unique(loans[mapping["sku"]], sku_text)})
     frame["Customer"] = text("customer")
     frame["Description"] = text("description")
     frame["Document"] = text("document")
-    frame["From site"] = text("from_site").map(normalise_site_code)
-    frame["To site"] = text("to_site").map(normalise_site_code)
+    frame["From site"] = map_unique(text("from_site"), normalise_site_code)
+    frame["To site"] = map_unique(text("to_site"), normalise_site_code)
     frame["Qty"] = to_number(loans[mapping["qty"]]).fillna(0.0)
     if mapping.get("returned_qty"):
         frame["Qty"] = (frame["Qty"] - to_number(loans[mapping["returned_qty"]]).fillna(0.0)).clip(lower=0.0)
@@ -1450,7 +1514,7 @@ def classify_loan_lines(
     closed = status.map(lambda value: any(word in value for word in CLOSED_STATUS_WORDS))
     frame = frame.loc[frame["SKU"].ne("") & (frame["Qty"] > 0) & ~closed].copy()
 
-    frame["From category"] = frame["From site"].map(lambda code: category_for(code, site_mapping) if code else "")
+    frame["From category"] = map_unique(frame["From site"], lambda code: category_for(code, site_mapping) if code else "")
     is_loan = frame["Customer"].ne("") | frame["From category"].eq("Loan")
     frame["Type"] = np.where(is_loan, "Loan", "Transfer")
     frame["Days out"] = (today - pd.to_datetime(frame["Date"], errors="coerce")).dt.days
@@ -1525,7 +1589,7 @@ def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max:
     return alt.layer(ring, track, fill, marker, headline, subline, status).properties(height=196).configure_view(strokeWidth=0)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=16, **BY_TOKEN)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict) -> pd.DataFrame:
     """One row per SKU: available-to-sell stock (Warehouse + Clearance sites) plus context.
 
@@ -1533,14 +1597,14 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     Showroom units, Ignored units, Unmapped units, Sites with stock, and when
     the export has a cost column, Inventory unit cost (weighted by units on hand).
     """
-    frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
+    frame = pd.DataFrame({"SKU": map_unique(inventory[mapping["sku"]], sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
         to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
     )
     if mapping.get("site"):
-        frame["Site"] = inventory[mapping["site"]].map(normalise_site_code)
-        frame["Category"] = frame["Site"].map(lambda code: category_for(code, site_mapping))
+        frame["Site"] = map_unique(inventory[mapping["site"]], normalise_site_code)
+        frame["Category"] = map_unique(frame["Site"], lambda code: category_for(code, site_mapping))
     else:
         # Without a site column nothing can be excluded; treat every row as sellable.
         frame["Site"] = ""
@@ -1585,12 +1649,12 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     return out.reset_index()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=16, **BY_TOKEN)
 def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
     """Per-SKU sales inside the window plus lifetime first/last sale dates."""
     dated = sales.dropna(subset=["Date"]).copy()
     key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
-    dated["SKU"] = dated[key_column].map(sku_text)
+    dated["SKU"] = map_unique(dated[key_column], sku_text)
     dated = dated.loc[dated["SKU"].ne("")]
     if dated.empty:
         return pd.DataFrame(columns=["SKU", "Units sold", "Sales value", "COGS", "Months with sales", "Last sale", "First sale"])
@@ -1623,6 +1687,7 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
     return window.join(history, how="outer").join(attributes, how="left").reset_index()
 
 
+@st.cache_data(show_spinner=False, max_entries=4, **BY_TOKEN)
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
     empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group", "Option unit cost"])
@@ -1631,7 +1696,7 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
     if sku_col is None:
         return empty
-    frame = pd.DataFrame({"SKU": options[sku_col].map(sku_text)})
+    frame = pd.DataFrame({"SKU": map_unique(options[sku_col], sku_text)})
     for role, candidates in {
         "Description": INVENTORY_COLUMN_CANDIDATES["description"],
         "Supplier": ["supplier", "supplier brand", "brand", "vendor"],
@@ -1645,6 +1710,7 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     return frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
 
 
+@st.cache_data(show_spinner=False, max_entries=4, **BY_TOKEN)
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
     """Open PO quantity per SKU; empty when the PO sheet has no SKU or quantity column."""
     if purchase_orders is None or purchase_orders.empty:
@@ -1654,7 +1720,7 @@ def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
     if sku_col is None or qty_col is None:
         return pd.Series(dtype=float)
     keyed = pd.DataFrame(
-        {"SKU": purchase_orders[sku_col].map(sku_text), "Open PO qty": to_number(purchase_orders[qty_col]).fillna(0.0)}
+        {"SKU": map_unique(purchase_orders[sku_col], sku_text), "Open PO qty": to_number(purchase_orders[qty_col]).fillna(0.0)}
     )
     return keyed.loc[keyed["SKU"].ne("")].groupby("SKU")["Open PO qty"].sum()
 
@@ -1726,7 +1792,7 @@ def build_inventory_table(
     if not open_po.empty:
         master["Open PO qty"] = master["SKU"].map(open_po).fillna(0.0)
 
-    master["SKU type"] = master["SKU"].map(classify_sku)
+    master["SKU type"] = map_unique(master["SKU"], classify_sku)
     master["Avg monthly units"] = master["Units sold"] / window_months
     daily_rate = master["Units sold"] / window_days
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -1859,16 +1925,10 @@ def value_axis(fmt: str, **overrides) -> alt.Axis:
     return alt.Axis(**settings)
 
 
-def choices_for(series: pd.Series) -> list[str]:
-    values = sorted(
-        {str(value).strip() for value in series.dropna() if str(value).strip()},
-        key=str.casefold,
-    )
-    return ["TOTAL", *values]
-
-
-def filter_selectbox(label: str, series: pd.Series, default: str = "TOTAL") -> str:
-    if series.nunique(dropna=True) > 1500:
+def filter_selectbox(label: str, frame: pd.DataFrame, column: str, default: str = "TOTAL") -> str:
+    """A TOTAL-or-value selectbox over a column; a text search when the column has >1500 values."""
+    values = column_choices(frame, column)
+    if len(values) > 1500:
         starting_value = "" if default == "TOTAL" else default
         typed_value = st.text_input(
             f"{label} contains",
@@ -1876,13 +1936,78 @@ def filter_selectbox(label: str, series: pd.Series, default: str = "TOTAL") -> s
             key=f"forecast_{label}",
         ).strip()
         return typed_value or "TOTAL"
-    choices = choices_for(series)
+    choices = ["TOTAL", *values]
     index = choices.index(default) if default in choices else 0
     return st.selectbox(label, choices, index=index, key=f"forecast_{label}")
 
 
 def table_height(rows: int, cap: int = 420) -> int:
     return min(cap, int(38 + 35 * rows) + 3)
+
+
+@st.fragment
+def stock_health_charts(filtered: pd.DataFrame, chart_group: str) -> None:
+    """Measure toggle + the two stock-health charts. Re-runs on its own when toggled."""
+    control_left, _, control_right = st.columns([5, 1, 2], gap="small", vertical_alignment="center")
+    with control_left:
+        measure_label = st.radio(
+            "Measure", ["Units on hand", "SKUs", "Total stock value", "Free stock value"], index=0,
+            horizontal=True, key="inventory_chart_measure", label_visibility="collapsed",
+        )
+    with control_right:
+        show_share = st.toggle("Show as % of group", value=False, key="inventory_chart_normalize")
+    measure = {"Units on hand": "units", "SKUs": "skus", "Total stock value": "total_value", "Free stock value": "free_value"}[measure_label]
+
+    chart_left, chart_right = st.columns([2, 3], gap="small")
+    with chart_left:
+        st.markdown("<p class='card-title'>Stock health</p>", unsafe_allow_html=True)
+        st.altair_chart(stock_health_breakdown(filtered, measure=measure), **FULL_WIDTH)
+    with chart_right:
+        st.markdown(f"<p class='card-title'>Stock health by {chart_group.lower()} · top 15</p>", unsafe_allow_html=True)
+        st.altair_chart(
+            stock_health_by_group(filtered, chart_group, measure=measure, top_n=15, normalize=show_share),
+            **FULL_WIDTH,
+        )
+
+
+@st.fragment
+def loans_section(loan_lines: pd.DataFrame) -> None:
+    """Loan / transfer lines with the transfers toggle, as a fragment."""
+    loans = loan_lines.loc[loan_lines["Type"].eq("Loan")]
+    show_transfers = st.toggle("Include inter-site transfers", value=False, key="inventory_show_transfers")
+    shown = loan_lines if show_transfers else loans
+    loan_columns = ["Type", "Customer", "SKU", "Description", "Qty", "Avg option cost", "Value",
+                    "Date", "Days out", "Due", "From site", "From category", "To site", "Document"]
+    st.dataframe(
+        shown[loan_columns],
+        hide_index=True,
+        column_config={
+            "Qty": st.column_config.NumberColumn(format="%d"),
+            "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
+            "Value": st.column_config.NumberColumn(format="$%.0f"),
+            "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+            "Due": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+            "Days out": st.column_config.NumberColumn(format="%d"),
+        },
+        height=table_height(len(shown)),
+        **FULL_WIDTH,
+    )
+    st.download_button(
+        "Download CSV", shown[loan_columns].to_csv(index=False).encode("utf-8"),
+        file_name="stock_on_loan.csv", mime="text/csv", key="inventory_download_loans",
+    )
+    if not loans.empty and loans["Customer"].ne("").any():
+        by_customer = (
+            loans.loc[loans["Customer"].ne("")]
+            .groupby("Customer").agg(Lines=("SKU", "size"), Units=("Qty", "sum"), Value=("Value", "sum"), **{"Oldest (days)": ("Days out", "max")})
+            .sort_values("Value", ascending=False).reset_index()
+        )
+        st.caption("By customer")
+        st.dataframe(
+            by_customer, hide_index=True,
+            column_config={"Units": st.column_config.NumberColumn(format="%d"), "Value": st.column_config.NumberColumn(format="$%.0f"), "Oldest (days)": st.column_config.NumberColumn(format="%d")},
+            height=table_height(len(by_customer), cap=300), **FULL_WIDTH,
+        )
 
 
 # =============================================================================
@@ -1983,17 +2108,15 @@ if selected_tab == "Forecast":
                 metric = st.selectbox("View", metric_options, index=0)
 
                 st.markdown("**Sales**")
-                selected_location = filter_selectbox("Location", column_or_empty(sales_data, "City"))
-                selected_channel = filter_selectbox("Sales channel", column_or_empty(sales_data, "Sales Channel Net"))
+                selected_location = filter_selectbox("Location", sales_data, "City")
+                selected_channel = filter_selectbox("Sales channel", sales_data, "Sales Channel Net")
 
                 st.markdown("**Product**")
-                selected_classification = filter_selectbox(
-                    "Classification", column_or_empty(sales_data, "OptionsData.Fourth Product Group")
-                )
-                selected_supplier = filter_selectbox("Supplier", column_or_empty(sales_data, "Supplier Brand"))
-                selected_class = filter_selectbox("Class", column_or_empty(sales_data, "OptionsData.Class"))
-                selected_model = filter_selectbox("Model", column_or_empty(sales_data, "Model"))
-                selected_sku = filter_selectbox("SKU", column_or_empty(sales_data, "SKU Key"))
+                selected_classification = filter_selectbox("Classification", sales_data, "OptionsData.Fourth Product Group")
+                selected_supplier = filter_selectbox("Supplier", sales_data, "Supplier Brand")
+                selected_class = filter_selectbox("Class", sales_data, "OptionsData.Class")
+                selected_model = filter_selectbox("Model", sales_data, "Model")
+                selected_sku = filter_selectbox("SKU", sales_data, "SKU Key")
 
                 with st.expander("Forecast settings", expanded=False):
                     history_from_year = st.number_input(
@@ -2314,41 +2437,47 @@ if selected_tab == "Forecast":
                     .add_params(legend_selection)
                 )
 
-                month_hover_charts = []
+                # One hover layer for all twelve months: a 12-row frame whose
+                # columns are the series labels, holding pre-formatted text so a
+                # month without a value shows blank. (Twelve single-row layers
+                # cost ~0.3 s of Altair spec building per rerun.)
+                series_labels = [view_label(int(year), fiscal) for year in year_columns]
+                forecast_labels = [f"Forecast {year}" for year in sorted(forecast_chart_data["Year"].unique(), key=label_year_number)]
+                forecast_lookup = {
+                    (row["Year"], row["Month"]): row["Forecast"]
+                    for _, row in forecast_chart_data.iterrows()
+                    if pd.notna(row["Forecast"])
+                }
+                profile_by_month = annual_profile.set_index("Month") if not annual_profile.empty else pd.DataFrame()
+                # value_format is a D3 format ("$,.0f"); Python's format() wants the "$" outside.
+                prefix, python_spec = ("$", value_format[1:]) if value_format.startswith("$") else ("", value_format)
+                hover_rows = []
                 for month in month_sort_order:
-                    rows = annual_profile.loc[annual_profile["Month"].eq(month)]
-                    tooltip_row = {"Month": month}
-                    tooltip_fields = []
-                    for year in year_columns:
-                        value = rows.iloc[0][year] if not rows.empty else pd.NA
-                        if pd.notna(value):
-                            field = f"year_{year}"
-                            tooltip_row[field] = float(value)
-                            tooltip_fields.append(
-                                alt.Tooltip(f"{field}:Q", title=view_label(int(year), fiscal), format=value_format)
-                            )
-                    month_forecasts = forecast_chart_data.loc[forecast_chart_data["Month"].eq(month)]
-                    for year in sorted(month_forecasts["Year"].unique(), key=label_year_number):
-                        forecast_value = month_forecasts.loc[month_forecasts["Year"].eq(year), "Forecast"]
-                        if forecast_value.empty or pd.isna(forecast_value.iloc[0]):
-                            continue
-                        field = f"forecast_{label_year_number(year)}"
-                        tooltip_row[field] = float(forecast_value.iloc[0])
-                        tooltip_fields.append(alt.Tooltip(f"{field}:Q", title=f"Forecast {year}", format=value_format))
-                    if tooltip_fields:
-                        month_hover_selection = alt.selection_point(
-                            name=f"hover_{month.lower()}", fields=["Month"], on="pointerover", clear="pointerout",
+                    row = {"Month": month}
+                    for year, label in zip(year_columns, series_labels):
+                        value = profile_by_month.at[month, year] if month in profile_by_month.index and year in profile_by_month.columns else np.nan
+                        row[label] = f"{prefix}{format(float(value), python_spec)}" if pd.notna(value) else ""
+                    for label in forecast_labels:
+                        value = forecast_lookup.get((label.removeprefix("Forecast "), month))
+                        row[label] = f"{prefix}{format(float(value), python_spec)}" if value is not None else ""
+                    hover_rows.append(row)
+                hover_frame = pd.DataFrame(hover_rows)
+                hover_fields = [label for label in series_labels + forecast_labels if hover_frame[label].ne("").any()]
+                month_hover_selection = alt.selection_point(
+                    name="hover_month", fields=["Month"], on="pointerover", clear="pointerout",
+                )
+                month_hover_charts = []
+                if hover_fields:
+                    month_hover_charts.append(
+                        alt.Chart(hover_frame)
+                        .mark_rule(color="#667085", strokeWidth=12)
+                        .encode(
+                            x=month_axis,
+                            opacity=alt.condition(month_hover_selection, alt.value(0.18), alt.value(0), empty=False),
+                            tooltip=[alt.Tooltip("Month:N")] + [alt.Tooltip(f"{label}:N", title=label) for label in hover_fields],
                         )
-                        month_hover_charts.append(
-                            alt.Chart(pd.DataFrame([tooltip_row]))
-                            .mark_rule(color="#667085", strokeWidth=12)
-                            .encode(
-                                x=month_axis,
-                                opacity=alt.condition(month_hover_selection, alt.value(0.18), alt.value(0), empty=False),
-                                tooltip=tooltip_fields,
-                            )
-                            .add_params(month_hover_selection)
-                        )
+                        .add_params(month_hover_selection)
+                    )
 
                 # Legend show/hide and the month hover are handled in the browser by the
                 # chart's own selections; no on_select, so a legend click doesn't rerun
@@ -2415,22 +2544,16 @@ elif selected_tab == "Inventory Analysis":
                 st.header("Inventory filters")
                 st.markdown("**Product**")
                 filter_sources = {
-                    "Supplier": [attributes["Supplier"], sales_data.get("OptionsData.Supplier")],
-                    "Class": [attributes["Class"], sales_data.get("OptionsData.Class")],
-                    "Product group": [attributes["Product group"], sales_data.get("OptionsData.Fourth Product Group")],
+                    "Supplier": ("Supplier", "OptionsData.Supplier"),
+                    "Class": ("Class", "OptionsData.Class"),
+                    "Product group": ("Product group", "OptionsData.Fourth Product Group"),
                 }
                 product_filters: dict[str, list[str]] = {}
                 product_filters["SKU type"] = st.multiselect("SKU type", SKU_TYPES, default=[], key="inventory_filter_SKU type",
                                                              help="From the stock-code pattern; rules on the Backend Mapping tab.")
-                for label, sources in filter_sources.items():
+                for label, (attribute_column, sales_column) in filter_sources.items():
                     values = sorted(
-                        {
-                            str(value).strip()
-                            for source in sources
-                            if source is not None
-                            for value in source.dropna()
-                            if str(value).strip() and str(value).strip().lower() != "nan"
-                        },
+                        set(column_choices(attributes, attribute_column)) | set(column_choices(sales_data, sales_column)),
                         key=str.casefold,
                     )
                     product_filters[label] = st.multiselect(label, values, default=[], key=f"inventory_filter_{label}")
@@ -2484,12 +2607,13 @@ elif selected_tab == "Inventory Analysis":
                     window_months, window_days, today, int(dead_days), int(slow_dos), int(risk_dos),
                     cost_source=cost_source,
                 )
-                if not loans_raw.empty and loan_mapping.get("sku") and loan_mapping.get("qty"):
-                    early_lines = classify_loan_lines(loans_raw, loan_mapping, site_mapping, master.set_index("SKU")["Avg option cost"], today)
-                    on_loan = early_lines.loc[early_lines["Type"].eq("Loan")].groupby("SKU")["Qty"].sum()
-                    master["On loan units"] = master["SKU"].map(on_loan).fillna(0.0)
-                else:
+                cost_by_sku = master.set_index("SKU")["Avg option cost"]
+                loan_lines = classify_loan_lines(loans_raw, loan_mapping, site_mapping, cost_by_sku, today)
+                if loan_lines.empty:
                     master["On loan units"] = 0.0
+                else:
+                    on_loan = loan_lines.loc[loan_lines["Type"].eq("Loan")].groupby("SKU")["Qty"].sum()
+                    master["On loan units"] = master["SKU"].map(on_loan).fillna(0.0)
 
                 filtered = master
                 for label, chosen in product_filters.items():
@@ -2566,7 +2690,6 @@ elif selected_tab == "Inventory Analysis":
                     # ----------------------------------------------------
                     # Company-wide position: every site, every SKU, no filters
                     # ----------------------------------------------------
-                    cost_by_sku = master.set_index("SKU")["Avg option cost"]
                     totals = company_wide_totals(inventory_raw, mapping, site_mapping, cost_by_sku)
                     by_category = totals["by_category"]
                     units_breakdown = " · ".join(
@@ -2585,7 +2708,6 @@ elif selected_tab == "Inventory Analysis":
 
                     # Loans and transfers from the loan file; the inventory's Loan
                     # sites are the fallback when there is no file.
-                    loan_lines = classify_loan_lines(loans_raw, loan_mapping, site_mapping, cost_by_sku, today)
                     loans = loan_lines.loc[loan_lines["Type"].eq("Loan")]
                     transfers = loan_lines.loc[loan_lines["Type"].eq("Transfer")]
                     if not loan_lines.empty:
@@ -2597,7 +2719,7 @@ elif selected_tab == "Inventory Analysis":
                     else:
                         loan_value, loan_units = totals["loan_value"], totals["loan_units"]
                         loan_help = (
-                            f"{loan_units:,.0f} units at sites categorised as Loan. Add a loan file under Raw_data/Loan for "
+                            f"{loan_units:,.0f} units at sites categorised as Loan. Add a loan file under Raw_data/loan for "
                             "customer-level detail; codes containing LOAN are picked up automatically."
                         )
                     transfer_value, transfer_units = float(transfers["Value"].sum(skipna=True)), float(transfers["Qty"].sum())
@@ -2698,30 +2820,10 @@ elif selected_tab == "Inventory Analysis":
 
                     # Stock-health charts: the four dimensions, and the status mix
                     # across the attribute chosen in "Group by" (Supplier when per SKU).
+                    # A fragment, so switching measure re-draws the charts without
+                    # re-running the rest of the tab.
                     chart_group = group_by if group_by != "SKU" else "Supplier"
-                    control_left, _, control_right = st.columns([5, 1, 2], gap="small", vertical_alignment="center")
-                    with control_left:
-                        measure_label = st.radio(
-                            "Measure", ["Units on hand", "SKUs", "Total stock value", "Free stock value"], index=0,
-                            horizontal=True, key="inventory_chart_measure", label_visibility="collapsed",
-                        )
-                    with control_right:
-                        show_share = st.toggle("Show as % of group", value=False, key="inventory_chart_normalize")
-                    measure = {"Units on hand": "units", "SKUs": "skus", "Total stock value": "total_value", "Free stock value": "free_value"}[measure_label]
-
-                    chart_left, chart_right = st.columns([2, 3], gap="small")
-                    with chart_left:
-                        st.markdown("<p class='card-title'>Stock health</p>", unsafe_allow_html=True)
-                        st.altair_chart(stock_health_breakdown(filtered, measure=measure), **FULL_WIDTH)
-                    with chart_right:
-                        st.markdown(
-                            f"<p class='card-title'>Stock health by {chart_group.lower()} · top 15</p>",
-                            unsafe_allow_html=True,
-                        )
-                        st.altair_chart(
-                            stock_health_by_group(filtered, chart_group, measure=measure, top_n=15, normalize=show_share),
-                            **FULL_WIDTH,
-                        )
+                    stock_health_charts(filtered, chart_group)
 
                     sku_columns = [
                         "SKU", "Description", "SKU type", "Supplier", "Class", "Product group", "Status",
@@ -2808,40 +2910,7 @@ elif selected_tab == "Inventory Analysis":
                                 + (f" · plus {len(transfers):,} transfer lines" if len(transfers) else ""),
                                 expanded=False,
                             ):
-                                show_transfers = st.toggle("Include inter-site transfers", value=False, key="inventory_show_transfers")
-                                shown = loan_lines if show_transfers else loans
-                                loan_columns = ["Type", "Customer", "SKU", "Description", "Qty", "Avg option cost", "Value",
-                                                "Date", "Days out", "Due", "From site", "From category", "To site", "Document"]
-                                st.dataframe(
-                                    shown[loan_columns],
-                                    hide_index=True,
-                                    column_config={
-                                        "Qty": st.column_config.NumberColumn(format="%d"),
-                                        "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
-                                        "Value": st.column_config.NumberColumn(format="$%.0f"),
-                                        "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
-                                        "Due": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
-                                        "Days out": st.column_config.NumberColumn(format="%d"),
-                                    },
-                                    height=table_height(len(shown)),
-                                    **FULL_WIDTH,
-                                )
-                                st.download_button(
-                                    "Download CSV", shown[loan_columns].to_csv(index=False).encode("utf-8"),
-                                    file_name="stock_on_loan.csv", mime="text/csv", key="inventory_download_loans",
-                                )
-                                if not loans.empty and loans["Customer"].ne("").any():
-                                    by_customer = (
-                                        loans.loc[loans["Customer"].ne("")]
-                                        .groupby("Customer").agg(Lines=("SKU", "size"), Units=("Qty", "sum"), Value=("Value", "sum"), **{"Oldest (days)": ("Days out", "max")})
-                                        .sort_values("Value", ascending=False).reset_index()
-                                    )
-                                    st.caption("By customer")
-                                    st.dataframe(
-                                        by_customer, hide_index=True,
-                                        column_config={"Units": st.column_config.NumberColumn(format="%d"), "Value": st.column_config.NumberColumn(format="$%.0f"), "Oldest (days)": st.column_config.NumberColumn(format="%d")},
-                                        height=table_height(len(by_customer), cap=300), **FULL_WIDTH,
-                                    )
+                                loans_section(loan_lines)
 
                     with st.expander(f"📋 All SKUs · {len(filtered):,}", expanded=False):
                         show_table(filtered, "inventory_analysis.csv", "inventory_download_all")
@@ -3006,7 +3075,7 @@ elif selected_tab == "Backend Mapping":
     with st.container(border=True):
         st.markdown("<p class='card-title'>Loan file columns</p>", unsafe_allow_html=True)
         if loans_raw.empty:
-            st.caption("No loan file is loaded. Put the loan / transfer export under Raw_data/Loan (newest file is used).")
+            st.caption("No loan file is loaded. Put the loan / transfer export under Raw_data/loan (newest file is used).")
         else:
             st.caption(
                 "A line with a customer name is a loan; one without is an inter-site transfer, unless it left a Loan site. "
