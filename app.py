@@ -434,7 +434,13 @@ def read_workbook(path: Path, *args, **kwargs) -> pd.DataFrame:
             raise ImportError(f"Cannot read '{path.name}': {WORKBOOK_PROBLEMS['xls-no-xlrd']}")
         return _pandas_read_excel(path, *args, engine="xlrd", **kwargs)
     if kind == "html":
-        tables = pd.read_html(path, header=kwargs.get("header", 0))
+        try:
+            tables = pd.read_html(path, header=kwargs.get("header", 0))
+        except ImportError as e:
+            raise ImportError(
+                f"'{path.name}' is an HTML table saved with an Excel extension; reading it needs the "
+                "'lxml' package — add lxml to requirements.txt"
+            ) from e
         if not tables:
             raise ValueError(f"Cannot read '{path.name}': the HTML export contains no table")
         frame = tables[0]
@@ -1799,10 +1805,11 @@ if selected_tab == "Forecast":
                             .add_params(month_hover_selection)
                         )
 
+                # Legend show/hide and the month hover are handled in the browser by the
+                # chart's own selections; no on_select, so a legend click doesn't rerun
+                # the whole script (and layered charts can't carry one on Streamlit < 1.41).
                 st.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts).properties(height=360).configure_view(strokeWidth=0),
-                    key="forecast_monthly_chart",
-                    on_select="rerun",
                     **FULL_WIDTH,
                 )
                 st.caption(
