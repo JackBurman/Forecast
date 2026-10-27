@@ -1161,12 +1161,22 @@ def sku_type_rules_table() -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 # Showroom: display stock, excluded. Warehouse / Clearance: available to sell.
+# Loan: out on loan to clients - not for sale, but tracked for value.
 # Ignored: deliberately not tracked (quarantine, returns, transit...) - skipped
 # silently. Unmapped: a code seen in the export that nobody has categorised yet
 # - excluded like Ignored, but flagged so it gets a decision.
-SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Ignored", "Unmapped"]
-ASSIGNABLE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Ignored"]
+SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Loan", "Ignored", "Unmapped"]
+ASSIGNABLE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Loan", "Ignored"]
 SELLABLE_CATEGORIES = {"Warehouse", "Clearance"}
+
+
+def category_for(code: str, site_mapping: dict) -> str:
+    """Category of a site code: the mapping first; a code containing LOAN defaults to Loan; else Unmapped."""
+    if code in site_mapping:
+        return site_mapping[code]
+    if "LOAN" in code:
+        return "Loan"
+    return "Unmapped"
 CATEGORY_ORDER = {category: index for index, category in enumerate(SITE_CATEGORIES)}
 DEFAULT_SITE_MAPPING = {
     "RSYD": "Showroom", "RMEL": "Showroom", "RPER": "Showroom", "RBRI": "Showroom", "ROXF": "Showroom",
@@ -1234,14 +1244,14 @@ def site_mapping_frame(site_mapping: dict[str, str], site_units: pd.Series) -> p
     """The editable table shown on the Backend Mapping tab: one row per known site code."""
     codes = sorted(
         set(site_mapping) | {code for code in site_units.index if code},
-        key=lambda code: (CATEGORY_ORDER[site_mapping.get(code, "Unmapped")], code),
+        key=lambda code: (CATEGORY_ORDER[category_for(code, site_mapping)], code),
     )
     return pd.DataFrame(
         [
             {
                 "Site code": code,
-                "Category": site_mapping.get(code, "Unmapped"),
-                "Available to sell": site_mapping.get(code, "Unmapped") in SELLABLE_CATEGORIES,
+                "Category": category_for(code, site_mapping),
+                "Available to sell": category_for(code, site_mapping) in SELLABLE_CATEGORIES,
                 "In inventory export": code in site_units.index,
                 "Units on hand": float(site_units.get(code, 0.0)),
             }
@@ -1285,6 +1295,115 @@ def units_by_site(inventory: pd.DataFrame, mapping: dict) -> pd.Series:
     return units.groupby(codes).sum()
 
 
+def company_wide_totals(inventory: pd.DataFrame, mapping: dict, site_mapping: dict, cost_by_sku: pd.Series) -> dict:
+    """Totals over every row of the inventory export, whatever the site category.
+
+    Value = units × unit cost, taking the export's own cost column where it
+    has one and the SKU's resolved average option cost otherwise. Allocated
+    units are on hand minus free (stock committed to sales orders).
+    """
+    frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
+    frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
+    frame["Free"] = to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
+    if mapping.get("site"):
+        frame["Category"] = inventory[mapping["site"]].map(normalise_site_code).map(lambda code: category_for(code, site_mapping))
+    else:
+        frame["Category"] = "Warehouse"
+    row_cost = to_number(inventory[mapping["cost"]]) if mapping.get("cost") else pd.Series(np.nan, index=frame.index)
+    frame["Unit cost"] = row_cost.where(row_cost.notna() & (row_cost > 0), frame["SKU"].map(cost_by_sku))
+    frame = frame.loc[frame["SKU"].ne("")]
+    frame["Allocated"] = (frame["On hand"] - frame["Free"]).clip(lower=0.0)
+    frame["Value"] = frame["On hand"] * frame["Unit cost"]
+    frame["Free value"] = frame["Free"] * frame["Unit cost"]
+    frame["Allocated value"] = frame["Allocated"] * frame["Unit cost"]
+    by_category = (
+        frame.groupby("Category")[["On hand", "Free", "Allocated", "Value", "Free value", "Allocated value"]]
+        .sum()
+        .reindex(SITE_CATEGORIES)
+        .fillna(0.0)
+    )
+    stocked = frame["On hand"] > 0
+    return {
+        "units": float(frame["On hand"].sum()),
+        "free_units": float(frame["Free"].sum()),
+        "allocated_units": float(frame["Allocated"].sum()),
+        "value": float(frame["Value"].sum(skipna=True)),
+        "free_value": float(frame["Free value"].sum(skipna=True)),
+        "allocated_value": float(frame["Allocated value"].sum(skipna=True)),
+        "showroom_value": float(by_category.loc["Showroom", "Value"]),
+        "loan_value": float(by_category.loc["Loan", "Value"]),
+        "loan_units": float(by_category.loc["Loan", "On hand"]),
+        "by_category": by_category,
+        "costed_share": float(frame.loc[stocked, "Unit cost"].notna().mean()) if stocked.any() else 0.0,
+    }
+
+
+GAUGE_START, GAUGE_END = -2 * np.pi / 3, 2 * np.pi / 3  # a 240° dial
+
+
+def gauge_band_colour(value: float, target: float, tolerance: float) -> tuple[str, str]:
+    """(label, colour) for where a value sits against its target: green within ±tolerance,
+    amber within ±3×tolerance, red beyond."""
+    if target <= 0:
+        return "No target", "#9aa0a6"
+    deviation = abs(value / target - 1)
+    if deviation <= tolerance:
+        return "On target", "#009e73"
+    if deviation <= 3 * tolerance:
+        return "Near target", "#e69f00"
+    return "Off target", "#d55e00"
+
+
+def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max: float | None = None) -> alt.LayerChart:
+    """A dial: coloured bands around the target (green = within ±tolerance), the value as a filled
+    inner arc in the band's colour, a tick at the target and the figure in the centre."""
+    scale_max = scale_max or max(target * 1.5, value * 1.1, 1.0)
+    span = GAUGE_END - GAUGE_START
+
+    def angle(amount: float) -> float:
+        return GAUGE_START + span * min(max(amount / scale_max, 0.0), 1.0)
+
+    bands = []
+    cuts = [0.0, target * (1 - 3 * tolerance), target * (1 - tolerance), target * (1 + tolerance), target * (1 + 3 * tolerance), scale_max]
+    # Ring colours: neutral outside, amber shoulders, green target band. The
+    # value arc carries the red/amber/green verdict so the ring stays calm.
+    colours = ["#dcdcdc", "#f5d58a", "#009e73", "#f5d58a", "#dcdcdc"]
+    for lower, upper, colour in zip(cuts[:-1], cuts[1:], colours):
+        lower, upper = max(0.0, min(lower, scale_max)), max(0.0, min(upper, scale_max))
+        if upper > lower:
+            bands.append({"start": angle(lower), "end": angle(upper), "colour": colour})
+    band_frame = pd.DataFrame(bands)
+    label, colour = gauge_band_colour(value, target, tolerance)
+    value_frame = pd.DataFrame({"start": [GAUGE_START], "end": [angle(value)], "colour": [colour]})
+    tick = pd.DataFrame({"start": [angle(target) - 0.008], "end": [angle(target) + 0.008]})
+    centre = pd.DataFrame(
+        {
+            "value": [f"${value / 1e6:,.2f}M"],
+            "detail": [f"{value / target - 1:+.1%} vs ${target / 1e6:,.1f}M target" if target > 0 else "no target set"],
+            "label": [label],
+        }
+    )
+
+    # Outer ring: the target bands, solid. Inner arc: the value, in its band's colour.
+    # Tick: a thin radial line at the target. Text sits in the clear centre.
+    ring = alt.Chart(band_frame).mark_arc(innerRadius=72, outerRadius=84).encode(
+        theta=alt.Theta("start:Q", scale=None), theta2="end:Q", color=alt.Color("colour:N", scale=None),
+    )
+    track = alt.Chart(pd.DataFrame({"start": [GAUGE_START], "end": [GAUGE_END]})).mark_arc(
+        innerRadius=56, outerRadius=66, color="#000000", opacity=0.07
+    ).encode(theta=alt.Theta("start:Q", scale=None), theta2="end:Q")
+    fill = alt.Chart(value_frame).mark_arc(innerRadius=56, outerRadius=66, cornerRadius=4).encode(
+        theta=alt.Theta("start:Q", scale=None), theta2="end:Q", color=alt.Color("colour:N", scale=None),
+    )
+    marker = alt.Chart(tick).mark_arc(innerRadius=52, outerRadius=88, color="#31333F").encode(
+        theta=alt.Theta("start:Q", scale=None), theta2="end:Q"
+    )
+    headline = alt.Chart(centre).mark_text(fontSize=21, fontWeight="bold", dy=-8).encode(text="value:N")
+    subline = alt.Chart(centre).mark_text(fontSize=10.5, dy=11, opacity=0.75).encode(text="detail:N")
+    status = alt.Chart(centre).mark_text(fontSize=11, dy=27, fontWeight="bold", color=colour).encode(text="label:N")
+    return alt.layer(ring, track, fill, marker, headline, subline, status).properties(height=196).configure_view(strokeWidth=0)
+
+
 @st.cache_data(show_spinner=False)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict) -> pd.DataFrame:
     """One row per SKU: available-to-sell stock (Warehouse + Clearance sites) plus context.
@@ -1300,7 +1419,7 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     )
     if mapping.get("site"):
         frame["Site"] = inventory[mapping["site"]].map(normalise_site_code)
-        frame["Category"] = frame["Site"].map(site_mapping).fillna("Unmapped")
+        frame["Category"] = frame["Site"].map(lambda code: category_for(code, site_mapping))
     else:
         # Without a site column nothing can be excluded; treat every row as sellable.
         frame["Site"] = ""
@@ -1326,6 +1445,9 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     )
     out["Ignored units"] = (
         frame.loc[frame["Category"].eq("Ignored")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    )
+    out["Loan units"] = (
+        frame.loc[frame["Category"].eq("Loan")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
     )
     out["Sites with stock"] = (
         sellable.loc[sellable["On hand"] > 0].groupby("SKU")["Site"].nunique().reindex(skus).fillna(0).astype(int)
@@ -1477,7 +1599,7 @@ def build_inventory_table(
     for column in ["Supplier", "Class", "Product group"]:
         master[column] = master[column].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
 
-    for column in ["On hand", "Free stock", "On hand (all sites)", "Showroom units", "Ignored units", "Unmapped units",
+    for column in ["On hand", "Free stock", "On hand (all sites)", "Showroom units", "Ignored units", "Unmapped units", "Loan units",
                    "Units sold", "Sales value", "COGS", "Months with sales"]:
         master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0.0) if column in master.columns else 0.0
     if not open_po.empty:
@@ -2208,6 +2330,14 @@ elif selected_tab == "Inventory Analysis":
                         "Stock-out risk: days of supply below", min_value=7, max_value=365, value=60, step=7,
                         key="inventory_risk_dos",
                     )
+                    showroom_target = float(st.number_input(
+                        "Showroom value target ($)", min_value=0.0, value=4_000_000.0, step=100_000.0,
+                        key="inventory_showroom_target",
+                    ))
+                    showroom_tolerance = float(st.number_input(
+                        "Showroom target tolerance (%)", min_value=1.0, max_value=50.0, value=5.0, step=1.0,
+                        key="inventory_showroom_tolerance", help="Within this band either side of the target shows green.",
+                    )) / 100
                 st.caption("Site categories and export columns are set on the **Backend Mapping** tab.")
 
             if not mapping["sku"] or not mapping["on_hand"]:
@@ -2248,9 +2378,10 @@ elif selected_tab == "Inventory Analysis":
 
                 # Site context for the caption: what was excluded, and anything unmapped.
                 site_units = units_by_site(inventory_raw, mapping)
-                showroom_units = float(sum(units for code, units in site_units.items() if site_mapping.get(code) == "Showroom"))
-                ignored_units = float(sum(units for code, units in site_units.items() if site_mapping.get(code) == "Ignored"))
-                unmapped_codes = sorted(code for code in site_units.index if code and site_mapping.get(code, "Unmapped") == "Unmapped")
+                showroom_units = float(sum(units for code, units in site_units.items() if category_for(code, site_mapping) == "Showroom"))
+                ignored_units = float(sum(units for code, units in site_units.items() if category_for(code, site_mapping) == "Ignored"))
+                loan_units = float(sum(units for code, units in site_units.items() if category_for(code, site_mapping) == "Loan"))
+                unmapped_codes = sorted(code for code in site_units.index if code and category_for(code, site_mapping) == "Unmapped")
 
                 context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with group_col:
@@ -2261,6 +2392,7 @@ elif selected_tab == "Inventory Analysis":
                 with context_col:
                     st.caption(
                         f"Warehouse & clearance stock only · showroom excluded ({showroom_units:,.0f} units)"
+                        + (f" · loan stock excluded ({loan_units:,.0f} units)" if loan_units else "")
                         + (f" · ignored sites skipped ({ignored_units:,.0f} units)" if ignored_units else "")
                         + f" · sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs"
                     )
@@ -2299,6 +2431,49 @@ elif selected_tab == "Inventory Analysis":
 
                     def pct_of_on_hand(units: float) -> str:
                         return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
+
+                    # ----------------------------------------------------
+                    # Company-wide position: every site, every SKU, no filters
+                    # ----------------------------------------------------
+                    totals = company_wide_totals(inventory_raw, mapping, site_mapping, master.set_index("SKU")["Avg option cost"])
+                    by_category = totals["by_category"]
+                    units_breakdown = " · ".join(
+                        f"{category} {by_category.loc[category, 'On hand']:,.0f}"
+                        for category in SITE_CATEGORIES if by_category.loc[category, "On hand"] > 0
+                    )
+                    wide_col, gauge_col = st.columns([3, 1.25], gap="small")
+                    with wide_col:
+                        metric_card(
+                            "Company-wide stock · all sites, all SKUs, before filters",
+                            [
+                                dict(
+                                    label="Total SOH (units)", value=f"{totals['units']:,.0f}",
+                                    help=f"{units_breakdown} · total value ${totals['value']:,.0f}",
+                                ),
+                                dict(
+                                    label="Free stock value", value=f"${totals['free_value']:,.0f}",
+                                    help=f"{totals['free_units']:,.0f} free units × average option cost, across all sites.",
+                                ),
+                                dict(
+                                    label="Allocated value", value=f"${totals['allocated_value']:,.0f}",
+                                    help=f"{totals['allocated_units']:,.0f} units on hand but not free (committed to sales orders) × average option cost.",
+                                ),
+                                dict(
+                                    label="Loan value", value=f"${totals['loan_value']:,.0f}",
+                                    help=f"{totals['loan_units']:,.0f} units at sites categorised as Loan. Map loan site codes on the Backend Mapping tab; codes containing LOAN are picked up automatically.",
+                                ),
+                            ],
+                        )
+                        if totals["costed_share"] < 0.999:
+                            st.caption(f"Values cover {totals['costed_share']:.0%} of stocked units; the rest have no cost from any source.")
+                    with gauge_col:
+                        with st.container(border=True):
+                            st.markdown("<p class='card-title'>Showroom stock value</p>", unsafe_allow_html=True)
+                            st.altair_chart(gauge_chart(totals["showroom_value"], showroom_target, showroom_tolerance), **FULL_WIDTH)
+                            st.caption(
+                                f"{by_category.loc['Showroom', 'On hand']:,.0f} showroom units · green within ±{showroom_tolerance:.0%} of "
+                                f"${showroom_target / 1e6:,.1f}M, amber within ±{3 * showroom_tolerance:.0%}."
+                            )
 
                     metric_card(
                         "Available-to-sell stock · warehouse & clearance",
@@ -2468,9 +2643,10 @@ elif selected_tab == "Backend Mapping":
         st.markdown("<p class='card-title'>Site categories</p>", unsafe_allow_html=True)
         st.caption(
             "**Warehouse** and **Clearance** stock is available to sell and counts towards stock health. "
-            "**Showroom** stock is display stock and is excluded. **Ignored** sites (quarantine, returns, in transit, "
-            "anything not worth tracking) are skipped silently. A code still **Unmapped** is skipped too, but flagged "
-            "until it gets a category. Add a row for a new site code; codes are matched case-insensitively."
+            "**Showroom** stock is display stock and is excluded. **Loan** stock is out with clients: not for sale, but "
+            "valued on the Inventory tab (codes containing LOAN land here automatically). **Ignored** sites (quarantine, "
+            "returns, in transit, anything not worth tracking) are skipped silently. A code still **Unmapped** is skipped "
+            "too, but flagged until it gets a category. Add a row for a new site code; codes are matched case-insensitively."
         )
         editor_frame = site_mapping_frame(site_mapping, site_units)
         st.session_state["site_editor_frame"] = editor_frame
@@ -2486,7 +2662,7 @@ elif selected_tab == "Backend Mapping":
                 "Site code": st.column_config.TextColumn(required=True, max_chars=12, validate=r"^\s*[A-Za-z0-9_-]+\s*$"),
                 "Category": st.column_config.SelectboxColumn(
                     options=SITE_CATEGORIES, required=True,
-                    help="Showroom, Warehouse, Clearance or Ignored. Unmapped means not yet decided.",
+                    help="Showroom, Warehouse, Clearance, Loan or Ignored. Unmapped means not yet decided.",
                 ),
                 "Available to sell": st.column_config.CheckboxColumn(help="Derived from the category."),
                 "In inventory export": st.column_config.CheckboxColumn(help="The code appears in the current inventory export."),
