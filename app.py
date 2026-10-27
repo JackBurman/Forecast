@@ -747,7 +747,7 @@ def load_raw_folder_data(
             f"Purchase orders — {column_summary(forecast_inputs['Purchase Orders'])}."
         )
 
-    # Loan / transfer document lines: newest file under Raw_data/loan. Not an
+    # Loan / transfer document lines: newest file under Raw_data/Loan. Not an
     # engine input, so it rides alongside the engine's sheets.
     loan_file = newest_file(loan_folder_path)
     if loan_file is not None:
@@ -2597,7 +2597,7 @@ elif selected_tab == "Inventory Analysis":
                     else:
                         loan_value, loan_units = totals["loan_value"], totals["loan_units"]
                         loan_help = (
-                            f"{loan_units:,.0f} units at sites categorised as Loan. Add a loan file under Raw_data/loan for "
+                            f"{loan_units:,.0f} units at sites categorised as Loan. Add a loan file under Raw_data/Loan for "
                             "customer-level detail; codes containing LOAN are picked up automatically."
                         )
                     transfer_value, transfer_units = float(transfers["Value"].sum(skipna=True)), float(transfers["Qty"].sum())
@@ -3006,7 +3006,7 @@ elif selected_tab == "Backend Mapping":
     with st.container(border=True):
         st.markdown("<p class='card-title'>Loan file columns</p>", unsafe_allow_html=True)
         if loans_raw.empty:
-            st.caption("No loan file is loaded. Put the loan / transfer export under Raw_data/loan (newest file is used).")
+            st.caption("No loan file is loaded. Put the loan / transfer export under Raw_data/Loan (newest file is used).")
         else:
             st.caption(
                 "A line with a customer name is a loan; one without is an inter-site transfer, unless it left a Loan site. "
