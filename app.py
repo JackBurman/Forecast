@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import re
 
 import altair as alt
@@ -21,7 +22,7 @@ st.markdown(
         .block-container { padding-top: 3.2rem; padding-bottom: 1rem; }
         [data-testid="stVerticalBlock"] { gap: 0.6rem; }
         [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
-        h1 { font-size: 1.8rem !important; padding-top: -1.2rem !important; padding-bottom: 0.2rem !important; }
+        h1 { font-size: 1.8rem !important; padding-top: 0 !important; padding-bottom: 0.2rem !important; }
         h2, h3 { padding-top: 0.3rem !important; padding-bottom: 0.2rem !important; }
         [data-testid="stMetric"] { padding: 0.1rem 0; }
         [data-testid="stMetricLabel"] p { font-size: 0.78rem; line-height: 1.2; white-space: normal; }
@@ -90,6 +91,7 @@ INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "free": FREE_HEADERS,
     "site": ["site", "location", "warehouse", "branch", "store", "showroom"],
     "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
+    "cost": ["average option cost", "avg option cost", "average cost", "avg cost", "option cost", "unit cost", "cost per unit", "cost price", "standard cost", "cost"],
     "description": ["description", "item description", "product description", "product name", "name", "product"],
 }
 INVENTORY_ROLE_LABELS = {
@@ -98,6 +100,7 @@ INVENTORY_ROLE_LABELS = {
     "free": "Free stock column",
     "site": "Site / location column",
     "value": "Stock value column",
+    "cost": "Average option cost column",
     "description": "Description column",
 }
 
@@ -1114,37 +1117,189 @@ def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFram
 STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out of stock", "Inactive"]
 
 
+# -----------------------------------------------------------------------------
+# Site categories (backend mapping)
+#
+# Every inventory row carries a site code. Codes are mapped to a category, and
+# only Warehouse and Clearance stock is "available to sell": showroom stock is
+# display stock and is excluded from stock health, days of supply, turns and
+# value. The mapping lives in session state (editable on the Backend Mapping
+# tab) and can be saved to backend_mapping.json next to app.py as the default
+# for the deployment.
+# -----------------------------------------------------------------------------
+
+SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Unmapped"]
+SELLABLE_CATEGORIES = {"Warehouse", "Clearance"}
+CATEGORY_ORDER = {category: index for index, category in enumerate(SITE_CATEGORIES)}
+DEFAULT_SITE_MAPPING = {
+    "RSYD": "Showroom", "RMEL": "Showroom", "RPER": "Showroom", "RBRI": "Showroom", "ROXF": "Showroom",
+    "W1SY": "Warehouse", "W3ME": "Warehouse", "W4PE": "Warehouse", "W5BR": "Warehouse",
+    "XITS": "Clearance", "XITM": "Clearance", "XITP": "Clearance", "XITB": "Clearance",
+}
+COST_SOURCES = {
+    "auto": "Automatic (inventory export → options data → sales)",
+    "inventory": "Inventory export cost column",
+    "options": "Options data cost column",
+    "sales": "Derived from sales (COGS ÷ units sold in the window)",
+}
+MAPPING_FILE = base_dir / "backend_mapping.json"
+
+
+def normalise_site_code(value) -> str:
+    return "" if pd.isna(value) else str(value).strip().upper()
+
+
+def load_backend_mapping_file() -> dict:
+    try:
+        return json.loads(MAPPING_FILE.read_text(encoding="utf-8")) if MAPPING_FILE.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_backend_mapping_file(payload: dict) -> None:
+    MAPPING_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def init_backend_state() -> None:
+    """Seed the session-state mappings once, from backend_mapping.json when it exists."""
+    if "site_mapping" in st.session_state:
+        return
+    saved = load_backend_mapping_file()
+    site_mapping = saved.get("site_mapping") or DEFAULT_SITE_MAPPING
+    st.session_state["site_mapping"] = {
+        normalise_site_code(code): (category if category in SITE_CATEGORIES else "Unmapped")
+        for code, category in site_mapping.items()
+        if normalise_site_code(code)
+    }
+    st.session_state["inventory_column_mapping"] = saved.get("column_mapping", {})
+    st.session_state["cost_source"] = saved.get("cost_source", "auto") if saved.get("cost_source", "auto") in COST_SOURCES else "auto"
+    st.session_state["site_editor_version"] = 0
+
+
+def current_site_mapping() -> dict[str, str]:
+    init_backend_state()
+    return dict(st.session_state["site_mapping"])
+
+
+def resolve_inventory_mapping(inventory: pd.DataFrame) -> dict[str, str | None]:
+    """Auto-detected inventory columns, overridden by choices made on the Backend Mapping tab."""
+    init_backend_state()
+    mapping = detect_inventory_columns(inventory)
+    for role, choice in st.session_state["inventory_column_mapping"].items():
+        if choice == "(none)":
+            mapping[role] = None
+        elif choice in inventory.columns:
+            mapping[role] = choice
+    return mapping
+
+
+def site_mapping_frame(site_mapping: dict[str, str], site_units: pd.Series) -> pd.DataFrame:
+    """The editable table shown on the Backend Mapping tab: one row per known site code."""
+    codes = sorted(
+        set(site_mapping) | {code for code in site_units.index if code},
+        key=lambda code: (CATEGORY_ORDER[site_mapping.get(code, "Unmapped")], code),
+    )
+    return pd.DataFrame(
+        [
+            {
+                "Site code": code,
+                "Category": site_mapping.get(code, "Unmapped"),
+                "Available to sell": site_mapping.get(code, "Unmapped") in SELLABLE_CATEGORIES,
+                "In inventory export": code in site_units.index,
+                "Units on hand": float(site_units.get(code, 0.0)),
+            }
+            for code in codes
+        ]
+    )
+
+
+def apply_site_editor_changes() -> None:
+    """on_change for the site editor: fold its edits into session state, then recreate the editor.
+
+    The editor is keyed by a version number; bumping it means the next run
+    shows a fresh editor built from the updated mapping, so edits and added
+    rows are never applied twice.
+    """
+    key = f"backend_site_editor_{st.session_state['site_editor_version']}"
+    state = st.session_state.get(key, {})
+    frame = st.session_state["site_editor_frame"].copy()
+    for row, changes in state.get("edited_rows", {}).items():
+        for column, value in changes.items():
+            frame.loc[int(row), column] = value
+    if state.get("added_rows"):
+        frame = pd.concat([frame, pd.DataFrame(state["added_rows"])], ignore_index=True)
+    if state.get("deleted_rows"):
+        frame = frame.drop(index=[int(row) for row in state["deleted_rows"]])
+    mapping = {}
+    for code, category in zip(frame.get("Site code", []), frame.get("Category", [])):
+        code = normalise_site_code(code)
+        if code:
+            mapping[code] = category if category in SITE_CATEGORIES else "Unmapped"
+    st.session_state["site_mapping"] = mapping
+    st.session_state["site_editor_version"] += 1
+
+
+def units_by_site(inventory: pd.DataFrame, mapping: dict) -> pd.Series:
+    """Units on hand per site code across the whole export (all SKUs)."""
+    if not mapping.get("site") or not mapping.get("on_hand"):
+        return pd.Series(dtype=float)
+    codes = inventory[mapping["site"]].map(normalise_site_code)
+    units = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
+    return units.groupby(codes).sum()
+
+
 @st.cache_data(show_spinner=False)
-def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """One row per SKU with on-hand and free stock summed across sites."""
+def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict) -> pd.DataFrame:
+    """One row per SKU: available-to-sell stock (Warehouse + Clearance sites) plus context.
+
+    Columns: On hand / Free stock (sellable sites only), On hand (all sites),
+    Showroom units, Unmapped units, Sites with stock, and when the export has
+    a cost column, Inventory unit cost (weighted by units on hand).
+    """
     frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
         to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
     )
-    if mapping.get("value"):
-        frame["Stock value"] = to_number(inventory[mapping["value"]]).fillna(0.0)
     if mapping.get("site"):
-        frame["Site"] = inventory[mapping["site"]].astype(str).str.strip()
+        frame["Site"] = inventory[mapping["site"]].map(normalise_site_code)
+        frame["Category"] = frame["Site"].map(site_mapping).fillna("Unmapped")
+    else:
+        # Without a site column nothing can be excluded; treat every row as sellable.
+        frame["Site"] = ""
+        frame["Category"] = "Warehouse"
+    frame["Sellable"] = frame["Category"].isin(SELLABLE_CATEGORIES)
+    if mapping.get("cost"):
+        frame["Unit cost"] = to_number(inventory[mapping["cost"]])
     if mapping.get("description"):
         frame["Inventory description"] = inventory[mapping["description"]].astype(str).str.strip()
     frame = frame.loc[frame["SKU"].ne("")]
 
-    if "Site" in frame.columns:
-        target_locations = {"W1SY", "W3ME", "W4PE", "W5BR"}
-        frame["Free stock"] = np.where(frame["Site"].isin(target_locations), frame["Free stock"], 0.0)
-
-    aggregations = {"On hand": "sum", "Free stock": "sum"}
-    if "Stock value" in frame.columns:
-        aggregations["Stock value"] = "sum"
+    skus = pd.Index(sorted(frame["SKU"].unique()), name="SKU")
+    sellable = frame.loc[frame["Sellable"]]
+    out = pd.DataFrame(index=skus)
+    out["On hand"] = sellable.groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    out["Free stock"] = sellable.groupby("SKU")["Free stock"].sum().reindex(skus).fillna(0.0)
+    out["On hand (all sites)"] = frame.groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    out["Showroom units"] = (
+        frame.loc[frame["Category"].eq("Showroom")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    )
+    out["Unmapped units"] = (
+        frame.loc[frame["Category"].eq("Unmapped")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    )
+    out["Sites with stock"] = (
+        sellable.loc[sellable["On hand"] > 0].groupby("SKU")["Site"].nunique().reindex(skus).fillna(0).astype(int)
+    )
+    if "Unit cost" in frame.columns:
+        costed = frame.loc[frame["Unit cost"].notna() & (frame["Unit cost"] > 0)].copy()
+        costed["Weight"] = costed["On hand"].clip(lower=0)
+        costed["Weighted"] = costed["Unit cost"] * costed["Weight"]
+        grouped = costed.groupby("SKU")
+        weighted = grouped["Weighted"].sum() / grouped["Weight"].sum()
+        out["Inventory unit cost"] = weighted.where(grouped["Weight"].sum() > 0, grouped["Unit cost"].mean()).reindex(skus)
     if "Inventory description" in frame.columns:
-        aggregations["Inventory description"] = "first"
-    grouped = frame.groupby("SKU").agg(aggregations)
-    if "Site" in frame.columns:
-        grouped["Sites with stock"] = (
-            frame.loc[frame["On hand"] > 0].groupby("SKU")["Site"].nunique().reindex(grouped.index).fillna(0).astype(int)
-        )
-    return grouped.reset_index()
+        out["Inventory description"] = frame.groupby("SKU")["Inventory description"].first().reindex(skus)
+    return out.reset_index()
 
 
 @st.cache_data(show_spinner=False)
@@ -1187,7 +1342,7 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
 
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
-    empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group"])
+    empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group", "Option unit cost"])
     if options is None or options.empty:
         return empty
     sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
@@ -1202,6 +1357,8 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
     }.items():
         col = detect_column(options.columns, candidates, exclude=(sku_col,))
         frame[role] = options[col].astype(str).str.strip() if col else pd.NA
+    cost_col = detect_column(options.columns, INVENTORY_COLUMN_CANDIDATES["cost"], exclude=(sku_col,))
+    frame["Option unit cost"] = to_number(options[cost_col]) if cost_col else np.nan
     return frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
 
 
@@ -1219,6 +1376,31 @@ def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
     return keyed.loc[keyed["SKU"].ne("")].groupby("SKU")["Open PO qty"].sum()
 
 
+def resolve_avg_option_cost(master: pd.DataFrame, derived: pd.Series, cost_source: str) -> tuple[pd.Series, pd.Series]:
+    """Per-SKU average option cost and where each value came from.
+
+    Sources, in automatic order: the inventory export's cost column, the
+    options data's cost column, then a derived cost (COGS ÷ units sold in the
+    window). A chosen source is used first and gaps are filled from the others.
+    """
+    candidates = {
+        "inventory": master["Inventory unit cost"] if "Inventory unit cost" in master.columns else pd.Series(np.nan, index=master.index),
+        "options": master["Option unit cost"] if "Option unit cost" in master.columns else pd.Series(np.nan, index=master.index),
+        "sales": derived,
+    }
+    order = ["inventory", "options", "sales"]
+    if cost_source in candidates:
+        order = [cost_source] + [name for name in order if name != cost_source]
+    cost = pd.Series(np.nan, index=master.index, dtype=float)
+    source = pd.Series("none", index=master.index, dtype=object)
+    for name in order:
+        values = pd.to_numeric(candidates[name], errors="coerce")
+        usable = cost.isna() & values.notna() & (values > 0)
+        cost = cost.where(~usable, values)
+        source = source.where(~usable, name)
+    return cost, source
+
+
 def build_inventory_table(
     inventory_sku: pd.DataFrame,
     movement: pd.DataFrame,
@@ -1230,8 +1412,15 @@ def build_inventory_table(
     dead_days: int,
     slow_dos: int,
     risk_dos: int,
+    cost_source: str = "auto",
 ) -> pd.DataFrame:
-    """SKU-level stock position, movement, days of supply, turns and status."""
+    """SKU-level available-to-sell stock, movement, days of supply, turns, value and status.
+
+    "On hand" and "Free stock" are Warehouse + Clearance stock only; showroom
+    stock is carried separately in "Showroom units" and never counts towards
+    stock health. Total stock value = On hand × Avg option cost; Free stock
+    value = Free stock × Avg option cost.
+    """
     master = inventory_sku.merge(movement, on="SKU", how="outer")
     master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
     for column in ["Description", "Supplier", "Class", "Product group"]:
@@ -1248,7 +1437,8 @@ def build_inventory_table(
     for column in ["Supplier", "Class", "Product group"]:
         master[column] = master[column].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
 
-    for column in ["On hand", "Free stock", "Units sold", "Sales value", "COGS", "Months with sales"]:
+    for column in ["On hand", "Free stock", "On hand (all sites)", "Showroom units", "Unmapped units",
+                   "Units sold", "Sales value", "COGS", "Months with sales"]:
         master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0.0) if column in master.columns else 0.0
     if not open_po.empty:
         master["Open PO qty"] = master["SKU"].map(open_po).fillna(0.0)
@@ -1260,14 +1450,18 @@ def build_inventory_table(
         master["Turns (annualised)"] = np.where(
             master["On hand"] > 0, (master["Units sold"] * 12 / window_months) / master["On hand"], np.nan
         )
-        unit_cost = np.where(master["Units sold"] > 0, master["COGS"] / master["Units sold"], np.nan)
+        derived_cost = pd.Series(
+            np.where(master["Units sold"] > 0, master["COGS"] / master["Units sold"], np.nan), index=master.index
+        )
         if "Open PO qty" in master.columns:
             master["Days of supply incl. POs"] = np.where(
                 daily_rate > 0, (master["On hand"] + master["Open PO qty"]) / daily_rate, np.inf
             )
-    master["Est. stock value"] = (
-        master["Stock value"] if "Stock value" in master.columns else master["On hand"] * unit_cost
-    )
+
+    master["Avg option cost"], master["Cost source"] = resolve_avg_option_cost(master, derived_cost, cost_source)
+    master["Total stock value"] = master["On hand"] * master["Avg option cost"]
+    master["Free stock value"] = master["Free stock"] * master["Avg option cost"]
+    master = master.drop(columns=[c for c in ("Inventory unit cost", "Option unit cost") if c in master.columns])
 
     last_sale = pd.to_datetime(master["Last sale"], errors="coerce")
     master["Last sale"] = last_sale
@@ -1287,6 +1481,7 @@ def build_inventory_table(
         ["Out of stock", "Inactive", "Dead stock", "Slow moving", "Stock-out risk"],
         default="Healthy",
     )
+    master["Active"] = master["Status"].ne("Inactive")
     master["Dead units"] = np.where(master["Status"] == "Dead stock", on_hand, 0.0)
     master["Slow units"] = np.where(master["Status"] == "Slow moving", on_hand, 0.0)
     master["Days of supply"] = master["Days of supply"].replace(np.inf, np.nan)
@@ -1299,16 +1494,20 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
     grouped = master.groupby(group_column).agg(
         **{
             "SKUs": ("SKU", "nunique"),
-            "SKUs with stock": ("On hand", lambda s: int((s > 0).sum())),
+            "Active SKUs": ("Active", "sum"),
             "On hand": ("On hand", "sum"),
+            "Free stock": ("Free stock", "sum"),
+            "Showroom units": ("Showroom units", "sum"),
             "Units sold": ("Units sold", "sum"),
             "Sales value": ("Sales value", "sum"),
+            "Total stock value": ("Total stock value", "sum"),
+            "Free stock value": ("Free stock value", "sum"),
             "Dead units": ("Dead units", "sum"),
             "Slow units": ("Slow units", "sum"),
             "Stock-out risk SKUs": ("Status", lambda s: int((s == "Stock-out risk").sum())),
-            "Est. stock value": ("Est. stock value", "sum"),
         }
     )
+    grouped["Active SKUs"] = grouped["Active SKUs"].astype(int)
     daily_rate = grouped["Units sold"] / window_days
     with np.errstate(divide="ignore", invalid="ignore"):
         grouped["Days of supply"] = np.where(daily_rate > 0, grouped["On hand"] / daily_rate, np.nan)
@@ -1450,7 +1649,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 selected_tab = st.radio(
     "View",
-    ["Forecast", "Inventory Analysis", "Options Data", "Formatted Data", "Document Status"],
+    ["Forecast", "Inventory Analysis", "Backend Mapping", "Options Data", "Formatted Data", "Document Status"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -1900,7 +2099,9 @@ elif selected_tab == "Inventory Analysis":
             last_complete = current_period - 1
 
             attributes = option_attributes(options_raw)
-            detected = detect_inventory_columns(inventory_raw)
+            mapping = resolve_inventory_mapping(inventory_raw)
+            site_mapping = current_site_mapping()
+            cost_source = st.session_state.get("cost_source", "auto")
 
             with st.sidebar:
                 st.header("Inventory filters")
@@ -1916,6 +2117,7 @@ elif selected_tab == "Inventory Analysis":
                         {
                             str(value).strip()
                             for source in sources
+                            if source is not None
                             for value in source.dropna()
                             if str(value).strip() and str(value).strip().lower() != "nan"
                         },
@@ -1943,25 +2145,12 @@ elif selected_tab == "Inventory Analysis":
                         "Stock-out risk: days of supply below", min_value=7, max_value=365, value=60, step=7,
                         key="inventory_risk_dos",
                     )
-
-                mapping_needed = detected["sku"] is None or detected["on_hand"] is None
-                with st.expander("Inventory column mapping", expanded=mapping_needed):
-                    column_options = ["(none)"] + [str(col) for col in inventory_raw.columns]
-                    mapping: dict[str, str | None] = {}
-                    for role, label in INVENTORY_ROLE_LABELS.items():
-                        default = str(detected[role]) if detected[role] is not None else "(none)"
-                        choice = st.selectbox(
-                            label,
-                            column_options,
-                            index=column_options.index(default) if default in column_options else 0,
-                            key=f"inventory_map_{role}",
-                        )
-                        mapping[role] = None if choice == "(none)" else choice
+                st.caption("Site categories and export columns are set on the **Backend Mapping** tab.")
 
             if not mapping["sku"] or not mapping["on_hand"]:
                 st.warning(
-                    "The SKU and on-hand quantity columns of the inventory sheet could not be identified. "
-                    "Choose them under *Inventory column mapping* in the sidebar."
+                    "The SKU and on-hand quantity columns of the inventory export could not be identified. "
+                    "Choose them on the **Backend Mapping** tab."
                 )
             else:
                 window_end = last_complete
@@ -1969,12 +2158,13 @@ elif selected_tab == "Inventory Analysis":
                 window_periods = pd.period_range(window_start, window_end, freq="M")
                 window_days = int(sum(period.days_in_month for period in window_periods))
 
-                inventory_sku = inventory_by_sku(inventory_raw, mapping)
+                inventory_sku = inventory_by_sku(inventory_raw, mapping, site_mapping)
                 movement = sku_movement(sales_data, str(window_start), str(window_end))
                 open_po = open_po_by_sku(purchase_orders_raw)
                 master = build_inventory_table(
                     inventory_sku, movement, attributes, open_po,
                     window_months, window_days, today, int(dead_days), int(slow_dos), int(risk_dos),
+                    cost_source=cost_source,
                 )
 
                 filtered = master
@@ -1993,6 +2183,11 @@ elif selected_tab == "Inventory Analysis":
                     filtered = filtered.loc[text_match]
                 filtered = filtered.reset_index(drop=True)
 
+                # Site context for the caption: what was excluded, and anything unmapped.
+                site_units = units_by_site(inventory_raw, mapping)
+                showroom_units = float(sum(units for code, units in site_units.items() if site_mapping.get(code) == "Showroom"))
+                unmapped_codes = sorted(code for code in site_units.index if code and code not in site_mapping)
+
                 context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with group_col:
                     group_by = st.selectbox(
@@ -2000,16 +2195,36 @@ elif selected_tab == "Inventory Analysis":
                         key="inventory_group_by", label_visibility="collapsed",
                     )
                 with context_col:
-                    st.caption(f"Sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs")
+                    st.caption(
+                        f"Warehouse & clearance stock only · showroom stock excluded ({showroom_units:,.0f} units) · "
+                        f"sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs"
+                    )
+                if not mapping.get("site"):
+                    st.warning(
+                        "The inventory export has no site column, so every row is treated as available to sell. "
+                        "Pick the site column on the **Backend Mapping** tab to exclude showroom stock."
+                    )
+                elif unmapped_codes:
+                    st.warning(
+                        f"{len(unmapped_codes)} site code(s) in the inventory export are not categorised and are "
+                        f"excluded from stock health: {', '.join(unmapped_codes)}. Categorise them on the **Backend Mapping** tab."
+                    )
 
                 if filtered.empty:
                     st.warning("No SKUs match these filters.")
                 else:
                     total_on_hand = float(filtered["On hand"].sum())
+                    total_free = float(filtered["Free stock"].sum())
                     total_units = float(filtered["Units sold"].sum())
+                    total_value = float(filtered["Total stock value"].sum(skipna=True))
+                    free_value = float(filtered["Free stock value"].sum(skipna=True))
                     dead_units = float(filtered["Dead units"].sum())
                     slow_units = float(filtered["Slow units"].sum())
+                    dead_value = float(filtered.loc[filtered["Status"] == "Dead stock", "Total stock value"].sum(skipna=True))
+                    slow_value = float(filtered.loc[filtered["Status"] == "Slow moving", "Total stock value"].sum(skipna=True))
+                    active_skus = int(filtered["Active"].sum())
                     status_counts = filtered["Status"].value_counts()
+                    costed_share = float(filtered.loc[filtered["On hand"] > 0, "Avg option cost"].notna().mean()) if (filtered["On hand"] > 0).any() else 0.0
                     overall_daily_rate = total_units / window_days if window_days else 0.0
                     overall_dos = total_on_hand / overall_daily_rate if overall_daily_rate > 0 else np.nan
                     overall_turns = (total_units * 12 / window_months) / total_on_hand if total_on_hand > 0 else np.nan
@@ -2017,15 +2232,30 @@ elif selected_tab == "Inventory Analysis":
                     def pct_of_on_hand(units: float) -> str:
                         return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
 
+                    metric_card(
+                        "Available-to-sell stock · warehouse & clearance",
+                        [
+                            dict(label="Units on hand", value=f"{total_on_hand:,.0f}", help=f"Free stock {total_free:,.0f} units."),
+                            dict(label="Active SKUs", value=f"{active_skus:,}", help="SKUs with available stock or sales in the window (every status except Inactive)."),
+                            dict(
+                                label="Total stock value", value=f"${total_value:,.0f}",
+                                help=f"Units on hand × average option cost · {costed_share:.0%} of stocked SKUs have a cost ({COST_SOURCES[cost_source]}).",
+                            ),
+                            dict(label="Free stock value", value=f"${free_value:,.0f}", help="Free (unallocated) units × average option cost."),
+                        ],
+                    )
+
                     health_col, movement_col = st.columns([3, 2], gap="small")
                     with health_col:
                         metric_card(
                             "Stock health",
                             [
-                                dict(label="On hand (units)", value=f"{total_on_hand:,.0f}"),
-                                dict(label="Dead stock", value=f"{dead_units:,.0f}", delta=pct_of_on_hand(dead_units), delta_color="off"),
-                                dict(label="Slow moving", value=f"{slow_units:,.0f}", delta=pct_of_on_hand(slow_units), delta_color="off"),
-                                dict(label="Stock-out risk", value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs"),
+                                dict(label="Dead stock", value=f"{dead_units:,.0f}", delta=pct_of_on_hand(dead_units), delta_color="off",
+                                     help=f"{int(status_counts.get('Dead stock', 0))} SKUs · ${dead_value:,.0f} · stock with no sale in {int(dead_days)} days."),
+                                dict(label="Slow moving", value=f"{slow_units:,.0f}", delta=pct_of_on_hand(slow_units), delta_color="off",
+                                     help=f"{int(status_counts.get('Slow moving', 0))} SKUs · ${slow_value:,.0f} · more than {int(slow_dos)} days of supply."),
+                                dict(label="Stock-out risk", value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs",
+                                     help=f"Fewer than {int(risk_dos)} days of supply · plus {int(status_counts.get('Out of stock', 0))} SKUs already out of sellable stock with recent sales."),
                             ],
                         )
                     with movement_col:
@@ -2033,24 +2263,24 @@ elif selected_tab == "Inventory Analysis":
                             f"Movement · last {window_months} months",
                             [
                                 dict(label="Units sold", value=f"{total_units:,.0f}"),
-                                dict(label="Days of supply", value=f"{overall_dos:,.0f}" if pd.notna(overall_dos) else "n/a"),
+                                dict(label="Days of supply", value=f"{overall_dos:,.0f}" if pd.notna(overall_dos) else "n/a",
+                                     help="Available units ÷ average daily units sold in the window."),
                                 dict(label="Turns (annualised)", value=f"{overall_turns:.1f}×" if pd.notna(overall_turns) else "n/a"),
                             ],
                         )
 
-                    # Stock-health charts: status breakdown, and the status mix
-                    # across the attribute chosen in "Group by" (Supplier when
-                    # the view is per SKU).
+                    # Stock-health charts: the four dimensions, and the status mix
+                    # across the attribute chosen in "Group by" (Supplier when per SKU).
                     chart_group = group_by if group_by != "SKU" else "Supplier"
-                    control_left, control_mid, control_right = st.columns([3, 3, 2], gap="small", vertical_alignment="center")
+                    control_left, _, control_right = st.columns([5, 1, 2], gap="small", vertical_alignment="center")
                     with control_left:
                         measure_label = st.radio(
-                            "Measure", ["Units on hand", "SKUs", "Stock value"], index=0,
+                            "Measure", ["Units on hand", "SKUs", "Total stock value", "Free stock value"], index=0,
                             horizontal=True, key="inventory_chart_measure", label_visibility="collapsed",
                         )
                     with control_right:
                         show_share = st.toggle("Show as % of group", value=False, key="inventory_chart_normalize")
-                    measure = {"Units on hand": "units", "SKUs": "skus", "Stock value": "value"}[measure_label]
+                    measure = {"Units on hand": "units", "SKUs": "skus", "Total stock value": "total_value", "Free stock value": "free_value"}[measure_label]
 
                     chart_left, chart_right = st.columns([2, 3], gap="small")
                     with chart_left:
@@ -2068,16 +2298,24 @@ elif selected_tab == "Inventory Analysis":
 
                     sku_columns = [
                         "SKU", "Description", "Supplier", "Class", "Product group", "Status",
-                        "On hand", "Free stock", "Units sold", "Avg monthly units", "Days of supply",
-                        "Turns (annualised)", "Last sale", "Days since last sale", "Sales value", "Est. stock value",
+                        "On hand", "Free stock", "Showroom units", "Avg option cost", "Total stock value", "Free stock value",
+                        "Units sold", "Avg monthly units", "Days of supply", "Turns (annualised)",
+                        "Last sale", "Days since last sale", "Sales value", "Cost source",
                     ]
                     if "Open PO qty" in filtered.columns:
                         sku_columns += ["Open PO qty", "Days of supply incl. POs"]
+                    if (filtered["Unmapped units"] > 0).any():
+                        sku_columns.append("Unmapped units")
                     sku_columns = [c for c in sku_columns if c in filtered.columns]
 
                     sku_column_config = {
-                        "On hand": st.column_config.NumberColumn(format="%d"),
+                        "On hand": st.column_config.NumberColumn("On hand (sellable)", format="%d"),
                         "Free stock": st.column_config.NumberColumn(format="%d"),
+                        "Showroom units": st.column_config.NumberColumn(format="%d", help="Display stock; excluded from stock health."),
+                        "Unmapped units": st.column_config.NumberColumn(format="%d", help="Stock at site codes that are not categorised."),
+                        "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
+                        "Total stock value": st.column_config.NumberColumn(format="$%.0f"),
+                        "Free stock value": st.column_config.NumberColumn(format="$%.0f"),
                         "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
                         "Avg monthly units": st.column_config.NumberColumn(format="%.1f"),
                         "Days of supply": st.column_config.NumberColumn(format="%d"),
@@ -2086,7 +2324,6 @@ elif selected_tab == "Inventory Analysis":
                         "Last sale": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
                         "Days since last sale": st.column_config.NumberColumn(format="%d"),
                         "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
-                        "Est. stock value": st.column_config.NumberColumn(format="$%.0f"),
                         "Open PO qty": st.column_config.NumberColumn(format="%d"),
                     }
 
@@ -2107,15 +2344,18 @@ elif selected_tab == "Inventory Analysis":
                                 summary,
                                 hide_index=True,
                                 column_config={
-                                    "On hand": st.column_config.NumberColumn(format="%d"),
+                                    "On hand": st.column_config.NumberColumn("On hand (sellable)", format="%d"),
+                                    "Free stock": st.column_config.NumberColumn(format="%d"),
+                                    "Showroom units": st.column_config.NumberColumn(format="%d"),
                                     "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
                                     "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
+                                    "Total stock value": st.column_config.NumberColumn(format="$%.0f"),
+                                    "Free stock value": st.column_config.NumberColumn(format="$%.0f"),
                                     "Dead units": st.column_config.NumberColumn(format="%d"),
                                     "Slow units": st.column_config.NumberColumn(format="%d"),
                                     "Dead stock %": st.column_config.NumberColumn(format="%.0f%%"),
                                     "Days of supply": st.column_config.NumberColumn(format="%d"),
                                     "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
-                                    "Est. stock value": st.column_config.NumberColumn(format="$%.0f"),
                                 },
                                 height=table_height(len(summary)),
                                 **FULL_WIDTH,
@@ -2126,6 +2366,168 @@ elif selected_tab == "Inventory Analysis":
 
         except Exception as e:
             st.error(f"Something went wrong while rendering inventory analysis: {e}")
+
+# =============================================================================
+# Backend Mapping tab
+# =============================================================================
+elif selected_tab == "Backend Mapping":
+    init_backend_state()
+    prepared_data, source_names = load_prepared_data()
+    inventory_raw = prepared_data["Current Inventory"] if prepared_data is not None else pd.DataFrame()
+    options_raw = prepared_data.get("OptionsData") if prepared_data is not None else None
+
+    st.subheader("Backend mapping")
+    st.caption(
+        "Configuration the inventory analysis runs on. Changes apply immediately for this session; "
+        "save them to make them the default for this deployment."
+    )
+
+    # ------------------------------------------------------------------
+    # 1. Site categories
+    # ------------------------------------------------------------------
+    detected_mapping = resolve_inventory_mapping(inventory_raw) if not inventory_raw.empty else {}
+    site_units = units_by_site(inventory_raw, detected_mapping) if detected_mapping else pd.Series(dtype=float)
+    site_mapping = current_site_mapping()
+
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>Site categories</p>", unsafe_allow_html=True)
+        st.caption(
+            "**Warehouse** and **Clearance** stock is available to sell and counts towards stock health. "
+            "**Showroom** stock is display stock and is excluded. Codes left **Unmapped** are excluded and flagged. "
+            "Add a row for a new site code; codes are matched case-insensitively."
+        )
+        editor_frame = site_mapping_frame(site_mapping, site_units)
+        st.session_state["site_editor_frame"] = editor_frame
+        editor_key = f"backend_site_editor_{st.session_state['site_editor_version']}"
+        st.data_editor(
+            editor_frame,
+            key=editor_key,
+            on_change=apply_site_editor_changes,
+            num_rows="dynamic",
+            hide_index=True,
+            disabled=["Available to sell", "In inventory export", "Units on hand"],
+            column_config={
+                "Site code": st.column_config.TextColumn(required=True, max_chars=12, validate=r"^\s*[A-Za-z0-9_-]+\s*$"),
+                "Category": st.column_config.SelectboxColumn(options=SITE_CATEGORIES, required=True),
+                "Available to sell": st.column_config.CheckboxColumn(help="Derived from the category."),
+                "In inventory export": st.column_config.CheckboxColumn(help="The code appears in the current inventory export."),
+                "Units on hand": st.column_config.NumberColumn(format="%d", help="All SKUs at this site in the current export."),
+            },
+            height=table_height(len(editor_frame), cap=520),
+            **FULL_WIDTH,
+        )
+
+        unmapped = sorted(code for code in site_units.index if code and code not in site_mapping)
+        categorised_units = {
+            category: float(sum(units for code, units in site_units.items() if site_mapping.get(code) == category))
+            for category in SITE_CATEGORIES[:-1]
+        }
+        summary_bits = [f"{category}: {units:,.0f} units" for category, units in categorised_units.items()]
+        st.caption(
+            " · ".join(summary_bits)
+            + (f" · **Unmapped: {', '.join(unmapped)}**" if unmapped else " · all site codes in the export are categorised")
+        )
+
+        action_reset, action_save, action_download, _ = st.columns([1, 1, 1, 3], gap="small")
+        if action_reset.button("Reset to defaults", key="backend_reset", **FULL_WIDTH):
+            st.session_state["site_mapping"] = dict(DEFAULT_SITE_MAPPING)
+            st.session_state["site_editor_version"] += 1
+            st.rerun()
+        if action_save.button("Save as deployment default", key="backend_save", **FULL_WIDTH, help=f"Writes {MAPPING_FILE.name} next to app.py."):
+            try:
+                save_backend_mapping_file(
+                    {
+                        "site_mapping": st.session_state["site_mapping"],
+                        "column_mapping": st.session_state["inventory_column_mapping"],
+                        "cost_source": st.session_state["cost_source"],
+                    }
+                )
+                st.success(f"Saved to {MAPPING_FILE.name}. Commit it to the repository to keep it across redeploys.")
+            except OSError as e:
+                st.error(f"Could not write {MAPPING_FILE.name}: {e}")
+        action_download.download_button(
+            "Download JSON",
+            json.dumps(
+                {
+                    "site_mapping": st.session_state["site_mapping"],
+                    "column_mapping": st.session_state["inventory_column_mapping"],
+                    "cost_source": st.session_state["cost_source"],
+                },
+                indent=2,
+            ).encode("utf-8"),
+            file_name="backend_mapping.json",
+            mime="application/json",
+            key="backend_download",
+            **FULL_WIDTH,
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Inventory export columns
+    # ------------------------------------------------------------------
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>Inventory export columns</p>", unsafe_allow_html=True)
+        if inventory_raw.empty:
+            st.caption("No inventory export is loaded, so there is nothing to map yet.")
+        else:
+            st.caption(
+                "Detected automatically from the column headings; override any that are wrong. "
+                "SKU, on-hand quantity and site are what the stock-health analysis depends on."
+            )
+            detected = detect_inventory_columns(inventory_raw)
+            column_options = ["(auto)", "(none)"] + [str(col) for col in inventory_raw.columns]
+            overrides = dict(st.session_state["inventory_column_mapping"])
+            chooser_columns = st.columns(3, gap="small")
+            for index, (role, label) in enumerate(INVENTORY_ROLE_LABELS.items()):
+                current = overrides.get(role, "(auto)")
+                if current not in column_options:
+                    current = "(auto)"
+                auto_label = f"auto → {detected[role]}" if detected[role] else "auto → not found"
+                choice = chooser_columns[index % 3].selectbox(
+                    label,
+                    column_options,
+                    index=column_options.index(current),
+                    key=f"backend_column_{role}",
+                    help=auto_label,
+                )
+                if choice == "(auto)":
+                    overrides.pop(role, None)
+                else:
+                    overrides[role] = choice
+            st.session_state["inventory_column_mapping"] = overrides
+            with st.expander("Preview of the inventory export", expanded=False):
+                st.dataframe(inventory_raw.head(8), hide_index=True, **FULL_WIDTH)
+
+    # ------------------------------------------------------------------
+    # 3. Average option cost source
+    # ------------------------------------------------------------------
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>Average option cost</p>", unsafe_allow_html=True)
+        st.caption(
+            "The per-unit cost of one unit of a SKU/option. Total stock value = units on hand × this cost; "
+            "free stock value = free units × this cost. Gaps in the chosen source are filled from the others."
+        )
+        inventory_cost_col = resolve_inventory_mapping(inventory_raw).get("cost") if not inventory_raw.empty else None
+        options_cost_col = (
+            detect_column(options_raw.columns, INVENTORY_COLUMN_CANDIDATES["cost"],
+                          exclude=(detect_column(options_raw.columns, ["stock code", "sku", "sku key"]) or "",))
+            if options_raw is not None and not options_raw.empty else None
+        )
+        availability = {
+            "inventory": f"inventory export column '{inventory_cost_col}'" if inventory_cost_col else "no cost column found in the inventory export",
+            "options": f"options data column '{options_cost_col}'" if options_cost_col else "no cost column found in the options data",
+            "sales": "COGS ÷ units sold in the window, for SKUs with sales",
+        }
+        source_keys = list(COST_SOURCES)
+        chosen = st.radio(
+            "Cost source",
+            source_keys,
+            index=source_keys.index(st.session_state["cost_source"]),
+            format_func=lambda key: COST_SOURCES[key],
+            key="backend_cost_source_choice",
+            label_visibility="collapsed",
+        )
+        st.session_state["cost_source"] = chosen
+        st.caption(" · ".join(f"{COST_SOURCES[key].split(' (')[0]}: {text}" for key, text in availability.items()))
 
 # =============================================================================
 # Options Data tab
