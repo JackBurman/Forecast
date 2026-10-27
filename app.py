@@ -1130,6 +1130,10 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict) -> pd.DataFrame:
         frame["Inventory description"] = inventory[mapping["description"]].astype(str).str.strip()
     frame = frame.loc[frame["SKU"].ne("")]
 
+    if "Site" in frame.columns:
+        target_locations = {"W1SY", "W3ME", "W4PE", "W5BR"}
+        frame["Free stock"] = np.where(frame["Site"].isin(target_locations), frame["Free stock"], 0.0)
+
     aggregations = {"On hand": "sum", "Free stock": "sum"}
     if "Stock value" in frame.columns:
         aggregations["Stock value"] = "sum"
@@ -1912,7 +1916,6 @@ elif selected_tab == "Inventory Analysis":
                         {
                             str(value).strip()
                             for source in sources
-                            if source is not None
                             for value in source.dropna()
                             if str(value).strip() and str(value).strip().lower() != "nan"
                         },
