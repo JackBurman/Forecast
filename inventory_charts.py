@@ -30,12 +30,13 @@ import streamlit as st
 # chart so a colour means the same thing everywhere on the dashboard.
 # Colours are from the Okabe–Ito colour-blind-safe palette.
 # -----------------------------------------------------------------------------
-STATUS_ORDER = ["Healthy", "Stock-out risk", "Slow moving", "Dead stock", "Out of stock", "Inactive"]
+STATUS_ORDER = ["Healthy", "Stock-out risk", "Slow moving", "Dead stock", "Allocated", "Out of stock", "Inactive"]
 STATUS_COLOURS = {
     "Healthy": "#009e73",
     "Stock-out risk": "#cc79a7",
     "Slow moving": "#e69f00",
     "Dead stock": "#d55e00",
+    "Allocated": "#56b4e9",
     "Out of stock": "#0072b2",
     "Inactive": "#9aa0a6",
 }
