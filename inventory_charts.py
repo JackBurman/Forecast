@@ -2,7 +2,7 @@
 
 Both charts take the SKU-level ``master`` frame produced by
 ``build_inventory_table`` (one row per SKU with ``Status``, ``On hand``,
-``Units sold``, ``Est. stock value`` and the product attributes) and return a
+``Free stock``, ``Total stock value``, ``Free stock value`` and the product attributes) and return a
 single-view or layered Altair chart, which is what lets Streamlit stretch them
 to the container width. Concatenated or faceted specs cannot be made
 responsive, so side-by-side panels are done with ``st.columns`` instead.
@@ -11,8 +11,11 @@ Usage inside the tab::
 
     from inventory_charts import stock_health_breakdown, stock_health_by_group, FULL_WIDTH
 
-    st.altair_chart(stock_health_breakdown(filtered), **FULL_WIDTH)
-    st.altair_chart(stock_health_by_group(filtered, "Supplier"), **FULL_WIDTH)
+    st.altair_chart(stock_health_breakdown(filtered, measure="units"), **FULL_WIDTH)
+    st.altair_chart(stock_health_by_group(filtered, "Supplier", measure="free_value"), **FULL_WIDTH)
+
+Measures: "units" (on hand), "skus", "total_value" (on hand × average option
+cost) and "free_value" (free stock × average option cost).
 """
 from __future__ import annotations
 
@@ -38,13 +41,42 @@ STATUS_COLOURS = {
 }
 STATUS_RANK = {status: rank for rank, status in enumerate(STATUS_ORDER)}
 
-Measure = Literal["units", "skus", "value"]
+Measure = Literal["units", "skus", "total_value", "free_value"]
 MEASURES = {
     # key: (aggregated column, axis title, D3 axis format, D3 label/tooltip format)
     "units": ("units", "Units on hand", "~s", ",.0f"),
-    "skus": ("skus", "SKUs", "~s", ",.0f"),
-    "value": ("value", "Stock value", "$~s", "$,.0f"),
+    "skus": ("skus", "Active SKUs", "~s", ",.0f"),
+    "total_value": ("total_value", "Total stock value", "$~s", "$,.0f"),
+    "free_value": ("free_value", "Free stock value", "$~s", "$,.0f"),
 }
+MEASURE_LABELS = {"units": "Units on hand", "skus": "SKUs", "total_value": "Total stock value", "free_value": "Free stock value"}
+
+# Columns of the master frame each aggregate is built from.
+AGGREGATIONS = {
+    "units": ("On hand", "sum"),
+    "skus": ("SKU", "nunique"),
+    "total_value": ("Total stock value", "sum"),
+    "free_value": ("Free stock value", "sum"),
+}
+
+
+def _aggregate(frame: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """Sum units / values and count SKUs for each group, tolerating missing value columns."""
+    available = {name: spec for name, spec in AGGREGATIONS.items() if spec[0] in frame.columns}
+    out = frame.groupby(by).agg(**available).reset_index()
+    for name in AGGREGATIONS:
+        if name not in out.columns:
+            out[name] = 0.0
+    return out
+
+
+def _measure_tooltips() -> list[alt.Tooltip]:
+    return [
+        alt.Tooltip("units:Q", title="Units on hand", format=",.0f"),
+        alt.Tooltip("skus:Q", title="SKUs", format=",.0f"),
+        alt.Tooltip("total_value:Q", title="Total stock value", format="$,.0f"),
+        alt.Tooltip("free_value:Q", title="Free stock value", format="$,.0f"),
+    ]
 
 
 def python_format(value: float, d3_format: str) -> str:
@@ -112,13 +144,8 @@ def row_height(rows: int, per_row: int = 30, minimum: int = 120, extra: int = 30
 # -----------------------------------------------------------------------------
 
 def _status_summary(master: pd.DataFrame) -> pd.DataFrame:
-    summary = (
-        master.groupby("Status")
-        .agg(units=("On hand", "sum"), skus=("SKU", "nunique"), value=("Est. stock value", "sum"))
-        .reindex([status for status in STATUS_ORDER if status in set(master["Status"])])
-        .fillna(0.0)
-        .reset_index()
-    )
+    present = [status for status in STATUS_ORDER if status in set(master["Status"])]
+    summary = _aggregate(master, ["Status"]).set_index("Status").reindex(present).fillna(0.0).reset_index()
     total_units = summary["units"].sum()
     total_skus = summary["skus"].sum()
     summary["units_share"] = summary["units"] / total_units if total_units else 0.0
@@ -129,8 +156,8 @@ def _status_summary(master: pd.DataFrame) -> pd.DataFrame:
 def stock_health_breakdown(master: pd.DataFrame, measure: Measure = "units", bar_size: int = 22) -> alt.LayerChart:
     """Horizontal bars by status for one measure, labelled with that measure and the SKU count.
 
-    ``measure`` selects the bar length: "units" (on hand), "skus" or "value".
-    Tooltips always carry units, SKUs, stock value and shares.
+    ``measure`` selects the bar length: "units", "skus", "total_value" or
+    "free_value". Tooltips always carry all four plus the shares.
     """
     summary = _status_summary(master)
     column, axis_title, axis_fmt, number_fmt = MEASURES[measure]
@@ -147,11 +174,9 @@ def stock_health_breakdown(master: pd.DataFrame, measure: Measure = "units", bar
 
     tooltip = [
         alt.Tooltip("Status:N"),
-        alt.Tooltip("units:Q", title="Units on hand", format=",.0f"),
+        *_measure_tooltips(),
         alt.Tooltip("units_share:Q", title="Share of units", format=".0%"),
-        alt.Tooltip("skus:Q", title="SKUs", format=",.0f"),
         alt.Tooltip("skus_share:Q", title="Share of SKUs", format=".0%"),
-        alt.Tooltip("value:Q", title="Stock value", format="$,.0f"),
     ]
 
     bars = (
@@ -194,11 +219,7 @@ def stock_health_by_group(
     frame = master.copy()
     frame[group_col] = frame[group_col].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
 
-    agg = (
-        frame.groupby([group_col, "Status"])
-        .agg(units=("On hand", "sum"), skus=("SKU", "nunique"), value=("Est. stock value", "sum"))
-        .reset_index()
-    )
+    agg = _aggregate(frame, [group_col, "Status"])
     agg = agg.loc[agg[column] > 0]
     totals = agg.groupby(group_col)[column].sum().sort_values(ascending=False)
     order = totals.index[:top_n].tolist()
@@ -229,9 +250,7 @@ def stock_health_by_group(
             tooltip=[
                 alt.Tooltip(f"{group_col}:N"),
                 alt.Tooltip("Status:N"),
-                alt.Tooltip("units:Q", title="Units on hand", format=",.0f"),
-                alt.Tooltip("skus:Q", title="SKUs", format=",.0f"),
-                alt.Tooltip("value:Q", title="Stock value", format="$,.0f"),
+                *_measure_tooltips(),
                 alt.Tooltip("share:Q", title=f"Share of group {axis_title.lower()}", format=".0%"),
                 alt.Tooltip("group_total:Q", title=f"Group {axis_title.lower()}", format=number_fmt),
             ],
