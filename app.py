@@ -413,6 +413,16 @@ def xlrd_available() -> bool:
     return True
 
 
+def calamine_available() -> bool:
+    """python-calamine is installed and this pandas knows the 'calamine' engine (2.2+)."""
+    try:
+        import python_calamine  # noqa: F401
+    except ImportError:
+        return False
+    major, minor = (int(part) for part in pd.__version__.split(".")[:2])
+    return (major, minor) >= (2, 2)
+
+
 def workbook_problem(path: Path) -> str | None:
     """A sentence describing why the file cannot be read, or None when it can."""
     kind = sniff_workbook(path)
@@ -461,12 +471,17 @@ def _read_excel_by_content(io, *args, **kwargs):
 
     forecast_engine reads the Raw_data workbooks with pd.read_excel, so this is
     the one place its reads can be made content-aware without editing it. An
-    explicit engine= argument is always respected.
+    explicit engine= argument is respected, except that engine="calamine" (which
+    forecast_engine asks for) falls back to content-based reading when the
+    python-calamine package is not installed, instead of failing the load.
     """
-    if "engine" not in kwargs and isinstance(io, (str, Path)):
+    engine = kwargs.get("engine")
+    if isinstance(io, (str, Path)):
         path = Path(io)
         if path.is_file() and path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
-            return read_workbook(path, *args, **kwargs)
+            if engine is None or (engine == "calamine" and not calamine_available()):
+                kwargs.pop("engine", None)
+                return read_workbook(path, *args, **kwargs)
     return _pandas_read_excel(io, *args, **kwargs)
 
 
