@@ -1384,7 +1384,7 @@ def table_height(rows: int, cap: int = 420) -> int:
 
 header_left, header_right = st.columns([6, 1], gap="small", vertical_alignment="center")
 with header_left:
-    st.title("📦 Forecasting & Purchasing System")
+    st.title("📦 Forecast and Inventory Program")
 with header_right:
     if st.button("🔄 Refresh data", **FULL_WIDTH):
         load_csv.clear()
@@ -1392,7 +1392,7 @@ with header_right:
         st.rerun()
 
 st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: -60px;'>"
+    "<div style='text-align: center; margin-top: -10px;'>"
     "<img src='https://livingedge.com.au/on/demandware.static/-/Library-Sites-shared_library/default/dw1e07d773/logo.svg' width='100'>"
     "</div>",
     unsafe_allow_html=True,
