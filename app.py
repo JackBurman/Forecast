@@ -1114,7 +1114,38 @@ def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFram
 # Inventory analysis
 # =============================================================================
 
-STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out of stock", "Inactive"]
+STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Allocated", "Out of stock", "Inactive"]
+
+# SKU / stock-code patterns. Checked in this order: the *SHOW* rule wins over a
+# prefix because it is the more specific signal, then the letter prefixes,
+# then the leading digit.
+SKU_TYPE_RULES = [
+    ("Legacy showroom display (*SHOW*)", lambda code: "SHOW" in code),
+    ("Clearance product (LEX*)", lambda code: code.startswith("LEX")),
+    ("Consignment (C*)", lambda code: code.startswith("C")),
+    ("Standard (1*)", lambda code: code.startswith("1")),
+    ("Part (4*)", lambda code: code.startswith("4")),
+    ("Project (5*)", lambda code: code.startswith("5")),
+    ("Bundled (6*)", lambda code: code.startswith("6")),
+]
+SKU_TYPES = [label for label, _ in SKU_TYPE_RULES] + ["Other"]
+
+
+def classify_sku(code) -> str:
+    """Product classification from the stock code pattern (see SKU_TYPE_RULES)."""
+    text = "" if pd.isna(code) else str(code).strip().upper()
+    if not text:
+        return "Other"
+    for label, matches in SKU_TYPE_RULES:
+        if matches(text):
+            return label
+    return "Other"
+
+
+def sku_type_rules_table() -> pd.DataFrame:
+    """The rules as a small table for the Backend Mapping tab."""
+    patterns = ["contains SHOW", "starts with LEX", "starts with C", "starts with 1", "starts with 4", "starts with 5", "starts with 6", "anything else"]
+    return pd.DataFrame({"Order": range(1, len(SKU_TYPES) + 1), "SKU type": SKU_TYPES, "Rule": patterns})
 
 
 # -----------------------------------------------------------------------------
@@ -1122,13 +1153,19 @@ STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Out o
 #
 # Every inventory row carries a site code. Codes are mapped to a category, and
 # only Warehouse and Clearance stock is "available to sell": showroom stock is
-# display stock and is excluded from stock health, days of supply, turns and
-# value. The mapping lives in session state (editable on the Backend Mapping
-# tab) and can be saved to backend_mapping.json next to app.py as the default
-# for the deployment.
+# display stock, and Ignored / Unmapped sites are skipped, so none of those
+# count towards stock health, days of supply, turns or value. The mapping
+# lives in session state (editable on the Backend Mapping tab) and can be
+# saved to backend_mapping.json next to app.py as the default for the
+# deployment.
 # -----------------------------------------------------------------------------
 
-SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Unmapped"]
+# Showroom: display stock, excluded. Warehouse / Clearance: available to sell.
+# Ignored: deliberately not tracked (quarantine, returns, transit...) - skipped
+# silently. Unmapped: a code seen in the export that nobody has categorised yet
+# - excluded like Ignored, but flagged so it gets a decision.
+SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Ignored", "Unmapped"]
+ASSIGNABLE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Ignored"]
 SELLABLE_CATEGORIES = {"Warehouse", "Clearance"}
 CATEGORY_ORDER = {category: index for index, category in enumerate(SITE_CATEGORIES)}
 DEFAULT_SITE_MAPPING = {
@@ -1253,8 +1290,8 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     """One row per SKU: available-to-sell stock (Warehouse + Clearance sites) plus context.
 
     Columns: On hand / Free stock (sellable sites only), On hand (all sites),
-    Showroom units, Unmapped units, Sites with stock, and when the export has
-    a cost column, Inventory unit cost (weighted by units on hand).
+    Showroom units, Ignored units, Unmapped units, Sites with stock, and when
+    the export has a cost column, Inventory unit cost (weighted by units on hand).
     """
     frame = pd.DataFrame({"SKU": inventory[mapping["sku"]].map(sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
@@ -1286,6 +1323,9 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
     )
     out["Unmapped units"] = (
         frame.loc[frame["Category"].eq("Unmapped")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
+    )
+    out["Ignored units"] = (
+        frame.loc[frame["Category"].eq("Ignored")].groupby("SKU")["On hand"].sum().reindex(skus).fillna(0.0)
     )
     out["Sites with stock"] = (
         sellable.loc[sellable["On hand"] > 0].groupby("SKU")["Site"].nunique().reindex(skus).fillna(0).astype(int)
@@ -1437,16 +1477,18 @@ def build_inventory_table(
     for column in ["Supplier", "Class", "Product group"]:
         master[column] = master[column].fillna("Unknown").astype(str).replace({"": "Unknown", "nan": "Unknown"})
 
-    for column in ["On hand", "Free stock", "On hand (all sites)", "Showroom units", "Unmapped units",
+    for column in ["On hand", "Free stock", "On hand (all sites)", "Showroom units", "Ignored units", "Unmapped units",
                    "Units sold", "Sales value", "COGS", "Months with sales"]:
         master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0.0) if column in master.columns else 0.0
     if not open_po.empty:
         master["Open PO qty"] = master["SKU"].map(open_po).fillna(0.0)
 
+    master["SKU type"] = master["SKU"].map(classify_sku)
     master["Avg monthly units"] = master["Units sold"] / window_months
     daily_rate = master["Units sold"] / window_days
     with np.errstate(divide="ignore", invalid="ignore"):
         master["Days of supply"] = np.where(daily_rate > 0, master["On hand"] / daily_rate, np.inf)
+        master["Days of supply (free)"] = np.where(daily_rate > 0, master["Free stock"] / daily_rate, np.inf)
         master["Turns (annualised)"] = np.where(
             master["On hand"] > 0, (master["Units sold"] * 12 / window_months) / master["On hand"], np.nan
         )
@@ -1467,24 +1509,42 @@ def build_inventory_table(
     master["Last sale"] = last_sale
     master["Days since last sale"] = (today - last_sale).dt.days
 
+    # Status, first match wins:
+    #   Out of stock   - nothing on hand, but it sold in the window
+    #   Inactive       - nothing on hand and no sales
+    #   Stock-out risk - still moving (sold within dead_days) and free stock covers
+    #                    fewer than risk_dos days (free, not on hand: allocated units
+    #                    cannot be sold again)
+    #   Allocated      - on hand but no free stock: committed to sales orders, so
+    #                    exempt from dead / slow classification whatever the last sale date
+    #   Dead stock     - free stock with no sale for dead_days (or never sold)
+    #   Slow moving    - more than slow_dos days of supply
+    #   Healthy        - everything else
     on_hand = master["On hand"]
+    free = master["Free stock"]
     dos = master["Days of supply"]
+    free_dos = master["Days of supply (free)"]
+    selling = master["Units sold"] > 0
+    allocated = (on_hand > 0) & (free <= 0)
     never_or_stale = last_sale.isna() | (master["Days since last sale"] > dead_days)
     master["Status"] = np.select(
         [
-            (on_hand <= 0) & (master["Units sold"] > 0),
+            (on_hand <= 0) & selling,
             on_hand <= 0,
+            (on_hand > 0) & selling & ~never_or_stale & (free_dos < risk_dos),
+            allocated,
             (on_hand > 0) & never_or_stale,
             (on_hand > 0) & (dos > slow_dos),
-            (on_hand > 0) & (dos < risk_dos),
         ],
-        ["Out of stock", "Inactive", "Dead stock", "Slow moving", "Stock-out risk"],
+        ["Out of stock", "Inactive", "Stock-out risk", "Allocated", "Dead stock", "Slow moving"],
         default="Healthy",
     )
     master["Active"] = master["Status"].ne("Inactive")
     master["Dead units"] = np.where(master["Status"] == "Dead stock", on_hand, 0.0)
     master["Slow units"] = np.where(master["Status"] == "Slow moving", on_hand, 0.0)
+    master["Allocated units"] = np.where(master["Status"] == "Allocated", on_hand, 0.0)
     master["Days of supply"] = master["Days of supply"].replace(np.inf, np.nan)
+    master["Days of supply (free)"] = master["Days of supply (free)"].replace(np.inf, np.nan)
     if "Days of supply incl. POs" in master.columns:
         master["Days of supply incl. POs"] = master["Days of supply incl. POs"].replace(np.inf, np.nan)
     return master.sort_values("On hand", ascending=False).reset_index(drop=True)
@@ -1504,6 +1564,7 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
             "Free stock value": ("Free stock value", "sum"),
             "Dead units": ("Dead units", "sum"),
             "Slow units": ("Slow units", "sum"),
+            "Allocated units": ("Allocated units", "sum"),
             "Stock-out risk SKUs": ("Status", lambda s: int((s == "Stock-out risk").sum())),
         }
     )
@@ -1516,374 +1577,6 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
         )
         grouped["Dead stock %"] = np.where(grouped["On hand"] > 0, grouped["Dead units"] / grouped["On hand"] * 100, np.nan)
     return grouped.sort_values("On hand", ascending=False).reset_index()
-
-
-# =============================================================================
-# Purchasing / replenishment
-#
-# Net requirement per SKU over the replenishment horizon (lead time + review
-# period), priced at Purchase Ex GST, then allocated against a budget in
-# sales-velocity order. Every step is a plain pandas function so the numbers
-# can be checked outside Streamlit.
-# =============================================================================
-
-PRICE_HEADERS = ["purchase ex gst", "purchase price ex gst", "purchase price", "buy price", "cost ex gst",
-                 "landed cost", "purchase cost", "unit cost", "cost"]
-MOQ_HEADERS = ["moq", "minimum order qty", "minimum order quantity", "min order qty", "order multiple",
-               "pack size", "carton qty", "carton quantity"]
-LINKED_PO_HEADERS = ["linked qty", "linked quantity", "linked", "allocated qty", "allocated", "committed qty", "committed"]
-UNLINKED_PO_HEADERS = ["unlinked qty", "unlinked quantity", "unlinked", "unallocated qty", "unallocated", "free po qty"]
-VELOCITY_COLUMNS = {"Units sold": "Units sold", "Sales value": "Sales value", "Turnover rate": "Turns (annualised)"}
-RANK_WITHIN_COLUMNS = {"Fourth product group": "Product group", "Supplier": "Supplier", "Class": "Class", "Overall": None}
-UPLIFT_FLOOR, UPLIFT_CAP = 0.5, 2.0
-
-
-def option_purchase_terms(options: pd.DataFrame | None) -> pd.DataFrame:
-    """Per-SKU Purchase Ex GST and MOQ from the options data, where such columns exist."""
-    empty = pd.DataFrame(columns=["SKU", "Purchase Ex GST", "MOQ"])
-    if options is None or options.empty:
-        return empty
-    sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
-    if sku_col is None:
-        return empty
-    price_col = detect_column(options.columns, PRICE_HEADERS, exclude=(sku_col,))
-    moq_col = detect_column(options.columns, MOQ_HEADERS, exclude=(sku_col, price_col or ""))
-    frame = pd.DataFrame({"SKU": options[sku_col].map(sku_text)})
-    frame["Purchase Ex GST"] = to_number(options[price_col]) if price_col else np.nan
-    frame["MOQ"] = to_number(options[moq_col]) if moq_col else np.nan
-    frame.attrs["price_column"] = price_col
-    frame.attrs["moq_column"] = moq_col
-    return frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])
-
-
-def open_po_detail(
-    purchase_orders: pd.DataFrame | None, today: pd.Timestamp, horizon_days: int, include_overdue: bool
-) -> pd.DataFrame:
-    """Per-SKU open purchase orders: linked (allocated to customer orders), unlinked, and the
-    unlinked quantity due inside the horizon, which is what counts as supply."""
-    columns = ["SKU", "Open PO linked", "Open PO unlinked", "PO supply in horizon", "Next ETA"]
-    if purchase_orders is None or purchase_orders.empty or "Open PO Qty" not in purchase_orders.columns:
-        return pd.DataFrame(columns=columns)
-    sku_col = detect_column(purchase_orders.columns, SKU_HEADERS)
-    if sku_col is None:
-        return pd.DataFrame(columns=columns)
-    frame = pd.DataFrame({"SKU": purchase_orders[sku_col].map(sku_text)})
-    frame["Open"] = to_number(purchase_orders["Open PO Qty"]).fillna(0.0)
-    linked_col = detect_column(purchase_orders.columns, LINKED_PO_HEADERS, exclude=(sku_col, "Open PO Qty"))
-    unlinked_col = detect_column(purchase_orders.columns, UNLINKED_PO_HEADERS, exclude=(sku_col, "Open PO Qty", linked_col or ""))
-    if unlinked_col:
-        frame["Unlinked"] = to_number(purchase_orders[unlinked_col]).fillna(0.0)
-        frame["Linked"] = (
-            to_number(purchase_orders[linked_col]).fillna(0.0) if linked_col else (frame["Open"] - frame["Unlinked"]).clip(lower=0)
-        )
-    elif linked_col:
-        frame["Linked"] = to_number(purchase_orders[linked_col]).fillna(0.0)
-        frame["Unlinked"] = (frame["Open"] - frame["Linked"]).clip(lower=0)
-    else:
-        frame["Linked"] = 0.0
-        frame["Unlinked"] = frame["Open"]
-    frame["ETA"] = parse_dates(purchase_orders["Date"]) if "Date" in purchase_orders.columns else pd.NaT
-    frame = frame.loc[frame["SKU"].ne("")]
-
-    horizon_end = today + pd.Timedelta(days=horizon_days)
-    on_time = frame["ETA"].notna() & (frame["ETA"] >= today) & (frame["ETA"] <= horizon_end)
-    overdue = frame["ETA"].notna() & (frame["ETA"] < today)
-    frame["In horizon"] = np.where(on_time | (overdue & include_overdue), frame["Unlinked"], 0.0)
-    grouped = frame.groupby("SKU")
-    out = pd.DataFrame(
-        {
-            "Open PO linked": grouped["Linked"].sum(),
-            "Open PO unlinked": grouped["Unlinked"].sum(),
-            "PO supply in horizon": grouped["In horizon"].sum(),
-            "Next ETA": grouped["ETA"].min(),
-        }
-    ).reset_index()
-    out.attrs["linked_column"] = linked_col
-    out.attrs["unlinked_column"] = unlinked_col
-    return out
-
-
-def forecast_units_over_days(forecast_by_month: pd.Series, start: pd.Timestamp, days: int) -> float:
-    """Sum a monthly forecast over a span of days, pro-rating each month by its days."""
-    total = 0.0
-    for day in pd.date_range(start, periods=days, freq="D"):
-        period = day.to_period("M")
-        if period in forecast_by_month.index and pd.notna(forecast_by_month[period]):
-            total += float(forecast_by_month[period]) / period.days_in_month
-    return total
-
-
-def demand_uplift(sales: pd.DataFrame, window_start: pd.Period, window_end: pd.Period, horizon_days: int, today: pd.Timestamp) -> float:
-    """How much busier the coming horizon is expected to be than the trailing window, from the
-    app's rolling forecast of total units; clipped to [0.5, 2.0] and 1.0 when there is no history."""
-    result = build_forecasts(sales, "Qty", 0.5, 1.0, today=today)
-    frames = [frame for frame in (result["forecast_this"], result["forecast_next"]) if not frame.empty]
-    if not frames or result["actual"].empty:
-        return 1.0
-    forecast = pd.concat(
-        [pd.Series(frame["Forecast"].values, index=pd.to_datetime(frame["Date"]).dt.to_period("M")) for frame in frames]
-    )
-    window_units = float(result["actual"].reindex(pd.period_range(window_start, window_end, freq="M")).fillna(0.0).sum())
-    window_days = sum(period.days_in_month for period in pd.period_range(window_start, window_end, freq="M"))
-    trailing_rate = window_units / window_days if window_days else 0.0
-    if trailing_rate <= 0:
-        return 1.0
-    horizon_units = forecast_units_over_days(forecast, today + pd.Timedelta(days=1), horizon_days)
-    if horizon_units <= 0:
-        return 1.0
-    return float(min(max((horizon_units / horizon_days) / trailing_rate, UPLIFT_FLOOR), UPLIFT_CAP))
-
-
-def build_purchase_plan(
-    master: pd.DataFrame,
-    po_detail: pd.DataFrame,
-    terms: pd.DataFrame,
-    uplift: float,
-    window_months: int,
-    window_days: int,
-    lead_time_days: int,
-    review_days: int,
-    safety_days: int,
-    today: pd.Timestamp,
-    round_to_moq: bool,
-) -> pd.DataFrame:
-    """SKU-level requirement:
-
-        rate            = units sold in window ÷ window days × uplift
-        forecast demand = rate × (lead time + review period)
-        safety stock    = rate × safety days
-        supply          = free stock + unlinked open POs due inside the horizon
-        net requirement = max(0, forecast demand + safety stock − supply)
-        recommended qty = net requirement rounded up (to MOQ / order multiple when known)
-        extended cost   = recommended qty × Purchase Ex GST
-    """
-    horizon_days = lead_time_days + review_days
-    plan = master.merge(po_detail, on="SKU", how="left").merge(terms.drop(columns=[], errors="ignore"), on="SKU", how="left")
-    for column in ["Open PO linked", "Open PO unlinked", "PO supply in horizon"]:
-        plan[column] = pd.to_numeric(plan.get(column), errors="coerce").fillna(0.0) if column in plan.columns else 0.0
-    if "Next ETA" not in plan.columns:
-        plan["Next ETA"] = pd.NaT
-
-    plan["Velocity (units/month)"] = plan["Units sold"] / window_months
-    rate = plan["Units sold"] / window_days * uplift
-    plan["Forecast demand"] = rate * horizon_days
-    plan["Safety stock"] = rate * safety_days
-    plan["Target stock"] = plan["Forecast demand"] + plan["Safety stock"]
-    plan["Supply"] = plan["Free stock"] + plan["PO supply in horizon"]
-    plan["Net requirement"] = (plan["Target stock"] - plan["Supply"]).clip(lower=0.0)
-
-    recommended = np.ceil(plan["Net requirement"] - 1e-9)
-    moq = pd.to_numeric(plan.get("MOQ"), errors="coerce") if "MOQ" in plan.columns else pd.Series(np.nan, index=plan.index)
-    if round_to_moq:
-        has_moq = moq.notna() & (moq > 0) & (recommended > 0)
-        recommended = np.where(has_moq, np.ceil(recommended / moq.fillna(1)) * moq.fillna(1), recommended)
-    plan["Recommended qty"] = pd.Series(recommended, index=plan.index).astype(float).clip(lower=0.0) + 0.0  # +0.0 turns -0.0 into 0.0
-
-    price = pd.to_numeric(plan.get("Purchase Ex GST"), errors="coerce") if "Purchase Ex GST" in plan.columns else pd.Series(np.nan, index=plan.index)
-    fallback = pd.to_numeric(plan["Avg option cost"], errors="coerce")
-    plan["Price source"] = np.where(price.notna() & (price > 0), "options", np.where(fallback.notna() & (fallback > 0), "avg option cost", "none"))
-    plan["Purchase Ex GST"] = price.where(price.notna() & (price > 0), fallback)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        days_cover = np.where(rate > 0, plan["Supply"] / rate, np.inf)
-    plan["Days of cover"] = pd.Series(days_cover, index=plan.index).replace(np.inf, np.nan)
-    plan["Stock-out date"] = pd.to_datetime(
-        [today + pd.Timedelta(days=float(d)) if pd.notna(d) else pd.NaT for d in plan["Days of cover"]]
-    )
-    plan["Horizon days"] = horizon_days
-    return plan
-
-
-def allocate_budget(
-    plan: pd.DataFrame,
-    budget: float | None,
-    velocity_column: str,
-    within_column: str | None,
-    order_qty_column: str = "Order qty",
-) -> pd.DataFrame:
-    """Rank purchase lines by sales velocity and fund them in that order until the budget is used.
-
-    The score is each SKU's percentile rank of ``velocity_column`` within its
-    ``within_column`` group (1.0 = the group's top seller), so every group's
-    best sellers compete on equal terms instead of one high-volume group
-    taking the whole budget. Ties break on absolute velocity. Whole lines are
-    funded in priority order; a line that no longer fits is deferred and the
-    walk continues, so smaller lines further down can still be funded.
-    ``budget`` of None (or 0) means no cap. Returns the plan with Priority,
-    Group rank, Cumulative spend, Funded spend to here, Funded and Status.
-    """
-    plan = plan.copy()
-    plan["Extended cost"] = plan[order_qty_column].fillna(0.0) * plan["Purchase Ex GST"].fillna(0.0)
-    is_line = plan["Include"].fillna(True).astype(bool) & (plan[order_qty_column].fillna(0.0) > 0)
-    velocity = pd.to_numeric(plan[velocity_column], errors="coerce").fillna(0.0)
-
-    if within_column and within_column in plan.columns:
-        group = plan[within_column].fillna("Unknown").astype(str)
-        score = velocity.groupby(group).rank(method="average", pct=True)
-        group_rank = velocity.groupby(group).rank(method="first", ascending=False)
-    else:
-        score = velocity.rank(method="average", pct=True)
-        group_rank = velocity.rank(method="first", ascending=False)
-    plan["Priority score"] = score.where(is_line)
-    plan["Group rank"] = group_rank.where(is_line)
-
-    lines = plan.loc[is_line].copy()
-    lines["_velocity"] = velocity[is_line]
-    lines = lines.sort_values(["Priority score", "_velocity", "Extended cost"], ascending=[False, False, True])
-    lines["Priority"] = np.arange(1, len(lines) + 1)
-    lines["Cumulative spend"] = lines["Extended cost"].cumsum()
-    cap = budget if budget and budget > 0 else None
-    if cap is None:
-        lines["Funded"] = True
-    else:
-        # Walk the list in priority order funding every whole line that still fits.
-        # A line too large for what is left is deferred and the walk continues,
-        # so one oversized line does not block smaller ones further down.
-        funded, remaining = [], cap
-        for cost in lines["Extended cost"].tolist():
-            fits = cost <= remaining + 1e-9
-            funded.append(fits)
-            if fits:
-                remaining -= cost
-        lines["Funded"] = funded
-    lines["Funded spend to here"] = lines["Extended cost"].where(lines["Funded"], 0.0).cumsum()
-
-    plan["Priority"] = np.nan
-    plan["Cumulative spend"] = np.nan
-    plan["Funded spend to here"] = np.nan
-    plan["Funded"] = False
-    plan.loc[lines.index, ["Priority", "Cumulative spend", "Funded spend to here", "Funded"]] = lines[
-        ["Priority", "Cumulative spend", "Funded spend to here", "Funded"]
-    ]
-    plan["Status"] = np.select(
-        [
-            ~plan["Include"].fillna(True).astype(bool),
-            ~is_line,
-            plan["Funded"].astype(bool),
-        ],
-        ["Excluded", "No purchase needed", "Within budget"],
-        default="Deferred",
-    )
-    return plan.sort_values(["Priority", "Velocity (units/month)"], ascending=[True, False], na_position="last").reset_index(drop=True)
-
-
-def budget_summary(plan: pd.DataFrame, budget: float | None) -> dict:
-    lines = plan.loc[plan["Status"].isin(["Within budget", "Deferred"])]
-    funded = lines.loc[lines["Status"].eq("Within budget")]
-    total = float(lines["Extended cost"].sum())
-    funded_spend = float(funded["Extended cost"].sum())
-    cap = budget if budget and budget > 0 else None
-    return {
-        "total_spend": total,
-        "funded_spend": funded_spend,
-        "deferred_spend": total - funded_spend,
-        "budget": cap,
-        "variance": (total - cap) if cap is not None else None,
-        "remaining": (cap - funded_spend) if cap is not None else None,
-        "lines": int(len(lines)),
-        "funded_lines": int(len(funded)),
-        "deferred_lines": int(len(lines) - len(funded)),
-    }
-
-
-def apply_purchasing_overrides(plan: pd.DataFrame, overrides: dict) -> pd.DataFrame:
-    """Per-SKU edits made in the purchasing table (order qty, price, include) on top of the recommendation."""
-    plan = plan.copy()
-    plan["Order qty"] = plan["Recommended qty"]
-    plan["Include"] = True
-    for sku, changes in overrides.items():
-        mask = plan["SKU"].eq(sku)
-        if not mask.any():
-            continue
-        if "Order qty" in changes and pd.notna(changes["Order qty"]):
-            plan.loc[mask, "Order qty"] = float(changes["Order qty"])
-        if "Purchase Ex GST" in changes and pd.notna(changes["Purchase Ex GST"]):
-            plan.loc[mask, "Purchase Ex GST"] = float(changes["Purchase Ex GST"])
-            plan.loc[mask, "Price source"] = "manual"
-        if "Include" in changes:
-            plan.loc[mask, "Include"] = bool(changes["Include"])
-    return plan
-
-
-def record_purchasing_edits() -> None:
-    """on_change for the purchasing editor: keep edits per SKU so they survive filter changes."""
-    key = st.session_state.get("purchasing_editor_key")
-    state = st.session_state.get(key, {}) if key else {}
-    frame = st.session_state.get("purchasing_editor_frame")
-    if frame is None:
-        return
-    overrides = dict(st.session_state.get("purchasing_overrides", {}))
-    for row, changes in state.get("edited_rows", {}).items():
-        sku = frame.iloc[int(row)]["SKU"]
-        current = dict(overrides.get(sku, {}))
-        current.update({column: value for column, value in changes.items() if column in ("Order qty", "Purchase Ex GST", "Include")})
-        overrides[sku] = current
-    st.session_state["purchasing_overrides"] = overrides
-
-
-def budget_curve_chart(plan: pd.DataFrame, budget: float | None) -> alt.LayerChart:
-    """Line cost by priority (green = funded, orange = deferred) with the funded running total
-    stepping up towards the budget line. Reads left to right as 'what the budget buys'."""
-    lines = plan.loc[plan["Status"].isin(["Within budget", "Deferred"])].sort_values("Priority")
-    data = pd.DataFrame(
-        {
-            "Priority": lines["Priority"].astype(int),
-            "SKU": lines["SKU"],
-            "Description": lines["Description"],
-            "Line cost": lines["Extended cost"],
-            "Funded spend to here": lines["Funded spend to here"],
-            "Status": lines["Status"],
-        }
-    )
-    bar_size = max(3, min(18, int(640 / max(len(data), 1))))
-    priority_axis = alt.X(
-        "Priority:Q", title="Priority (1 = highest sales velocity within its group)",
-        axis=value_axis("d", grid=False, tickMinStep=1), scale=alt.Scale(nice=False, padding=bar_size),
-    )
-    bars = (
-        alt.Chart(data)
-        .mark_bar(size=bar_size)
-        .encode(
-            x=priority_axis,
-            y=alt.Y("Line cost:Q", title="Line cost (ex GST)", axis=value_axis("$~s")),
-            color=alt.Color(
-                "Status:N",
-                scale=alt.Scale(domain=["Within budget", "Deferred"], range=["#009e73", "#e69f00"]),
-                legend=alt.Legend(title=None, orient="top", direction="horizontal", padding=0, offset=4),
-            ),
-            tooltip=[
-                alt.Tooltip("Priority:Q"),
-                alt.Tooltip("SKU:N"),
-                alt.Tooltip("Description:N"),
-                alt.Tooltip("Status:N"),
-                alt.Tooltip("Line cost:Q", format="$,.0f"),
-                alt.Tooltip("Funded spend to here:Q", format="$,.0f"),
-            ],
-        )
-    )
-    funded_total = (
-        alt.Chart(data)
-        .mark_line(color="#0072b2", strokeWidth=2, interpolate="step-before", point=alt.OverlayMarkDef(size=18, color="#0072b2"))
-        .encode(
-            x=priority_axis,
-            y=alt.Y("Funded spend to here:Q", title="Funded running total (ex GST)", axis=value_axis("$~s", titleColor="#0072b2")),
-            tooltip=[alt.Tooltip("Priority:Q"), alt.Tooltip("Funded spend to here:Q", format="$,.0f")],
-        )
-    )
-    layers = [bars, funded_total]
-    if budget and budget > 0:
-        rule_data = pd.DataFrame({"budget": [budget], "label": [f"Budget ${budget:,.0f}"]})
-        layers.append(alt.Chart(rule_data).mark_rule(color="#0072b2", strokeDash=[5, 4], strokeWidth=1.5).encode(y=alt.Y("budget:Q")))
-        layers.append(
-            alt.Chart(rule_data).mark_text(align="left", baseline="bottom", dx=4, dy=-3, color="#0072b2", fontSize=11, fontWeight="bold")
-            .encode(y=alt.Y("budget:Q"), x=alt.value(0), text="label:N")
-        )
-    return (
-        alt.layer(bars, alt.layer(*layers[1:]))
-        .resolve_scale(y="independent")
-        .properties(height=260)
-        .configure_view(strokeWidth=0)
-    )
 
 
 # =============================================================================
@@ -2017,7 +1710,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 selected_tab = st.radio(
     "View",
-    ["Forecast", "Inventory Analysis", "Purchasing", "Backend Mapping", "Options Data", "Formatted Data", "Document Status"],
+    ["Forecast", "Inventory Analysis", "Backend Mapping", "Options Data", "Formatted Data", "Document Status"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -2480,6 +2173,8 @@ elif selected_tab == "Inventory Analysis":
                     "Product group": [attributes["Product group"], sales_data.get("OptionsData.Fourth Product Group")],
                 }
                 product_filters: dict[str, list[str]] = {}
+                product_filters["SKU type"] = st.multiselect("SKU type", SKU_TYPES, default=[], key="inventory_filter_SKU type",
+                                                             help="From the stock-code pattern; rules on the Backend Mapping tab.")
                 for label, sources in filter_sources.items():
                     values = sorted(
                         {
@@ -2554,18 +2249,20 @@ elif selected_tab == "Inventory Analysis":
                 # Site context for the caption: what was excluded, and anything unmapped.
                 site_units = units_by_site(inventory_raw, mapping)
                 showroom_units = float(sum(units for code, units in site_units.items() if site_mapping.get(code) == "Showroom"))
-                unmapped_codes = sorted(code for code in site_units.index if code and code not in site_mapping)
+                ignored_units = float(sum(units for code, units in site_units.items() if site_mapping.get(code) == "Ignored"))
+                unmapped_codes = sorted(code for code in site_units.index if code and site_mapping.get(code, "Unmapped") == "Unmapped")
 
                 context_col, group_col = st.columns([5, 2], gap="small", vertical_alignment="center")
                 with group_col:
                     group_by = st.selectbox(
-                        "Group by", ["SKU", "Supplier", "Class", "Product group"], index=0,
+                        "Group by", ["SKU", "Supplier", "Class", "Product group", "SKU type"], index=0,
                         key="inventory_group_by", label_visibility="collapsed",
                     )
                 with context_col:
                     st.caption(
-                        f"Warehouse & clearance stock only · showroom stock excluded ({showroom_units:,.0f} units) · "
-                        f"sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs"
+                        f"Warehouse & clearance stock only · showroom excluded ({showroom_units:,.0f} units)"
+                        + (f" · ignored sites skipped ({ignored_units:,.0f} units)" if ignored_units else "")
+                        + f" · sales window {window_label(window_periods)} ({window_days} days) · {len(filtered):,} SKUs"
                     )
                 if not mapping.get("site"):
                     st.warning(
@@ -2575,7 +2272,8 @@ elif selected_tab == "Inventory Analysis":
                 elif unmapped_codes:
                     st.warning(
                         f"{len(unmapped_codes)} site code(s) in the inventory export are not categorised and are "
-                        f"excluded from stock health: {', '.join(unmapped_codes)}. Categorise them on the **Backend Mapping** tab."
+                        f"excluded from stock health: {', '.join(unmapped_codes)}. Categorise them on the **Backend Mapping** tab "
+                        f"(choose *Ignored* for sites that should not be tracked)."
                     )
 
                 if filtered.empty:
@@ -2590,6 +2288,8 @@ elif selected_tab == "Inventory Analysis":
                     slow_units = float(filtered["Slow units"].sum())
                     dead_value = float(filtered.loc[filtered["Status"] == "Dead stock", "Total stock value"].sum(skipna=True))
                     slow_value = float(filtered.loc[filtered["Status"] == "Slow moving", "Total stock value"].sum(skipna=True))
+                    allocated_units = float(filtered["Allocated units"].sum())
+                    allocated_value = float(filtered.loc[filtered["Status"] == "Allocated", "Total stock value"].sum(skipna=True))
                     active_skus = int(filtered["Active"].sum())
                     status_counts = filtered["Status"].value_counts()
                     costed_share = float(filtered.loc[filtered["On hand"] > 0, "Avg option cost"].notna().mean()) if (filtered["On hand"] > 0).any() else 0.0
@@ -2613,7 +2313,7 @@ elif selected_tab == "Inventory Analysis":
                         ],
                     )
 
-                    health_col, movement_col = st.columns([3, 2], gap="small")
+                    health_col, movement_col = st.columns([4, 2], gap="small")
                     with health_col:
                         metric_card(
                             "Stock health",
@@ -2623,7 +2323,9 @@ elif selected_tab == "Inventory Analysis":
                                 dict(label="Slow moving", value=f"{slow_units:,.0f}", delta=pct_of_on_hand(slow_units), delta_color="off",
                                      help=f"{int(status_counts.get('Slow moving', 0))} SKUs · ${slow_value:,.0f} · more than {int(slow_dos)} days of supply."),
                                 dict(label="Stock-out risk", value=f"{int(status_counts.get('Stock-out risk', 0)):,} SKUs",
-                                     help=f"Fewer than {int(risk_dos)} days of supply · plus {int(status_counts.get('Out of stock', 0))} SKUs already out of sellable stock with recent sales."),
+                                     help=f"Free stock covers fewer than {int(risk_dos)} days · plus {int(status_counts.get('Out of stock', 0))} SKUs already out of sellable stock with recent sales."),
+                                dict(label="Allocated", value=f"{allocated_units:,.0f}", delta=pct_of_on_hand(allocated_units), delta_color="off",
+                                     help=f"{int(status_counts.get('Allocated', 0))} SKUs · ${allocated_value:,.0f} · on hand with no free stock: committed to sales orders, never counted as dead or slow."),
                             ],
                         )
                     with movement_col:
@@ -2665,15 +2367,17 @@ elif selected_tab == "Inventory Analysis":
                         )
 
                     sku_columns = [
-                        "SKU", "Description", "Supplier", "Class", "Product group", "Status",
+                        "SKU", "Description", "SKU type", "Supplier", "Class", "Product group", "Status",
                         "On hand", "Free stock", "Showroom units", "Avg option cost", "Total stock value", "Free stock value",
-                        "Units sold", "Avg monthly units", "Days of supply", "Turns (annualised)",
+                        "Units sold", "Avg monthly units", "Days of supply", "Days of supply (free)", "Turns (annualised)",
                         "Last sale", "Days since last sale", "Sales value", "Cost source",
                     ]
                     if "Open PO qty" in filtered.columns:
                         sku_columns += ["Open PO qty", "Days of supply incl. POs"]
                     if (filtered["Unmapped units"] > 0).any():
                         sku_columns.append("Unmapped units")
+                    if (filtered["Ignored units"] > 0).any():
+                        sku_columns.append("Ignored units")
                     sku_columns = [c for c in sku_columns if c in filtered.columns]
 
                     sku_column_config = {
@@ -2681,6 +2385,8 @@ elif selected_tab == "Inventory Analysis":
                         "Free stock": st.column_config.NumberColumn(format="%d"),
                         "Showroom units": st.column_config.NumberColumn(format="%d", help="Display stock; excluded from stock health."),
                         "Unmapped units": st.column_config.NumberColumn(format="%d", help="Stock at site codes that are not categorised."),
+                        "Ignored units": st.column_config.NumberColumn(format="%d", help="Stock at sites categorised as Ignored."),
+                        "Days of supply (free)": st.column_config.NumberColumn(format="%d", help="Free stock ÷ daily rate; drives the stock-out risk flag."),
                         "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
                         "Total stock value": st.column_config.NumberColumn(format="$%.0f"),
                         "Free stock value": st.column_config.NumberColumn(format="$%.0f"),
@@ -2721,6 +2427,7 @@ elif selected_tab == "Inventory Analysis":
                                     "Free stock value": st.column_config.NumberColumn(format="$%.0f"),
                                     "Dead units": st.column_config.NumberColumn(format="%d"),
                                     "Slow units": st.column_config.NumberColumn(format="%d"),
+                                    "Allocated units": st.column_config.NumberColumn(format="%d"),
                                     "Dead stock %": st.column_config.NumberColumn(format="%.0f%%"),
                                     "Days of supply": st.column_config.NumberColumn(format="%d"),
                                     "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
@@ -2734,257 +2441,6 @@ elif selected_tab == "Inventory Analysis":
 
         except Exception as e:
             st.error(f"Something went wrong while rendering inventory analysis: {e}")
-
-# =============================================================================
-# Purchasing tab
-# =============================================================================
-elif selected_tab == "Purchasing":
-    prepared_data, source_names = load_prepared_data()
-
-    if prepared_data is None:
-        st.info("Add the sales workbooks, inventory export and PO export under Raw_data to build a purchasing schedule.")
-    else:
-        try:
-            sheets = prepared_data
-            sales_data = sheets["Sales Data"]
-            inventory_raw = sheets["Current Inventory"]
-            options_raw = sheets.get("OptionsData")
-            purchase_orders_raw = sheets.get("Purchase Orders")
-
-            today = pd.Timestamp.today().normalize()
-            last_complete = today.to_period("M") - 1
-
-            attributes = option_attributes(options_raw)
-            terms = option_purchase_terms(options_raw)
-            mapping = resolve_inventory_mapping(inventory_raw)
-            site_mapping = current_site_mapping()
-            cost_source = st.session_state.get("cost_source", "auto")
-            st.session_state.setdefault("purchasing_overrides", {})
-
-            with st.sidebar:
-                st.header("Purchasing")
-                budget = float(
-                    st.number_input(
-                        "Monthly procurement budget ($ ex GST)",
-                        min_value=0.0, value=250000.0, step=10000.0, key="purchasing_budget",
-                        help="Capital available for this order cycle. 0 = no cap.",
-                    )
-                )
-                prioritise_by = st.selectbox("Prioritise by", list(VELOCITY_COLUMNS), index=0, key="purchasing_velocity")
-                rank_within = st.selectbox(
-                    "Rank within", list(RANK_WITHIN_COLUMNS), index=0, key="purchasing_rank_within",
-                    help="Each group's top sellers are funded first, so one high-volume group cannot take the whole budget.",
-                )
-
-                st.markdown("**Filters**")
-                filter_values = {
-                    "Fourth product group": sorted({str(v).strip() for v in pd.concat([attributes["Product group"], sales_data.get("OptionsData.Fourth Product Group", pd.Series(dtype=object))]).dropna() if str(v).strip() and str(v).strip().lower() != "nan"}, key=str.casefold),
-                    "Supplier": sorted({str(v).strip() for v in pd.concat([attributes["Supplier"], sales_data.get("OptionsData.Supplier", pd.Series(dtype=object))]).dropna() if str(v).strip() and str(v).strip().lower() != "nan"}, key=str.casefold),
-                }
-                chosen_groups = st.multiselect("Fourth product group", filter_values["Fourth product group"], default=[], key="purchasing_filter_group")
-                chosen_suppliers = st.multiselect("Supplier", filter_values["Supplier"], default=[], key="purchasing_filter_supplier")
-                sku_search = st.text_input("SKU or description contains", key="purchasing_filter_sku", help="End with * to match a prefix.").strip()
-
-                with st.expander("Replenishment parameters", expanded=False):
-                    lead_time_days = int(st.number_input("Lead time (days)", min_value=1, max_value=365, value=90, step=7, key="purchasing_lead_time"))
-                    review_days = int(st.number_input("Review period (days)", min_value=0, max_value=180, value=30, step=7, key="purchasing_review", help="Days until the next order opportunity; demand over lead time + review period is covered."))
-                    safety_days = int(st.number_input("Safety stock (days of cover)", min_value=0, max_value=365, value=30, step=7, key="purchasing_safety"))
-                    window_months = st.selectbox("Sales window (complete months)", [3, 6, 12], index=2, key="purchasing_window")
-                    include_overdue = st.toggle("Count overdue open POs as supply", value=True, key="purchasing_overdue")
-                    round_to_moq = st.toggle("Round up to MOQ / order multiple", value=True, key="purchasing_moq", help="Applies when the options data has an MOQ or pack-size column.")
-                    show_all = st.toggle("Show SKUs with no purchase needed", value=False, key="purchasing_show_all")
-
-            if not mapping["sku"] or not mapping["on_hand"]:
-                st.warning("The SKU and on-hand quantity columns of the inventory export could not be identified. Choose them on the **Backend Mapping** tab.")
-            else:
-                window_end = last_complete
-                window_start = last_complete - (window_months - 1)
-                window_periods = pd.period_range(window_start, window_end, freq="M")
-                window_days = int(sum(period.days_in_month for period in window_periods))
-                horizon_days = lead_time_days + review_days
-
-                inventory_sku = inventory_by_sku(inventory_raw, mapping, site_mapping)
-                movement = sku_movement(sales_data, str(window_start), str(window_end))
-                open_po = open_po_by_sku(purchase_orders_raw)
-                master = build_inventory_table(
-                    inventory_sku, movement, attributes, open_po, window_months, window_days, today, 180, 365, 60,
-                    cost_source=cost_source,
-                )
-                po_detail = open_po_detail(purchase_orders_raw, today, horizon_days, include_overdue)
-                uplift = demand_uplift(sales_data, window_start, window_end, horizon_days, today)
-                plan = build_purchase_plan(
-                    master, po_detail, terms, uplift, window_months, window_days,
-                    lead_time_days, review_days, safety_days, today, round_to_moq,
-                )
-
-                # Filters
-                if chosen_groups:
-                    plan = plan.loc[plan["Product group"].isin(chosen_groups)]
-                if chosen_suppliers:
-                    plan = plan.loc[plan["Supplier"].isin(chosen_suppliers)]
-                if sku_search:
-                    if sku_search.endswith("*"):
-                        pattern, is_regex = f"^{re.escape(sku_search[:-1])}", True
-                    else:
-                        pattern, is_regex = sku_search, False
-                    plan = plan.loc[
-                        plan["SKU"].str.contains(pattern, case=False, regex=is_regex, na=False)
-                        | plan["Description"].str.contains(pattern, case=False, regex=is_regex, na=False)
-                    ]
-                plan = plan.reset_index(drop=True)
-
-                plan = apply_purchasing_overrides(plan, st.session_state["purchasing_overrides"])
-                plan = allocate_budget(
-                    plan, budget, VELOCITY_COLUMNS[prioritise_by], RANK_WITHIN_COLUMNS[rank_within], order_qty_column="Order qty"
-                )
-                summary = budget_summary(plan, budget)
-
-                # ------------------------------------------------------------
-                # Context + summary cards
-                # ------------------------------------------------------------
-                priced_lines = plan.loc[plan["Status"].isin(["Within budget", "Deferred"])]
-                unpriced = int((priced_lines["Price source"] == "none").sum())
-                st.caption(
-                    f"Horizon {horizon_days} days (lead time {lead_time_days} + review {review_days}) · safety {safety_days} days · "
-                    f"demand from {window_label(window_periods)} × seasonal uplift {uplift:.2f} · "
-                    f"supply = free sellable stock + unlinked POs due by {(today + pd.Timedelta(days=horizon_days)).strftime('%d %b %Y')}"
-                    + (" (incl. overdue)" if include_overdue else "")
-                    + (f" · ⚠️ {unpriced} line(s) have no price" if unpriced else "")
-                )
-                if terms.attrs.get("price_column") is None:
-                    st.info(
-                        "No Purchase Ex GST column was found in the options data, so lines are priced at the average option cost. "
-                        "Add a column such as 'Purchase Ex GST' to options_data.csv, or edit prices in the table."
-                    )
-
-                budget_col, schedule_col = st.columns([4, 3], gap="small")
-                with budget_col:
-                    variance = summary["variance"]
-                    metric_card(
-                        "Budget",
-                        [
-                            dict(label="Budget limit", value=f"${summary['budget']:,.0f}" if summary["budget"] else "No cap"),
-                            dict(
-                                label="Total recommended spend",
-                                value=f"${summary['total_spend']:,.0f}",
-                                delta=(f"{variance:+,.0f} vs budget" if variance is not None else None),
-                                delta_color="inverse",
-                                help="All lines with an order quantity, funded or deferred, at Purchase Ex GST.",
-                            ),
-                            dict(label="Funded spend", value=f"${summary['funded_spend']:,.0f}"),
-                            dict(
-                                label="Remaining capital",
-                                value=f"${summary['remaining']:,.0f}" if summary["remaining"] is not None else "n/a",
-                                help="Budget minus funded spend. Deferred lines are those that did not fit in what was left when their turn came.",
-                            ),
-                        ],
-                    )
-                with schedule_col:
-                    metric_card(
-                        "Schedule",
-                        [
-                            dict(label="Lines to order", value=f"{summary['lines']:,}"),
-                            dict(label="Within budget", value=f"{summary['funded_lines']:,}"),
-                            dict(
-                                label="Deferred",
-                                value=f"{summary['deferred_lines']:,}",
-                                delta=f"${summary['deferred_spend']:,.0f}" if summary["deferred_lines"] else None,
-                                delta_color="off",
-                            ),
-                        ],
-                    )
-
-                if summary["lines"]:
-                    st.markdown("<p class='card-title'>What the budget buys · line cost by priority, funded running total vs budget</p>", unsafe_allow_html=True)
-                    st.altair_chart(budget_curve_chart(plan, budget), **FULL_WIDTH)
-
-                # ------------------------------------------------------------
-                # Line-by-line table (editable qty / price / include)
-                # ------------------------------------------------------------
-                visible = plan if show_all else plan.loc[plan["Status"].ne("No purchase needed")]
-                visible = visible.reset_index(drop=True)
-                table_columns = [
-                    "Priority", "Status", "SKU", "Description", "Supplier", "Product group",
-                    "Include", "Order qty", "Purchase Ex GST", "Extended cost", "Cumulative spend", "Funded spend to here",
-                    "Recommended qty", "On hand", "Free stock", "Open PO linked", "Open PO unlinked", "Next ETA",
-                    "Forecast demand", "Safety stock", "Supply", "Net requirement", "Days of cover", "Stock-out date",
-                    "Velocity (units/month)", "Units sold", "Sales value", "Turns (annualised)", "Group rank", "MOQ", "Price source",
-                ]
-                table_columns = [c for c in table_columns if c in visible.columns]
-                editor_frame = visible[table_columns].copy()
-                editor_frame["Priority"] = editor_frame["Priority"].astype("Int64")
-                editor_frame["Group rank"] = editor_frame["Group rank"].astype("Int64")
-
-                signature = abs(hash((tuple(editor_frame["SKU"]), lead_time_days, review_days, safety_days, window_months, include_overdue, round_to_moq)))
-                editor_key = f"purchasing_editor_{signature}"
-                st.session_state["purchasing_editor_key"] = editor_key
-                st.session_state["purchasing_editor_frame"] = editor_frame
-
-                header_left, header_right = st.columns([5, 2], gap="small", vertical_alignment="center")
-                with header_left:
-                    st.markdown("<p class='card-title'>Purchasing schedule · edit Include, Order qty or Purchase Ex GST and the budget re-allocates</p>", unsafe_allow_html=True)
-                with header_right:
-                    if st.session_state["purchasing_overrides"] and st.button("Clear edits", key="purchasing_clear", **FULL_WIDTH):
-                        st.session_state["purchasing_overrides"] = {}
-                        st.rerun()
-
-                editable = ["Include", "Order qty", "Purchase Ex GST"]
-                st.data_editor(
-                    editor_frame,
-                    key=editor_key,
-                    on_change=record_purchasing_edits,
-                    hide_index=True,
-                    disabled=[c for c in table_columns if c not in editable],
-                    column_config={
-                        "Priority": st.column_config.NumberColumn(format="%d", help="1 = highest sales velocity within its group."),
-                        "Include": st.column_config.CheckboxColumn(help="Untick to leave this line out of the order."),
-                        "Order qty": st.column_config.NumberColumn(min_value=0, step=1, format="%d", help="Defaults to the recommended quantity."),
-                        "Purchase Ex GST": st.column_config.NumberColumn(min_value=0.0, format="$%.2f"),
-                        "Extended cost": st.column_config.NumberColumn(format="$%.0f"),
-                        "Cumulative spend": st.column_config.NumberColumn(format="$%.0f", help="Running total of all lines in priority order."),
-                        "Funded spend to here": st.column_config.NumberColumn(format="$%.0f", help="Running total of funded lines only."),
-                        "Recommended qty": st.column_config.NumberColumn(format="%d"),
-                        "On hand": st.column_config.NumberColumn("On hand (sellable)", format="%d"),
-                        "Free stock": st.column_config.NumberColumn(format="%d"),
-                        "Open PO linked": st.column_config.NumberColumn(format="%d", help="On order and allocated to customer orders; not counted as supply."),
-                        "Open PO unlinked": st.column_config.NumberColumn(format="%d", help="On order and unallocated; counted as supply when due inside the horizon."),
-                        "Next ETA": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
-                        "Forecast demand": st.column_config.NumberColumn(f"Forecast demand ({horizon_days}d)", format="%.0f"),
-                        "Safety stock": st.column_config.NumberColumn(format="%.0f"),
-                        "Supply": st.column_config.NumberColumn(format="%.0f"),
-                        "Net requirement": st.column_config.NumberColumn(format="%.0f"),
-                        "Days of cover": st.column_config.NumberColumn(format="%d"),
-                        "Stock-out date": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
-                        "Velocity (units/month)": st.column_config.NumberColumn(format="%.1f"),
-                        "Units sold": st.column_config.NumberColumn(f"Units sold ({window_months}m)", format="%d"),
-                        "Sales value": st.column_config.NumberColumn(f"Sales ({window_months}m)", format="$%.0f"),
-                        "Turns (annualised)": st.column_config.NumberColumn(format="%.1f"),
-                        "Group rank": st.column_config.NumberColumn(format="%d"),
-                        "MOQ": st.column_config.NumberColumn(format="%d"),
-                    },
-                    height=table_height(len(editor_frame), cap=560),
-                    **FULL_WIDTH,
-                )
-
-                export_cols = [c for c in table_columns if c not in ("Include",)]
-                schedule = plan.loc[plan["Status"].isin(["Within budget", "Deferred"]), export_cols]
-                download_left, download_right, _ = st.columns([2, 2, 3], gap="small")
-                download_left.download_button(
-                    "Download prioritised schedule (CSV)",
-                    schedule.to_csv(index=False).encode("utf-8"),
-                    file_name=f"purchasing_schedule_{today:%Y-%m-%d}.csv", mime="text/csv", key="purchasing_download_all", **FULL_WIDTH,
-                )
-                download_right.download_button(
-                    "Download funded lines only (CSV)",
-                    schedule.loc[schedule["Status"].eq("Within budget")].to_csv(index=False).encode("utf-8"),
-                    file_name=f"purchasing_funded_{today:%Y-%m-%d}.csv", mime="text/csv", key="purchasing_download_funded", **FULL_WIDTH,
-                )
-                st.caption(
-                    "Net requirement = forecast demand over lead time + review period, plus safety stock, minus free sellable stock and unlinked POs due in the horizon. "
-                    "Priority = percentile rank of the chosen velocity measure within the chosen group; lines are funded in priority order until the budget is used."
-                )
-        except Exception as e:
-            st.error(f"Something went wrong while building the purchasing schedule: {e}")
 
 # =============================================================================
 # Backend Mapping tab
@@ -3012,8 +2468,9 @@ elif selected_tab == "Backend Mapping":
         st.markdown("<p class='card-title'>Site categories</p>", unsafe_allow_html=True)
         st.caption(
             "**Warehouse** and **Clearance** stock is available to sell and counts towards stock health. "
-            "**Showroom** stock is display stock and is excluded. Codes left **Unmapped** are excluded and flagged. "
-            "Add a row for a new site code; codes are matched case-insensitively."
+            "**Showroom** stock is display stock and is excluded. **Ignored** sites (quarantine, returns, in transit, "
+            "anything not worth tracking) are skipped silently. A code still **Unmapped** is skipped too, but flagged "
+            "until it gets a category. Add a row for a new site code; codes are matched case-insensitively."
         )
         editor_frame = site_mapping_frame(site_mapping, site_units)
         st.session_state["site_editor_frame"] = editor_frame
@@ -3027,7 +2484,10 @@ elif selected_tab == "Backend Mapping":
             disabled=["Available to sell", "In inventory export", "Units on hand"],
             column_config={
                 "Site code": st.column_config.TextColumn(required=True, max_chars=12, validate=r"^\s*[A-Za-z0-9_-]+\s*$"),
-                "Category": st.column_config.SelectboxColumn(options=SITE_CATEGORIES, required=True),
+                "Category": st.column_config.SelectboxColumn(
+                    options=SITE_CATEGORIES, required=True,
+                    help="Showroom, Warehouse, Clearance or Ignored. Unmapped means not yet decided.",
+                ),
                 "Available to sell": st.column_config.CheckboxColumn(help="Derived from the category."),
                 "In inventory export": st.column_config.CheckboxColumn(help="The code appears in the current inventory export."),
                 "Units on hand": st.column_config.NumberColumn(format="%d", help="All SKUs at this site in the current export."),
@@ -3036,15 +2496,15 @@ elif selected_tab == "Backend Mapping":
             **FULL_WIDTH,
         )
 
-        unmapped = sorted(code for code in site_units.index if code and code not in site_mapping)
+        unmapped = sorted(code for code in site_units.index if code and site_mapping.get(code, "Unmapped") == "Unmapped")
         categorised_units = {
             category: float(sum(units for code, units in site_units.items() if site_mapping.get(code) == category))
-            for category in SITE_CATEGORIES[:-1]
+            for category in ASSIGNABLE_CATEGORIES
         }
         summary_bits = [f"{category}: {units:,.0f} units" for category, units in categorised_units.items()]
         st.caption(
             " · ".join(summary_bits)
-            + (f" · **Unmapped: {', '.join(unmapped)}**" if unmapped else " · all site codes in the export are categorised")
+            + (f" · **Unmapped (needs a decision): {', '.join(unmapped)}**" if unmapped else " · every site code in the export has a category")
         )
 
         action_reset, action_save, action_download, _ = st.columns([1, 1, 1, 3], gap="small")
@@ -3081,7 +2541,20 @@ elif selected_tab == "Backend Mapping":
         )
 
     # ------------------------------------------------------------------
-    # 2. Inventory export columns
+    # 2. SKU type rules (read-only reference, with counts from the export)
+    # ------------------------------------------------------------------
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>SKU type rules</p>", unsafe_allow_html=True)
+        st.caption("Products are classified from the stock-code pattern, first matching rule wins. Available as a filter and a grouping on the Inventory Analysis tab.")
+        rules = sku_type_rules_table()
+        if not inventory_raw.empty and detected_mapping.get("sku"):
+            codes = inventory_raw[detected_mapping["sku"]].map(sku_text)
+            counts = codes.loc[codes.ne("")].drop_duplicates().map(classify_sku).value_counts()
+            rules["SKUs in export"] = rules["SKU type"].map(counts).fillna(0).astype(int)
+        st.dataframe(rules, hide_index=True, height=table_height(len(rules)), **FULL_WIDTH)
+
+    # ------------------------------------------------------------------
+    # 3. Inventory export columns
     # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>Inventory export columns</p>", unsafe_allow_html=True)
@@ -3117,7 +2590,7 @@ elif selected_tab == "Backend Mapping":
                 st.dataframe(inventory_raw.head(8), hide_index=True, **FULL_WIDTH)
 
     # ------------------------------------------------------------------
-    # 3. Average option cost source
+    # 4. Average option cost source
     # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>Average option cost</p>", unsafe_allow_html=True)
