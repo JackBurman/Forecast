@@ -64,6 +64,7 @@ raw_data_path = base_dir / "Raw_data"
 csv_path = raw_data_path / "options_data.csv"
 inventory_folder_path = raw_data_path / "inventory"
 podash_folder_path = raw_data_path / "PODash"
+loan_folder_path = raw_data_path / "loan"
 
 # Files forecast_engine.read_raw_data_folder expects to find. When the live
 # inventory / PO exports live in the sub-folders instead, zero-row
@@ -745,6 +746,19 @@ def load_raw_folder_data(
             f"Inventory sheet — {column_summary(forecast_inputs['Current Inventory'])}. "
             f"Purchase orders — {column_summary(forecast_inputs['Purchase Orders'])}."
         )
+
+    # Loan / transfer document lines: newest file under Raw_data/loan. Not an
+    # engine input, so it rides alongside the engine's sheets.
+    loan_file = newest_file(loan_folder_path)
+    if loan_file is not None:
+        try:
+            sheets["Loans"] = read_tabular(loan_file)
+            source_names.append(str(loan_file.relative_to(raw_data_path)))
+        except Exception as e:
+            sheets["Loans"] = pd.DataFrame()
+            notes.append(f"Could not read the loan file '{loan_file.name}': {e}")
+    else:
+        sheets["Loans"] = pd.DataFrame()
     return sheets, source_names, notes
 
 
@@ -1219,6 +1233,7 @@ def init_backend_state() -> None:
         if normalise_site_code(code)
     }
     st.session_state["inventory_column_mapping"] = saved.get("column_mapping", {})
+    st.session_state["loan_column_mapping"] = saved.get("loan_column_mapping", {})
     st.session_state["cost_source"] = saved.get("cost_source", "auto") if saved.get("cost_source", "auto") in COST_SOURCES else "auto"
     st.session_state["site_editor_version"] = 0
 
@@ -1336,6 +1351,112 @@ def company_wide_totals(inventory: pd.DataFrame, mapping: dict, site_mapping: di
         "by_category": by_category,
         "costed_share": float(frame.loc[stocked, "Unit cost"].notna().mean()) if stocked.any() else 0.0,
     }
+
+
+# -----------------------------------------------------------------------------
+# Loans and transfers
+#
+# The loan file lists stock-movement document lines. A line with a customer
+# name is stock on loan to that customer; a line without one is a standard
+# inter-site transfer - unless the stock came from a Loan site, in which case
+# it is loan stock whatever the customer field says. Lines whose status says
+# returned / closed are over and are dropped.
+# -----------------------------------------------------------------------------
+
+LOAN_COLUMN_CANDIDATES: dict[str, list[str]] = {
+    "sku": SKU_HEADERS,
+    "customer": ["customer name", "customer", "client name", "client", "account name", "account", "debtor", "borrower", "name"],
+    "qty": ["qty", "quantity", "units", "qty out", "quantity out", "loan qty"],
+    "from_site": ["from location", "from site", "from warehouse", "source location", "origin", "from"],
+    "to_site": ["to location", "to site", "to warehouse", "destination", "to"],
+    "date": ["date", "loan date", "transfer date", "document date", "issued"],
+    "due": ["due date", "return date", "expected return", "return by", "due"],
+    "document": ["document", "document no", "doc no", "reference", "ref", "transfer no", "loan no", "number"],
+    "status": ["status", "state", "stage"],
+    "returned_qty": ["returned qty", "qty returned", "returned", "qty in", "received qty"],
+    "description": INVENTORY_COLUMN_CANDIDATES["description"],
+}
+LOAN_ROLE_LABELS = {
+    "sku": "SKU column",
+    "customer": "Customer name column",
+    "qty": "Quantity column",
+    "from_site": "From location column",
+    "to_site": "To location column",
+    "date": "Date column",
+    "due": "Due / return date column",
+    "document": "Document number column",
+    "status": "Status column",
+    "returned_qty": "Returned quantity column",
+    "description": "Description column",
+}
+CLOSED_STATUS_WORDS = ("return", "closed", "complete", "cancel", "received")
+
+
+def detect_loan_columns(loans: pd.DataFrame) -> dict[str, str | None]:
+    found: dict[str, str | None] = {}
+    used: list[str] = []
+    for role, candidates in LOAN_COLUMN_CANDIDATES.items():
+        col = detect_column(loans.columns, candidates, exclude=tuple(used))
+        found[role] = col
+        if col:
+            used.append(col)
+    return found
+
+
+def resolve_loan_mapping(loans: pd.DataFrame) -> dict[str, str | None]:
+    init_backend_state()
+    mapping = detect_loan_columns(loans)
+    for role, choice in st.session_state.get("loan_column_mapping", {}).items():
+        if choice == "(none)":
+            mapping[role] = None
+        elif choice in loans.columns:
+            mapping[role] = choice
+    return mapping
+
+
+def classify_loan_lines(
+    loans: pd.DataFrame, mapping: dict, site_mapping: dict, cost_by_sku: pd.Series, today: pd.Timestamp
+) -> pd.DataFrame:
+    """Standardised loan / transfer lines with a Type, an open quantity and a value.
+
+    Type: "Loan" when the line has a customer name or came from a Loan site,
+    otherwise "Transfer". Open qty = qty - returned qty. Value = open qty ×
+    the SKU's average option cost. Lines with a closed status are removed.
+    """
+    columns = ["Document", "Date", "Due", "Customer", "SKU", "Description", "Qty", "From site", "To site",
+               "From category", "Type", "Days out", "Avg option cost", "Value"]
+    if loans is None or loans.empty or not mapping.get("sku") or not mapping.get("qty"):
+        return pd.DataFrame(columns=columns)
+
+    def text(role: str) -> pd.Series:
+        col = mapping.get(role)
+        if not col:
+            return pd.Series("", index=loans.index, dtype=object)
+        values = loans[col].astype(str).str.strip()
+        return values.where(loans[col].notna() & ~values.str.lower().isin(["", "nan", "none", "null"]), "")
+
+    frame = pd.DataFrame({"SKU": loans[mapping["sku"]].map(sku_text)})
+    frame["Customer"] = text("customer")
+    frame["Description"] = text("description")
+    frame["Document"] = text("document")
+    frame["From site"] = text("from_site").map(normalise_site_code)
+    frame["To site"] = text("to_site").map(normalise_site_code)
+    frame["Qty"] = to_number(loans[mapping["qty"]]).fillna(0.0)
+    if mapping.get("returned_qty"):
+        frame["Qty"] = (frame["Qty"] - to_number(loans[mapping["returned_qty"]]).fillna(0.0)).clip(lower=0.0)
+    frame["Date"] = parse_dates(loans[mapping["date"]]) if mapping.get("date") else pd.NaT
+    frame["Due"] = parse_dates(loans[mapping["due"]]) if mapping.get("due") else pd.NaT
+    status = text("status").str.lower()
+    closed = status.map(lambda value: any(word in value for word in CLOSED_STATUS_WORDS))
+    frame = frame.loc[frame["SKU"].ne("") & (frame["Qty"] > 0) & ~closed].copy()
+
+    frame["From category"] = frame["From site"].map(lambda code: category_for(code, site_mapping) if code else "")
+    is_loan = frame["Customer"].ne("") | frame["From category"].eq("Loan")
+    frame["Type"] = np.where(is_loan, "Loan", "Transfer")
+    frame["Days out"] = (today - pd.to_datetime(frame["Date"], errors="coerce")).dt.days
+    frame["Avg option cost"] = frame["SKU"].map(cost_by_sku)
+    frame["Value"] = frame["Qty"] * frame["Avg option cost"]
+    return frame[columns].sort_values(["Type", "Value"], ascending=[True, False]).reset_index(drop=True)
 
 
 GAUGE_START, GAUGE_END = -2 * np.pi / 3, 2 * np.pi / 3  # a 240° dial
@@ -2281,6 +2402,10 @@ elif selected_tab == "Inventory Analysis":
             current_period = today.to_period("M")
             last_complete = current_period - 1
 
+            loans_raw = sheets.get("Loans", pd.DataFrame())
+            loan_mapping = resolve_loan_mapping(loans_raw) if not loans_raw.empty else {}
+            loan_file_name = next((Path(name).name for name in source_names if "loan" in str(name).lower()), "the loan file")
+
             attributes = option_attributes(options_raw)
             mapping = resolve_inventory_mapping(inventory_raw)
             site_mapping = current_site_mapping()
@@ -2359,6 +2484,12 @@ elif selected_tab == "Inventory Analysis":
                     window_months, window_days, today, int(dead_days), int(slow_dos), int(risk_dos),
                     cost_source=cost_source,
                 )
+                if not loans_raw.empty and loan_mapping.get("sku") and loan_mapping.get("qty"):
+                    early_lines = classify_loan_lines(loans_raw, loan_mapping, site_mapping, master.set_index("SKU")["Avg option cost"], today)
+                    on_loan = early_lines.loc[early_lines["Type"].eq("Loan")].groupby("SKU")["Qty"].sum()
+                    master["On loan units"] = master["SKU"].map(on_loan).fillna(0.0)
+                else:
+                    master["On loan units"] = 0.0
 
                 filtered = master
                 for label, chosen in product_filters.items():
@@ -2435,32 +2566,83 @@ elif selected_tab == "Inventory Analysis":
                     # ----------------------------------------------------
                     # Company-wide position: every site, every SKU, no filters
                     # ----------------------------------------------------
-                    totals = company_wide_totals(inventory_raw, mapping, site_mapping, master.set_index("SKU")["Avg option cost"])
+                    cost_by_sku = master.set_index("SKU")["Avg option cost"]
+                    totals = company_wide_totals(inventory_raw, mapping, site_mapping, cost_by_sku)
                     by_category = totals["by_category"]
                     units_breakdown = " · ".join(
                         f"{category} {by_category.loc[category, 'On hand']:,.0f}"
                         for category in SITE_CATEGORIES if by_category.loc[category, "On hand"] > 0
                     )
+                    sellable_value = float(by_category.loc[["Warehouse", "Clearance"], "Value"].sum())
+                    clearance_value = float(by_category.loc["Clearance", "Value"])
+                    clearance_units = float(by_category.loc["Clearance", "On hand"])
+                    untracked_value = float(by_category.loc[["Ignored", "Unmapped"], "Value"].sum())
+                    untracked_units = float(by_category.loc[["Ignored", "Unmapped"], "On hand"].sum())
+                    at_risk = master.loc[master["Status"].isin(["Dead stock", "Slow moving"])]
+                    at_risk_value = float(at_risk["Total stock value"].sum(skipna=True))
+                    on_order_units = float(open_po.sum()) if not open_po.empty else 0.0
+                    on_order_value = float((open_po * open_po.index.map(cost_by_sku)).sum(skipna=True)) if not open_po.empty else 0.0
+
+                    # Loans and transfers from the loan file; the inventory's Loan
+                    # sites are the fallback when there is no file.
+                    loan_lines = classify_loan_lines(loans_raw, loan_mapping, site_mapping, cost_by_sku, today)
+                    loans = loan_lines.loc[loan_lines["Type"].eq("Loan")]
+                    transfers = loan_lines.loc[loan_lines["Type"].eq("Transfer")]
+                    if not loan_lines.empty:
+                        loan_value, loan_units = float(loans["Value"].sum(skipna=True)), float(loans["Qty"].sum())
+                        loan_help = (
+                            f"{loan_units:,.0f} units on {len(loans):,} open loan lines to {loans['Customer'].replace('', np.nan).nunique():,} customers, "
+                            f"from {loan_file_name} · inventory Loan sites hold {totals['loan_units']:,.0f} units (${totals['loan_value']:,.0f})."
+                        )
+                    else:
+                        loan_value, loan_units = totals["loan_value"], totals["loan_units"]
+                        loan_help = (
+                            f"{loan_units:,.0f} units at sites categorised as Loan. Add a loan file under Raw_data/loan for "
+                            "customer-level detail; codes containing LOAN are picked up automatically."
+                        )
+                    transfer_value, transfer_units = float(transfers["Value"].sum(skipna=True)), float(transfers["Qty"].sum())
+
                     wide_col, gauge_col = st.columns([3, 1.25], gap="small")
                     with wide_col:
                         metric_card(
                             "Company-wide stock · all sites, all SKUs, before filters",
                             [
+                                dict(label="Total SOH (units)", value=f"{totals['units']:,.0f}", help=units_breakdown),
+                                dict(label="Total SOH value", value=f"${totals['value']:,.0f}", help="Every unit at every site × average option cost."),
                                 dict(
-                                    label="Total SOH (units)", value=f"{totals['units']:,.0f}",
-                                    help=f"{units_breakdown} · total value ${totals['value']:,.0f}",
+                                    label="Sellable value", value=f"${sellable_value:,.0f}",
+                                    help=f"Warehouse + clearance sites: {by_category.loc[['Warehouse', 'Clearance'], 'On hand'].sum():,.0f} units.",
                                 ),
                                 dict(
                                     label="Free stock value", value=f"${totals['free_value']:,.0f}",
-                                    help=f"{totals['free_units']:,.0f} free units × average option cost, across all sites.",
+                                    help=f"{totals['free_units']:,.0f} free (unallocated) units × average option cost, across all sites.",
                                 ),
                                 dict(
                                     label="Allocated value", value=f"${totals['allocated_value']:,.0f}",
-                                    help=f"{totals['allocated_units']:,.0f} units on hand but not free (committed to sales orders) × average option cost.",
+                                    help=f"{totals['allocated_units']:,.0f} units on hand but not free: committed to sales orders.",
+                                ),
+                            ],
+                        )
+                        metric_card(
+                            "Holdings & exposure",
+                            [
+                                dict(label="Loan value", value=f"${loan_value:,.0f}", help=loan_help),
+                                dict(
+                                    label="Clearance value", value=f"${clearance_value:,.0f}",
+                                    help=f"{clearance_units:,.0f} units at clearance sites (XIT*): sellable, but already marked down.",
                                 ),
                                 dict(
-                                    label="Loan value", value=f"${totals['loan_value']:,.0f}",
-                                    help=f"{totals['loan_units']:,.0f} units at sites categorised as Loan. Map loan site codes on the Backend Mapping tab; codes containing LOAN are picked up automatically.",
+                                    label="On order (open POs)", value=f"${on_order_value:,.0f}",
+                                    help=f"{on_order_units:,.0f} units on open purchase orders × average option cost: inbound commitment not yet in stock.",
+                                ),
+                                dict(
+                                    label="Dead & slow value", value=f"${at_risk_value:,.0f}",
+                                    help=f"{len(at_risk):,} SKUs classed Dead stock or Slow moving within sellable stock: the value most at risk of write-down.",
+                                ),
+                                dict(
+                                    label="Untracked value", value=f"${untracked_value:,.0f}",
+                                    help=f"{untracked_units:,.0f} units at Ignored or Unmapped sites (quarantine, transit, undecided)."
+                                    + (f" Plus {transfer_units:,.0f} units (${transfer_value:,.0f}) on open inter-site transfers." if transfer_units else ""),
                                 ),
                             ],
                         )
@@ -2553,6 +2735,8 @@ elif selected_tab == "Inventory Analysis":
                         sku_columns.append("Unmapped units")
                     if (filtered["Ignored units"] > 0).any():
                         sku_columns.append("Ignored units")
+                    if (filtered["On loan units"] > 0).any():
+                        sku_columns.append("On loan units")
                     sku_columns = [c for c in sku_columns if c in filtered.columns]
 
                     sku_column_config = {
@@ -2561,6 +2745,7 @@ elif selected_tab == "Inventory Analysis":
                         "Showroom units": st.column_config.NumberColumn(format="%d", help="Display stock; excluded from stock health."),
                         "Unmapped units": st.column_config.NumberColumn(format="%d", help="Stock at site codes that are not categorised."),
                         "Ignored units": st.column_config.NumberColumn(format="%d", help="Stock at sites categorised as Ignored."),
+                        "On loan units": st.column_config.NumberColumn(format="%d", help="Open loan lines to customers from the loan file."),
                         "Days of supply (free)": st.column_config.NumberColumn(format="%d", help="Free stock ÷ daily rate; drives the stock-out risk flag."),
                         "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
                         "Total stock value": st.column_config.NumberColumn(format="$%.0f"),
@@ -2610,6 +2795,53 @@ elif selected_tab == "Inventory Analysis":
                                 height=table_height(len(summary)),
                                 **FULL_WIDTH,
                             )
+
+                    if not loans_raw.empty:
+                        if loan_lines.empty:
+                            st.warning(
+                                f"{loan_file_name} was read but no loan or transfer lines could be built from it. "
+                                "Check the loan file columns on the **Backend Mapping** tab."
+                            )
+                        else:
+                            with st.expander(
+                                f"🤝 Stock on loan · {len(loans):,} lines · {loan_units:,.0f} units · ${loan_value:,.0f}"
+                                + (f" · plus {len(transfers):,} transfer lines" if len(transfers) else ""),
+                                expanded=False,
+                            ):
+                                show_transfers = st.toggle("Include inter-site transfers", value=False, key="inventory_show_transfers")
+                                shown = loan_lines if show_transfers else loans
+                                loan_columns = ["Type", "Customer", "SKU", "Description", "Qty", "Avg option cost", "Value",
+                                                "Date", "Days out", "Due", "From site", "From category", "To site", "Document"]
+                                st.dataframe(
+                                    shown[loan_columns],
+                                    hide_index=True,
+                                    column_config={
+                                        "Qty": st.column_config.NumberColumn(format="%d"),
+                                        "Avg option cost": st.column_config.NumberColumn(format="$%.2f"),
+                                        "Value": st.column_config.NumberColumn(format="$%.0f"),
+                                        "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                                        "Due": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                                        "Days out": st.column_config.NumberColumn(format="%d"),
+                                    },
+                                    height=table_height(len(shown)),
+                                    **FULL_WIDTH,
+                                )
+                                st.download_button(
+                                    "Download CSV", shown[loan_columns].to_csv(index=False).encode("utf-8"),
+                                    file_name="stock_on_loan.csv", mime="text/csv", key="inventory_download_loans",
+                                )
+                                if not loans.empty and loans["Customer"].ne("").any():
+                                    by_customer = (
+                                        loans.loc[loans["Customer"].ne("")]
+                                        .groupby("Customer").agg(Lines=("SKU", "size"), Units=("Qty", "sum"), Value=("Value", "sum"), **{"Oldest (days)": ("Days out", "max")})
+                                        .sort_values("Value", ascending=False).reset_index()
+                                    )
+                                    st.caption("By customer")
+                                    st.dataframe(
+                                        by_customer, hide_index=True,
+                                        column_config={"Units": st.column_config.NumberColumn(format="%d"), "Value": st.column_config.NumberColumn(format="$%.0f"), "Oldest (days)": st.column_config.NumberColumn(format="%d")},
+                                        height=table_height(len(by_customer), cap=300), **FULL_WIDTH,
+                                    )
 
                     with st.expander(f"📋 All SKUs · {len(filtered):,}", expanded=False):
                         show_table(filtered, "inventory_analysis.csv", "inventory_download_all")
@@ -2694,6 +2926,7 @@ elif selected_tab == "Backend Mapping":
                     {
                         "site_mapping": st.session_state["site_mapping"],
                         "column_mapping": st.session_state["inventory_column_mapping"],
+                        "loan_column_mapping": st.session_state["loan_column_mapping"],
                         "cost_source": st.session_state["cost_source"],
                     }
                 )
@@ -2706,6 +2939,7 @@ elif selected_tab == "Backend Mapping":
                 {
                     "site_mapping": st.session_state["site_mapping"],
                     "column_mapping": st.session_state["inventory_column_mapping"],
+                    "loan_column_mapping": st.session_state["loan_column_mapping"],
                     "cost_source": st.session_state["cost_source"],
                 },
                 indent=2,
@@ -2766,7 +3000,40 @@ elif selected_tab == "Backend Mapping":
                 st.dataframe(inventory_raw.head(8), hide_index=True, **FULL_WIDTH)
 
     # ------------------------------------------------------------------
-    # 4. Average option cost source
+    # 4. Loan file columns
+    # ------------------------------------------------------------------
+    loans_raw = prepared_data.get("Loans", pd.DataFrame()) if prepared_data is not None else pd.DataFrame()
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>Loan file columns</p>", unsafe_allow_html=True)
+        if loans_raw.empty:
+            st.caption("No loan file is loaded. Put the loan / transfer export under Raw_data/loan (newest file is used).")
+        else:
+            st.caption(
+                "A line with a customer name is a loan; one without is an inter-site transfer, unless it left a Loan site. "
+                "SKU, quantity and customer are what the loan analysis depends on."
+            )
+            detected_loan = detect_loan_columns(loans_raw)
+            loan_options = ["(auto)", "(none)"] + [str(col) for col in loans_raw.columns]
+            loan_overrides = dict(st.session_state["loan_column_mapping"])
+            chooser = st.columns(3, gap="small")
+            for index, (role, label) in enumerate(LOAN_ROLE_LABELS.items()):
+                current = loan_overrides.get(role, "(auto)")
+                if current not in loan_options:
+                    current = "(auto)"
+                choice = chooser[index % 3].selectbox(
+                    label, loan_options, index=loan_options.index(current), key=f"backend_loan_column_{role}",
+                    help=f"auto → {detected_loan[role]}" if detected_loan[role] else "auto → not found",
+                )
+                if choice == "(auto)":
+                    loan_overrides.pop(role, None)
+                else:
+                    loan_overrides[role] = choice
+            st.session_state["loan_column_mapping"] = loan_overrides
+            with st.expander("Preview of the loan file", expanded=False):
+                st.dataframe(loans_raw.head(8), hide_index=True, **FULL_WIDTH)
+
+    # ------------------------------------------------------------------
+    # 5. Average option cost source
     # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>Average option cost</p>", unsafe_allow_html=True)
@@ -2879,6 +3146,8 @@ elif selected_tab == "Document Status":
                 category = "Inventory Folder"
             elif "PODash" in path.parts:
                 category = "PO Dash Folder"
+            elif "loan" in path.parts:
+                category = "Loan Folder"
             elif "Sales Data" in path.parts:
                 category = "Sales Folder"
             elif path.name == "options_data.csv":
