@@ -481,8 +481,27 @@ def _read_excel_by_content(io, *args, **kwargs):
         if path.is_file() and path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
             if engine is None or (engine == "calamine" and not calamine_available()):
                 kwargs.pop("engine", None)
-                return read_workbook(path, *args, **kwargs)
+                return _tolerant_read(read_workbook, path, *args, **kwargs)
+            return _tolerant_read(_pandas_read_excel, path, *args, **kwargs)
     return _pandas_read_excel(io, *args, **kwargs)
+
+
+def _tolerant_read(reader, path: Path, *args, **kwargs) -> pd.DataFrame:
+    """Read a sheet; if it is shorter than the requested header offset, take row 0 as the header.
+
+    forecast_engine reads its workbooks with header=1 (a title row above the
+    headings). A zero-row placeholder, or an export without the title row, has
+    nothing on row 2 and pandas raises "Passed header=[1] ... but only 1 lines
+    in file"; the first row is then the header.
+    """
+    try:
+        return reader(path, *args, **kwargs)
+    except ValueError as e:
+        message = str(e)
+        if "Passed header" in message or "lines in file" in message:
+            retry = {key: value for key, value in kwargs.items() if key not in ("header", "skiprows")}
+            return reader(path, *args, header=0, **retry)
+        raise
 
 
 pd.read_excel = _read_excel_by_content
@@ -598,7 +617,11 @@ def write_engine_placeholders() -> list[Path]:
     for name, columns in ENGINE_PLACEHOLDERS.items():
         path = raw_data_path / name
         if not path.exists() or path.stat().st_size == 0:
-            pd.DataFrame(columns=columns).to_excel(path, index=False)
+            # Same shape as the real exports: a title row, then the headings
+            # (forecast_engine reads these with header=1).
+            pd.DataFrame([[f"{name} placeholder"] + [""] * (len(columns) - 1), columns]).to_excel(
+                path, index=False, header=False
+            )
             created.append(path)
     return created
 
