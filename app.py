@@ -2185,27 +2185,27 @@ if selected_tab == "Forecast":
                     clear=False,
                 )
 
-                # Swapping X and Y axes: X is Value, Y is Month
-                value_x_axis = alt.X(
-                    "Value:Q",
-                    title=y_title,
-                    scale=alt.Scale(zero=False),
-                    axis=value_axis(axis_format),
-                )
-
-                month_y_axis = alt.Y(
+                # Reversing axis switch: X is Month, Y is Value
+                month_x_axis = alt.X(
                     "Month:N",
                     sort=month_sort_order,
                     title=None,
                     axis=quiet_axis(labelAngle=0),
                 )
 
+                value_y_axis = alt.Y(
+                    "Value:Q",
+                    title=y_title,
+                    scale=alt.Scale(zero=False),
+                    axis=value_axis(axis_format),
+                )
+
                 yearly_chart = (
                     alt.Chart(chart_data)
                     .mark_line(point=alt.OverlayMarkDef(size=28), strokeWidth=2)
                     .encode(
-                        x=value_x_axis,
-                        y=month_y_axis,
+                        x=month_x_axis,
+                        y=value_y_axis,
                         color=alt.Color(
                             "Series:N",
                             sort=series_order,
@@ -2261,7 +2261,7 @@ if selected_tab == "Forecast":
                         alt.Chart(hover_frame)
                         .mark_rule(color="#667085", strokeWidth=12)
                         .encode(
-                            y=month_y_axis,
+                            x=month_x_axis,
                             opacity=alt.condition(month_hover_selection, alt.value(0.18), alt.value(0), empty=False),
                             tooltip=[alt.Tooltip("Month:N")] + [alt.Tooltip(f"{label}:N", title=label) for label in hover_fields],
                         )
@@ -2277,10 +2277,12 @@ if selected_tab == "Forecast":
                     "Click a legend entry to show or hide a series · Hover a month to compare every year."
                 )
 
-                # Data Table Underneath the Chart
+                # Data Table Underneath the Chart (with Transposed/Swapped Axes via .T)
                 with st.expander("📊 Monthly Data Table", expanded=True):
                     pivot_data = chart_data.pivot(index="Month", columns="Series", values="Value").reindex(month_sort_order)
                     pivot_data = pivot_data.reindex(columns=[col for col in series_order if col in pivot_data.columns])
+                    # Swap axes of the data table by transposing
+                    pivot_data = pivot_data.T
 
                     column_config_table = {}
                     for col in pivot_data.columns:
@@ -2292,7 +2294,7 @@ if selected_tab == "Forecast":
                             column_config_table[col] = st.column_config.NumberColumn(col, format="%,.0f")
 
                     st.dataframe(
-                        pivot_data.reset_index(),
+                        pivot_data.reset_index().rename(columns={"index": "Series"}),
                         hide_index=True,
                         column_config=column_config_table,
                         height=table_height(len(pivot_data)),
@@ -2301,7 +2303,7 @@ if selected_tab == "Forecast":
 
                     st.download_button(
                         "Download forecast table CSV",
-                        pivot_data.reset_index().to_csv(index=False).encode("utf-8"),
+                        pivot_data.reset_index().rename(columns={"index": "Series"}).to_csv(index=False).encode("utf-8"),
                         file_name="monthly_forecast_comparison.csv",
                         mime="text/csv",
                         key="download_monthly_forecast_table",
@@ -3047,6 +3049,6 @@ elif selected_tab == "Document Status":
             "Last Modified": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
             "Size (KB)": st.column_config.NumberColumn(format="%.1f KB"),
         },
-        height=table_height(len(filtered_docs), cap=450),
-        **FULL_WIDTH,
-    )
+    height=table_height(len(filtered_docs), cap=450),
+    **FULL_WIDTH,
+)
