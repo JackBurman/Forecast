@@ -161,12 +161,7 @@ def to_number(series: pd.Series) -> pd.Series:
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
-    """Parse a column that may mix Excel serials, real datetimes and day-first text.
-
-    Already-datetime columns pass straight through. Text is parsed with pandas'
-    vectorised single-format path first; only the values that fail fall back to
-    the slow per-element mixed-format parser.
-    """
+    """Parse a column that may mix Excel serials, real datetimes and day-first text."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce")
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
@@ -214,25 +209,10 @@ def sku_text(value) -> str:
 
 
 def map_unique(series: pd.Series, func) -> pd.Series:
-    """Apply a Python function once per distinct value instead of once per row.
-
-    Exports have thousands of rows but far fewer distinct codes, so this turns
-    a 200k-call loop into a few-thousand-call loop.
-    """
     uniques = series.unique()
     lookup = {value: func(value) for value in uniques}
     return series.map(lookup)
 
-
-# -----------------------------------------------------------------------------
-# Cache keys for big frames
-#
-# st.cache_data hashes every DataFrame argument by content on every call, which
-# for a 200k-row sales sheet costs more than the cached work. The loader tags
-# each sheet with a token derived from the files it was built from; cached
-# functions hash that token (plus the shape, so a filtered copy never collides)
-# and fall back to a content hash for untagged frames.
-# -----------------------------------------------------------------------------
 
 def frame_cache_key(frame: pd.DataFrame):
     token = frame.attrs.get("cache_token")
@@ -253,7 +233,6 @@ def tag_frames(sheets: dict, token: str) -> dict:
 
 @st.cache_data(show_spinner=False, max_entries=64, **BY_TOKEN)
 def column_choices(frame: pd.DataFrame, column: str) -> list[str]:
-    """Sorted distinct non-blank values of a column, computed from the distinct values only."""
     if column not in frame.columns:
         return []
     values = frame[column].dropna().unique()
@@ -264,7 +243,6 @@ def column_choices(frame: pd.DataFrame, column: str) -> list[str]:
 
 
 def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.DataFrame:
-    """Apply the Power Query-style transformation to the merged sales exports."""
     sales = df_sales.copy()
     sales.columns = [str(col).strip() for col in sales.columns]
 
@@ -288,7 +266,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
     sales = sales.dropna(how="all").reset_index(drop=True)
 
-    # Carry location labels down the sales export.
     sales["Location"] = pd.NA
     location_mask = (
         sales["Inv #"].astype(str).str.upper().str.startswith("LOCATION:", na=False)
@@ -316,7 +293,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
         sales["Stock Code"].astype(str).str.strip().str.replace("\r", "")
     )
 
-    # Enrich sales rows with product metadata.
     options_lookup = df_options.copy()
     options_lookup["SKU"] = map_unique(options_lookup["Stock Code"], normalize_sku)
     options_lookup = options_lookup[
@@ -364,17 +340,9 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
     def sales_channel_net(value) -> str:
         text = str(value or "").upper()
-        if "A&D" in text:
+        if "A&D" in text or "ECOMMERCE SALES" in text or "RETAIL" in text:
             return "Retail"
-        if "ECOMMERCE SALES" in text:
-            return "Retail"
-        if "RETAIL" in text:
-            return "Retail"
-        if "WAREHOUSE" in text:
-            return "Warehouse/Sale"
-        if "CLEARANCE SALE" in text:
-            return "Warehouse/Sale"
-        if "LOAN STOCK" in text:
+        if "WAREHOUSE" in text or "CLEARANCE SALE" in text or "LOAN STOCK" in text:
             return "Warehouse/Sale"
         if "WARRANTY" in text:
             return "Warranty"
@@ -397,7 +365,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
     if "SKU" in sales.columns:
         sales["SKU"] = sales["SKU"].astype("string")
     sales = sales.sort_values("Date", ascending=False).reset_index(drop=True)
-    # A handful of distinct values repeated over every row: store once each.
     for column in ["City", "Sales Channel", "Sales Channel Net", "Location", "Month"]:
         if column in sales.columns:
             sales[column] = sales[column].astype("category")
@@ -405,7 +372,6 @@ def clean_sales_data(df_sales: pd.DataFrame, df_options: pd.DataFrame) -> pd.Dat
 
 
 def raw_folder_manifest(folder: Path) -> tuple[tuple[str, int, int], ...]:
-    """Names, sizes and mtimes of every data file; a change invalidates the cache."""
     if not folder.exists():
         return ()
     files = sorted(
@@ -426,19 +392,6 @@ def newest_file(folder: Path) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
-# -----------------------------------------------------------------------------
-# Workbook reading by content, not by extension
-#
-# ERP exports are often not what their extension says: a ".xlsx" that is a
-# legacy BIFF ".xls", an "Excel" file that is really an HTML table, a CSV with
-# a .xls name, or - on Streamlit Community Cloud - a Git LFS pointer instead of
-# the workbook. Reading by extension (or forcing one engine) fails on these
-# with messages like "File is not a zip file". The first bytes of the file say
-# what it really is, so the reader below sniffs them and picks the right
-# parser, and the loader checks every workbook up front so a bad file is named
-# rather than surfacing as a cryptic error from inside forecast_engine.
-# -----------------------------------------------------------------------------
-
 ZIP_MAGIC = b"PK\x03\x04"
 BIFF_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 LFS_MAGIC = b"version https://git-lfs"
@@ -455,7 +408,6 @@ WORKBOOK_PROBLEMS = {
 
 
 def sniff_workbook(path: Path) -> str:
-    """What a spreadsheet file really contains: xlsx, xls, html, csv, lfs-pointer, empty or unknown."""
     if path.stat().st_size == 0:
         return "empty"
     with open(path, "rb") as handle:
@@ -484,7 +436,6 @@ def xlrd_available() -> bool:
 
 
 def calamine_available() -> bool:
-    """python-calamine is installed and this pandas knows the 'calamine' engine (2.2+)."""
     try:
         import python_calamine  # noqa: F401
     except ImportError:
@@ -494,7 +445,6 @@ def calamine_available() -> bool:
 
 
 def workbook_problem(path: Path) -> str | None:
-    """A sentence describing why the file cannot be read, or None when it can."""
     kind = sniff_workbook(path)
     if kind == "xls" and not xlrd_available():
         kind = "xls-no-xlrd"
@@ -505,7 +455,6 @@ _pandas_read_excel = pd.read_excel
 
 
 def read_workbook(path: Path, *args, **kwargs) -> pd.DataFrame:
-    """pd.read_excel that chooses the parser from the file's content."""
     kind = sniff_workbook(path)
     if kind == "xlsx":
         return _pandas_read_excel(path, *args, engine="openpyxl", **kwargs)
@@ -537,14 +486,6 @@ def read_workbook(path: Path, *args, **kwargs) -> pd.DataFrame:
 
 
 def _read_excel_by_content(io, *args, **kwargs):
-    """Route file-path reads through read_workbook; anything else goes to pandas untouched.
-
-    forecast_engine reads the Raw_data workbooks with pd.read_excel, so this is
-    the one place its reads can be made content-aware without editing it. An
-    explicit engine= argument is respected, except that engine="calamine" (which
-    forecast_engine asks for) falls back to content-based reading when the
-    python-calamine package is not installed, instead of failing the load.
-    """
     engine = kwargs.get("engine")
     if isinstance(io, (str, Path)):
         path = Path(io)
@@ -557,13 +498,6 @@ def _read_excel_by_content(io, *args, **kwargs):
 
 
 def _tolerant_read(reader, path: Path, *args, **kwargs) -> pd.DataFrame:
-    """Read a sheet; if it is shorter than the requested header offset, take row 0 as the header.
-
-    forecast_engine reads its workbooks with header=1 (a title row above the
-    headings). A zero-row placeholder, or an export without the title row, has
-    nothing on row 2 and pandas raises "Passed header=[1] ... but only 1 lines
-    in file"; the first row is then the header.
-    """
     try:
         return reader(path, *args, **kwargs)
     except ValueError as e:
@@ -578,7 +512,6 @@ pd.read_excel = _read_excel_by_content
 
 
 def workbook_problems(folder: Path) -> list[str]:
-    """Every .xls/.xlsx under the folder that cannot be read, with the reason."""
     problems = []
     if not folder.exists():
         return problems
@@ -591,11 +524,6 @@ def workbook_problems(folder: Path) -> list[str]:
 
 
 def detect_header_row(preview: pd.DataFrame) -> int:
-    """Row index of the header in an export that may start with title lines.
-
-    The first row holding a SKU-like header wins; otherwise the row with the
-    most populated cells.
-    """
     if preview.empty:
         return 0
     best_row, best_count = 0, -1
@@ -611,10 +539,7 @@ def detect_header_row(preview: pd.DataFrame) -> int:
 
 
 def read_tabular(path: Path) -> pd.DataFrame:
-    """Read a CSV / Excel export, skipping any title rows above the header."""
     if path.suffix.lower() == ".csv":
-        # Title lines above the header have fewer fields than the data, which
-        # trips the default parser; read the preview as ragged rows instead.
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             lines = [handle.readline() for _ in range(20)]
         ragged = [line.rstrip("\r\n").split(",") for line in lines if line.strip()]
@@ -628,19 +553,12 @@ def read_tabular(path: Path) -> pd.DataFrame:
         try:
             frame = read_workbook(path, skiprows=header_row)
         except ValueError:
-            # Sheet shorter than the detected offset (e.g. a one-line export).
             frame = read_workbook(path, header=0)
     frame.columns = [str(col).strip() for col in frame.columns]
     return frame.dropna(how="all").reset_index(drop=True)
 
 
 def add_alias_columns(frame: pd.DataFrame, aliases: dict[str, list[str]], numeric: tuple[str, ...] = ()) -> pd.DataFrame:
-    """Add standard column names alongside the export's own headers.
-
-    Original columns are never renamed, so whatever forecast_engine keyed on
-    in the original workbooks is still present; the aliases cover the names it
-    is known to look for.
-    """
     frame = frame.copy()
     frame.columns = [str(col).strip() for col in frame.columns]
     for alias, candidates in aliases.items():
@@ -678,17 +596,10 @@ def standardise_purchase_orders(frame: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def write_engine_placeholders() -> list[Path]:
-    """Create zero-row workbooks the engine's reader expects; returns what was created.
-
-    A zero-byte file of the same name (left behind by an earlier version of the
-    loader, or created with `touch`) is not a workbook and is replaced too.
-    """
     created = []
     for name, columns in ENGINE_PLACEHOLDERS.items():
         path = raw_data_path / name
         if not path.exists() or path.stat().st_size == 0:
-            # Same shape as the real exports: a title row, then the headings
-            # (forecast_engine reads these with header=1).
             pd.DataFrame([[f"{name} placeholder"] + [""] * (len(columns) - 1), columns]).to_excel(
                 path, index=False, header=False
             )
@@ -703,11 +614,6 @@ def column_summary(frame: pd.DataFrame | None) -> str:
 
 
 def local_prepare_forecast_sheets(inputs: dict) -> dict:
-    """App-side stand-in for forecast_engine.prepare_forecast_sheets.
-
-    Adds the three derived sales columns the filters rely on (SKU Key, Supplier
-    Brand, Model) from the options data, and passes the other sheets through.
-    """
     sales = inputs["Sales Data"].copy()
     options = inputs.get("OptionsData")
     sales["SKU Key"] = sales["SKU"].astype("string")
@@ -737,7 +643,6 @@ def load_raw_folder_data(
     folder: str,
     manifest: tuple[tuple[str, int, int], ...],
 ) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
-    """Returns (sheets, source file names, notes to show the user)."""
     notes: list[str] = []
 
     placeholders = write_engine_placeholders()
@@ -765,8 +670,6 @@ def load_raw_folder_data(
         if key not in sources:
             raise KeyError(f"forecast_engine.read_raw_data_folder did not return '{key}'.")
 
-    # Live inventory / PO exports: newest file in each sub-folder, falling back
-    # to whatever the engine read from Raw_data itself.
     inventory_file = newest_file(inventory_folder_path)
     if inventory_file is not None:
         try:
@@ -813,8 +716,6 @@ def load_raw_folder_data(
             f"Purchase orders — {column_summary(forecast_inputs['Purchase Orders'])}."
         )
 
-    # Loan / transfer document lines: newest file under Raw_data/loan. Not an
-    # engine input, so it rides alongside the engine's sheets.
     loan_file = newest_file(loan_folder_path)
     if loan_file is not None:
         try:
@@ -830,7 +731,6 @@ def load_raw_folder_data(
 
 
 def load_prepared_data():
-    """Load Raw_data for a tab; returns (sheets, source_names) or (None, [])."""
     try:
         sheets, names, notes = load_raw_folder_data(str(raw_data_path), raw_folder_manifest(raw_data_path))
     except Exception as e:
@@ -843,10 +743,6 @@ def load_prepared_data():
 
 # =============================================================================
 # Engine calls with app-side fallbacks
-#
-# The engine's helpers are used whenever they work. If one raises on the new
-# inventory / PO exports, the app computes the same quantity itself and says
-# so, rather than blanking the whole tab.
 # =============================================================================
 
 FILTER_COLUMNS = {
@@ -861,7 +757,6 @@ FILTER_COLUMNS = {
 
 
 def engine_call(name: str, fallback, *args):
-    """Call forecast_engine.<name>(*args); on failure use fallback and return a note."""
     func = getattr(forecast_engine, name, None)
     if func is None:
         return fallback(*args), f"forecast_engine has no {name}; the app calculated it instead."
@@ -925,7 +820,7 @@ def local_yearly_monthly_profile(sales: pd.DataFrame, _forecast, metric: str, st
 
 
 # =============================================================================
-# Forecast math (unchanged)
+# Forecast math
 # =============================================================================
 
 SEASON = 12
@@ -1148,11 +1043,10 @@ def window_label(window: pd.PeriodIndex) -> str:
 
 
 # =============================================================================
-# Year view (calendar Jan–Dec or Australian financial year Jul–Jun)
+# Year view
 # =============================================================================
 
 def fiscal_year_of(period: pd.Period) -> int:
-    """Australian FY ends 30 June and is named by its end year (FY2027 = Jul 2026 – Jun 2027)."""
     return period.year + 1 if period.month >= 7 else period.year
 
 
@@ -1174,7 +1068,6 @@ def label_year_number(label: str) -> int:
 
 
 def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFrame:
-    """Re-group a Month × calendar-year profile into Month × financial-year; values are moved, not recomputed."""
     long = profile.melt(id_vars="Month", var_name="Year", value_name="Value").dropna(subset=["Value"])
     if long.empty:
         return pd.DataFrame({"Month": FY_MONTHS})
@@ -1193,9 +1086,6 @@ def fiscal_profile(profile: pd.DataFrame, first_fiscal_year: int) -> pd.DataFram
 
 STATUS_ORDER = ["Dead stock", "Slow moving", "Stock-out risk", "Healthy", "Allocated", "Out of stock", "Inactive"]
 
-# SKU / stock-code patterns. Checked in this order: the *SHOW* rule wins over a
-# prefix because it is the more specific signal, then the letter prefixes,
-# then the leading digit.
 SKU_TYPE_RULES = [
     ("Legacy showroom display (*SHOW*)", lambda code: "SHOW" in code),
     ("Clearance product (LEX*)", lambda code: code.startswith("LEX")),
@@ -1209,7 +1099,6 @@ SKU_TYPES = [label for label, _ in SKU_TYPE_RULES] + ["Other"]
 
 
 def classify_sku(code) -> str:
-    """Product classification from the stock code pattern (see SKU_TYPE_RULES)."""
     text = "" if pd.isna(code) else str(code).strip().upper()
     if not text:
         return "Other"
@@ -1220,35 +1109,16 @@ def classify_sku(code) -> str:
 
 
 def sku_type_rules_table() -> pd.DataFrame:
-    """The rules as a small table for the Backend Mapping tab."""
     patterns = ["contains SHOW", "starts with LEX", "starts with C", "starts with 1", "starts with 4", "starts with 5", "starts with 6", "anything else"]
     return pd.DataFrame({"Order": range(1, len(SKU_TYPES) + 1), "SKU type": SKU_TYPES, "Rule": patterns})
 
 
-# -----------------------------------------------------------------------------
-# Site categories (backend mapping)
-#
-# Every inventory row carries a site code. Codes are mapped to a category, and
-# only Warehouse and Clearance stock is "available to sell": showroom stock is
-# display stock, and Ignored / Unmapped sites are skipped, so none of those
-# count towards stock health, days of supply, turns or value. The mapping
-# lives in session state (editable on the Backend Mapping tab) and can be
-# saved to backend_mapping.json next to app.py as the default for the
-# deployment.
-# -----------------------------------------------------------------------------
-
-# Showroom: display stock, excluded. Warehouse / Clearance: available to sell.
-# Loan: out on loan to clients - not for sale, but tracked for value.
-# Ignored: deliberately not tracked (quarantine, returns, transit...) - skipped
-# silently. Unmapped: a code seen in the export that nobody has categorised yet
-# - excluded like Ignored, but flagged so it gets a decision.
 SITE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Loan", "Ignored", "Unmapped"]
 ASSIGNABLE_CATEGORIES = ["Showroom", "Warehouse", "Clearance", "Loan", "Ignored"]
 SELLABLE_CATEGORIES = {"Warehouse", "Clearance"}
 
 
 def category_for(code: str, site_mapping: dict) -> str:
-    """Category of a site code: the mapping first; a code containing LOAN defaults to Loan; else Unmapped."""
     if code in site_mapping:
         return site_mapping[code]
     if "LOAN" in code:
@@ -1285,7 +1155,6 @@ def save_backend_mapping_file(payload: dict) -> None:
 
 
 def init_backend_state() -> None:
-    """Seed the session-state mappings once, from backend_mapping.json when it exists."""
     if "site_mapping" in st.session_state:
         return
     saved = load_backend_mapping_file()
@@ -1307,7 +1176,6 @@ def current_site_mapping() -> dict[str, str]:
 
 
 def resolve_inventory_mapping(inventory: pd.DataFrame) -> dict[str, str | None]:
-    """Auto-detected inventory columns, overridden by choices made on the Backend Mapping tab."""
     init_backend_state()
     mapping = detect_inventory_columns(inventory)
     for role, choice in st.session_state["inventory_column_mapping"].items():
@@ -1319,7 +1187,6 @@ def resolve_inventory_mapping(inventory: pd.DataFrame) -> dict[str, str | None]:
 
 
 def site_mapping_frame(site_mapping: dict[str, str], site_units: pd.Series) -> pd.DataFrame:
-    """The editable table shown on the Backend Mapping tab: one row per known site code."""
     codes = sorted(
         set(site_mapping) | {code for code in site_units.index if code},
         key=lambda code: (CATEGORY_ORDER[category_for(code, site_mapping)], code),
@@ -1339,12 +1206,6 @@ def site_mapping_frame(site_mapping: dict[str, str], site_units: pd.Series) -> p
 
 
 def apply_site_editor_changes() -> None:
-    """on_change for the site editor: fold its edits into session state, then recreate the editor.
-
-    The editor is keyed by a version number; bumping it means the next run
-    shows a fresh editor built from the updated mapping, so edits and added
-    rows are never applied twice.
-    """
     key = f"backend_site_editor_{st.session_state['site_editor_version']}"
     state = st.session_state.get(key, {})
     frame = st.session_state["site_editor_frame"].copy()
@@ -1365,7 +1226,6 @@ def apply_site_editor_changes() -> None:
 
 
 def units_by_site(inventory: pd.DataFrame, mapping: dict) -> pd.Series:
-    """Units on hand per site code across the whole export (all SKUs)."""
     if not mapping.get("site") or not mapping.get("on_hand"):
         return pd.Series(dtype=float)
     codes = map_unique(inventory[mapping["site"]], normalise_site_code)
@@ -1374,12 +1234,6 @@ def units_by_site(inventory: pd.DataFrame, mapping: dict) -> pd.Series:
 
 
 def company_wide_totals(inventory: pd.DataFrame, mapping: dict, site_mapping: dict, cost_by_sku: pd.Series) -> dict:
-    """Totals over every row of the inventory export, whatever the site category.
-
-    Value = units × unit cost, taking the export's own cost column where it
-    has one and the SKU's resolved average option cost otherwise. Allocated
-    units are on hand minus free (stock committed to sales orders).
-    """
     frame = pd.DataFrame({"SKU": map_unique(inventory[mapping["sku"]], sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free"] = to_number(inventory[mapping["free"]]).fillna(0.0) if mapping.get("free") else frame["On hand"]
@@ -1416,16 +1270,6 @@ def company_wide_totals(inventory: pd.DataFrame, mapping: dict, site_mapping: di
         "costed_share": float(frame.loc[stocked, "Unit cost"].notna().mean()) if stocked.any() else 0.0,
     }
 
-
-# -----------------------------------------------------------------------------
-# Loans and transfers
-#
-# The loan file lists stock-movement document lines. A line with a customer
-# name is stock on loan to that customer; a line without one is a standard
-# inter-site transfer - unless the stock came from a Loan site, in which case
-# it is loan stock whatever the customer field says. Lines whose status says
-# returned / closed are over and are dropped.
-# -----------------------------------------------------------------------------
 
 LOAN_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "sku": SKU_HEADERS,
@@ -1481,12 +1325,6 @@ def resolve_loan_mapping(loans: pd.DataFrame) -> dict[str, str | None]:
 def classify_loan_lines(
     loans: pd.DataFrame, mapping: dict, site_mapping: dict, cost_by_sku: pd.Series, today: pd.Timestamp
 ) -> pd.DataFrame:
-    """Standardised loan / transfer lines with a Type, an open quantity and a value.
-
-    Type: "Loan" when the line has a customer name or came from a Loan site,
-    otherwise "Transfer". Open qty = qty - returned qty. Value = open qty ×
-    the SKU's average option cost. Lines with a closed status are removed.
-    """
     columns = ["Document", "Date", "Due", "Customer", "SKU", "Description", "Qty", "From site", "To site",
                "From category", "Type", "Days out", "Avg option cost", "Value"]
     if loans is None or loans.empty or not mapping.get("sku") or not mapping.get("qty"):
@@ -1523,12 +1361,10 @@ def classify_loan_lines(
     return frame[columns].sort_values(["Type", "Value"], ascending=[True, False]).reset_index(drop=True)
 
 
-GAUGE_START, GAUGE_END = -2 * np.pi / 3, 2 * np.pi / 3  # a 240° dial
+GAUGE_START, GAUGE_END = -2 * np.pi / 3, 2 * np.pi / 3
 
 
 def gauge_band_colour(value: float, target: float, tolerance: float) -> tuple[str, str]:
-    """(label, colour) for where a value sits against its target: green within ±tolerance,
-    amber within ±3×tolerance, red beyond."""
     if target <= 0:
         return "No target", "#9aa0a6"
     deviation = abs(value / target - 1)
@@ -1540,8 +1376,6 @@ def gauge_band_colour(value: float, target: float, tolerance: float) -> tuple[st
 
 
 def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max: float | None = None) -> alt.LayerChart:
-    """A dial: coloured bands around the target (green = within ±tolerance), the value as a filled
-    inner arc in the band's colour, a tick at the target and the figure in the centre."""
     scale_max = scale_max or max(target * 1.5, value * 1.1, 1.0)
     span = GAUGE_END - GAUGE_START
 
@@ -1550,8 +1384,6 @@ def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max:
 
     bands = []
     cuts = [0.0, target * (1 - 3 * tolerance), target * (1 - tolerance), target * (1 + tolerance), target * (1 + 3 * tolerance), scale_max]
-    # Ring colours: neutral outside, amber shoulders, green target band. The
-    # value arc carries the red/amber/green verdict so the ring stays calm.
     colours = ["#dcdcdc", "#f5d58a", "#009e73", "#f5d58a", "#dcdcdc"]
     for lower, upper, colour in zip(cuts[:-1], cuts[1:], colours):
         lower, upper = max(0.0, min(lower, scale_max)), max(0.0, min(upper, scale_max))
@@ -1569,8 +1401,6 @@ def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max:
         }
     )
 
-    # Outer ring: the target bands, solid. Inner arc: the value, in its band's colour.
-    # Tick: a thin radial line at the target. Text sits in the clear centre.
     ring = alt.Chart(band_frame).mark_arc(innerRadius=72, outerRadius=84).encode(
         theta=alt.Theta("start:Q", scale=None), theta2="end:Q", color=alt.Color("colour:N", scale=None),
     )
@@ -1591,12 +1421,6 @@ def gauge_chart(value: float, target: float, tolerance: float = 0.05, scale_max:
 
 @st.cache_data(show_spinner=False, max_entries=16, **BY_TOKEN)
 def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict) -> pd.DataFrame:
-    """One row per SKU: available-to-sell stock (Warehouse + Clearance sites) plus context.
-
-    Columns: On hand / Free stock (sellable sites only), On hand (all sites),
-    Showroom units, Ignored units, Unmapped units, Sites with stock, and when
-    the export has a cost column, Inventory unit cost (weighted by units on hand).
-    """
     frame = pd.DataFrame({"SKU": map_unique(inventory[mapping["sku"]], sku_text)})
     frame["On hand"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
     frame["Free stock"] = (
@@ -1606,7 +1430,6 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
         frame["Site"] = map_unique(inventory[mapping["site"]], normalise_site_code)
         frame["Category"] = map_unique(frame["Site"], lambda code: category_for(code, site_mapping))
     else:
-        # Without a site column nothing can be excluded; treat every row as sellable.
         frame["Site"] = ""
         frame["Category"] = "Warehouse"
     frame["Sellable"] = frame["Category"].isin(SELLABLE_CATEGORIES)
@@ -1651,7 +1474,6 @@ def inventory_by_sku(inventory: pd.DataFrame, mapping: dict, site_mapping: dict)
 
 @st.cache_data(show_spinner=False, max_entries=16, **BY_TOKEN)
 def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.DataFrame:
-    """Per-SKU sales inside the window plus lifetime first/last sale dates."""
     dated = sales.dropna(subset=["Date"]).copy()
     key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
     dated["SKU"] = map_unique(dated[key_column], sku_text)
@@ -1689,7 +1511,6 @@ def sku_movement(sales: pd.DataFrame, window_start: str, window_end: str) -> pd.
 
 @st.cache_data(show_spinner=False, max_entries=4, **BY_TOKEN)
 def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
-    """Per-SKU Description / Supplier / Class / Product group from the options sheet."""
     empty = pd.DataFrame(columns=["SKU", "Description", "Supplier", "Class", "Product group", "Option unit cost"])
     if options is None or options.empty:
         return empty
@@ -1712,7 +1533,6 @@ def option_attributes(options: pd.DataFrame | None) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, max_entries=4, **BY_TOKEN)
 def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
-    """Open PO quantity per SKU; empty when the PO sheet has no SKU or quantity column."""
     if purchase_orders is None or purchase_orders.empty:
         return pd.Series(dtype=float)
     sku_col = detect_column(purchase_orders.columns, SKU_HEADERS)
@@ -1726,12 +1546,6 @@ def open_po_by_sku(purchase_orders: pd.DataFrame | None) -> pd.Series:
 
 
 def resolve_avg_option_cost(master: pd.DataFrame, derived: pd.Series, cost_source: str) -> tuple[pd.Series, pd.Series]:
-    """Per-SKU average option cost and where each value came from.
-
-    Sources, in automatic order: the inventory export's cost column, the
-    options data's cost column, then a derived cost (COGS ÷ units sold in the
-    window). A chosen source is used first and gaps are filled from the others.
-    """
     candidates = {
         "inventory": master["Inventory unit cost"] if "Inventory unit cost" in master.columns else pd.Series(np.nan, index=master.index),
         "options": master["Option unit cost"] if "Option unit cost" in master.columns else pd.Series(np.nan, index=master.index),
@@ -1763,13 +1577,6 @@ def build_inventory_table(
     risk_dos: int,
     cost_source: str = "auto",
 ) -> pd.DataFrame:
-    """SKU-level available-to-sell stock, movement, days of supply, turns, value and status.
-
-    "On hand" and "Free stock" are Warehouse + Clearance stock only; showroom
-    stock is carried separately in "Showroom units" and never counts towards
-    stock health. Total stock value = On hand × Avg option cost; Free stock
-    value = Free stock × Avg option cost.
-    """
     master = inventory_sku.merge(movement, on="SKU", how="outer")
     master = master.merge(attributes, on="SKU", how="left", suffixes=("", " (options)"))
     for column in ["Description", "Supplier", "Class", "Product group"]:
@@ -1818,17 +1625,6 @@ def build_inventory_table(
     master["Last sale"] = last_sale
     master["Days since last sale"] = (today - last_sale).dt.days
 
-    # Status, first match wins:
-    #   Out of stock   - nothing on hand, but it sold in the window
-    #   Inactive       - nothing on hand and no sales
-    #   Stock-out risk - still moving (sold within dead_days) and free stock covers
-    #                    fewer than risk_dos days (free, not on hand: allocated units
-    #                    cannot be sold again)
-    #   Allocated      - on hand but no free stock: committed to sales orders, so
-    #                    exempt from dead / slow classification whatever the last sale date
-    #   Dead stock     - free stock with no sale for dead_days (or never sold)
-    #   Slow moving    - more than slow_dos days of supply
-    #   Healthy        - everything else
     on_hand = master["On hand"]
     free = master["Free stock"]
     dos = master["Days of supply"]
@@ -1893,7 +1689,6 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
 # =============================================================================
 
 def metric_card(title: str, tiles: list[dict]) -> None:
-    """A bordered card with a small heading and one st.metric per tile."""
     with st.container(border=True):
         st.markdown(f"<p class='card-title'>{title}</p>", unsafe_allow_html=True)
         columns = st.columns(len(tiles), gap="small")
@@ -1902,7 +1697,6 @@ def metric_card(title: str, tiles: list[dict]) -> None:
 
 
 def chart_formats(metric: str) -> tuple[str, str, str]:
-    """Axis format, tooltip format and axis title for a metric."""
     if metric in ["Sale", "Cost", "GP $"]:
         return "$~s", "$,.0f", f"{metric.replace(' $', '')} ($)"
     if metric == "GP%":
@@ -1926,7 +1720,6 @@ def value_axis(fmt: str, **overrides) -> alt.Axis:
 
 
 def filter_selectbox(label: str, frame: pd.DataFrame, column: str, default: str = "TOTAL") -> str:
-    """A TOTAL-or-value selectbox over a column; a text search when the column has >1500 values."""
     values = column_choices(frame, column)
     if len(values) > 1500:
         starting_value = "" if default == "TOTAL" else default
@@ -1947,7 +1740,6 @@ def table_height(rows: int, cap: int = 420) -> int:
 
 @st.fragment
 def stock_health_charts(filtered: pd.DataFrame, chart_group: str) -> None:
-    """Measure toggle + the two stock-health charts. Re-runs on its own when toggled."""
     control_left, _, control_right = st.columns([5, 1, 2], gap="small", vertical_alignment="center")
     with control_left:
         measure_label = st.radio(
@@ -1972,7 +1764,6 @@ def stock_health_charts(filtered: pd.DataFrame, chart_group: str) -> None:
 
 @st.fragment
 def loans_section(loan_lines: pd.DataFrame) -> None:
-    """Loan / transfer lines with the transfers toggle, as a fragment."""
     loans = loan_lines.loc[loan_lines["Type"].eq("Loan")]
     show_transfers = st.toggle("Include inter-site transfers", value=False, key="inventory_show_transfers")
     shown = loan_lines if show_transfers else loans
@@ -2201,8 +1992,6 @@ if selected_tab == "Forecast":
                 else:
                     rolling_display = f"{forecast_label_prefix}{rolling_total:,.0f}"
 
-                # The view only decides which twelve months make up "this year";
-                # the forecast series are used exactly as produced.
                 current_period = last_complete + 1
                 view_this_year = view_year(current_period, fiscal)
                 this_label = view_label(view_this_year, fiscal)
@@ -2320,9 +2109,6 @@ if selected_tab == "Forecast":
                     ],
                 )
 
-                # Monthly comparison chart. In the FY view the engine is asked
-                # for one extra calendar year so July–December of the first
-                # financial year is present, then months are re-grouped.
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
                 annual_profile, note = engine_call(
                     "yearly_monthly_profile",
@@ -2437,10 +2223,6 @@ if selected_tab == "Forecast":
                     .add_params(legend_selection)
                 )
 
-                # One hover layer for all twelve months: a 12-row frame whose
-                # columns are the series labels, holding pre-formatted text so a
-                # month without a value shows blank. (Twelve single-row layers
-                # cost ~0.3 s of Altair spec building per rerun.)
                 series_labels = [view_label(int(year), fiscal) for year in year_columns]
                 forecast_labels = [f"Forecast {year}" for year in sorted(forecast_chart_data["Year"].unique(), key=label_year_number)]
                 forecast_lookup = {
@@ -2449,7 +2231,6 @@ if selected_tab == "Forecast":
                     if pd.notna(row["Forecast"])
                 }
                 profile_by_month = annual_profile.set_index("Month") if not annual_profile.empty else pd.DataFrame()
-                # value_format is a D3 format ("$,.0f"); Python's format() wants the "$" outside.
                 prefix, python_spec = ("$", value_format[1:]) if value_format.startswith("$") else ("", value_format)
                 hover_rows = []
                 for month in month_sort_order:
@@ -2479,9 +2260,6 @@ if selected_tab == "Forecast":
                         .add_params(month_hover_selection)
                     )
 
-                # Legend show/hide and the month hover are handled in the browser by the
-                # chart's own selections; no on_select, so a legend click doesn't rerun
-                # the whole script (and layered charts can't carry one on Streamlit < 1.41).
                 st.altair_chart(
                     alt.layer(yearly_chart, *month_hover_charts).properties(height=360).configure_view(strokeWidth=0),
                     **FULL_WIDTH,
@@ -2490,6 +2268,36 @@ if selected_tab == "Forecast":
                     f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · Solid lines: actual · Dashed lines: forecast · "
                     "Click a legend entry to show or hide a series · Hover a month to compare every year."
                 )
+
+                # Data Table Underneath the Chart
+                with st.expander("📊 Monthly Data Table", expanded=True):
+                    pivot_data = chart_data.pivot(index="Month", columns="Series", values="Value").reindex(month_sort_order)
+                    pivot_data = pivot_data.reindex(columns=[col for col in series_order if col in pivot_data.columns])
+
+                    column_config_table = {}
+                    for col in pivot_data.columns:
+                        if metric in ["Sale", "Cost", "GP $"]:
+                            column_config_table[col] = st.column_config.NumberColumn(col, format="$%,.0f")
+                        elif metric == "GP%":
+                            column_config_table[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+                        else:
+                            column_config_table[col] = st.column_config.NumberColumn(col, format="%,.0f")
+
+                    st.dataframe(
+                        pivot_data.reset_index(),
+                        hide_index=True,
+                        column_config=column_config_table,
+                        height=table_height(len(pivot_data)),
+                        **FULL_WIDTH,
+                    )
+
+                    st.download_button(
+                        "Download forecast table CSV",
+                        pivot_data.reset_index().to_csv(index=False).encode("utf-8"),
+                        file_name="monthly_forecast_comparison.csv",
+                        mime="text/csv",
+                        key="download_monthly_forecast_table",
+                    )
 
                 if metric == "Sale":
                     target_80 = sale_target * 0.8
@@ -2502,7 +2310,7 @@ if selected_tab == "Forecast":
                         t_col1, t_col2, t_col3, t_col4 = st.columns(4, gap="small")
                         t_col1.metric("Full Year Outlook", fmt_str(fy_act_fc), delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)")
                         t_col2.metric("100% Sale Target", f"${sale_target:,.0f}", delta=f"{target_pct:+.1f}% to Target")
-                        t_col3.metric("80% Sale Target", f"${target_80:,.0f}", delta=f"{target_80_pct:+.1f}% to 80% Target")
+                        t_col3.metric("80% Sale Target", f"${sale_target_80:,.0f}" if 'sale_target_80' in locals() else f"${target_80:,.0f}", delta=f"{target_80_pct:+.1f}% to 80% Target")
                         t_col4.metric(f"{prior_label} Full Year Actuals", fmt_str(prior_fy_act))
 
             for note in [n for n in engine_notes if n]:
@@ -2631,7 +2439,6 @@ elif selected_tab == "Inventory Analysis":
                     filtered = filtered.loc[text_match]
                 filtered = filtered.reset_index(drop=True)
 
-                # Site context for the caption: what was excluded, and anything unmapped.
                 site_units = units_by_site(inventory_raw, mapping)
                 showroom_units = float(sum(units for code, units in site_units.items() if category_for(code, site_mapping) == "Showroom"))
                 ignored_units = float(sum(units for code, units in site_units.items() if category_for(code, site_mapping) == "Ignored"))
@@ -2687,9 +2494,6 @@ elif selected_tab == "Inventory Analysis":
                     def pct_of_on_hand(units: float) -> str:
                         return f"{units / total_on_hand * 100:.0f}% of on hand" if total_on_hand > 0 else "n/a"
 
-                    # ----------------------------------------------------
-                    # Company-wide position: every site, every SKU, no filters
-                    # ----------------------------------------------------
                     totals = company_wide_totals(inventory_raw, mapping, site_mapping, cost_by_sku)
                     by_category = totals["by_category"]
                     units_breakdown = " · ".join(
@@ -2706,8 +2510,6 @@ elif selected_tab == "Inventory Analysis":
                     on_order_units = float(open_po.sum()) if not open_po.empty else 0.0
                     on_order_value = float((open_po * open_po.index.map(cost_by_sku)).sum(skipna=True)) if not open_po.empty else 0.0
 
-                    # Loans and transfers from the loan file; the inventory's Loan
-                    # sites are the fallback when there is no file.
                     loans = loan_lines.loc[loan_lines["Type"].eq("Loan")]
                     transfers = loan_lines.loc[loan_lines["Type"].eq("Transfer")]
                     if not loan_lines.empty:
@@ -2818,10 +2620,6 @@ elif selected_tab == "Inventory Analysis":
                             ],
                         )
 
-                    # Stock-health charts: the four dimensions, and the status mix
-                    # across the attribute chosen in "Group by" (Supplier when per SKU).
-                    # A fragment, so switching measure re-draws the charts without
-                    # re-running the rest of the tab.
                     chart_group = group_by if group_by != "SKU" else "Supplier"
                     stock_health_charts(filtered, chart_group)
 
@@ -2933,9 +2731,6 @@ elif selected_tab == "Backend Mapping":
         "save them to make them the default for this deployment."
     )
 
-    # ------------------------------------------------------------------
-    # 1. Site categories
-    # ------------------------------------------------------------------
     detected_mapping = resolve_inventory_mapping(inventory_raw) if not inventory_raw.empty else {}
     site_units = units_by_site(inventory_raw, detected_mapping) if detected_mapping else pd.Series(dtype=float)
     site_mapping = current_site_mapping()
@@ -3019,9 +2814,6 @@ elif selected_tab == "Backend Mapping":
             **FULL_WIDTH,
         )
 
-    # ------------------------------------------------------------------
-    # 2. SKU type rules (read-only reference, with counts from the export)
-    # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>SKU type rules</p>", unsafe_allow_html=True)
         st.caption("Products are classified from the stock-code pattern, first matching rule wins. Available as a filter and a grouping on the Inventory Analysis tab.")
@@ -3032,9 +2824,6 @@ elif selected_tab == "Backend Mapping":
             rules["SKUs in export"] = rules["SKU type"].map(counts).fillna(0).astype(int)
         st.dataframe(rules, hide_index=True, height=table_height(len(rules)), **FULL_WIDTH)
 
-    # ------------------------------------------------------------------
-    # 3. Inventory export columns
-    # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>Inventory export columns</p>", unsafe_allow_html=True)
         if inventory_raw.empty:
@@ -3068,9 +2857,6 @@ elif selected_tab == "Backend Mapping":
             with st.expander("Preview of the inventory export", expanded=False):
                 st.dataframe(inventory_raw.head(8), hide_index=True, **FULL_WIDTH)
 
-    # ------------------------------------------------------------------
-    # 4. Loan file columns
-    # ------------------------------------------------------------------
     loans_raw = prepared_data.get("Loans", pd.DataFrame()) if prepared_data is not None else pd.DataFrame()
     with st.container(border=True):
         st.markdown("<p class='card-title'>Loan file columns</p>", unsafe_allow_html=True)
@@ -3101,9 +2887,6 @@ elif selected_tab == "Backend Mapping":
             with st.expander("Preview of the loan file", expanded=False):
                 st.dataframe(loans_raw.head(8), hide_index=True, **FULL_WIDTH)
 
-    # ------------------------------------------------------------------
-    # 5. Average option cost source
-    # ------------------------------------------------------------------
     with st.container(border=True):
         st.markdown("<p class='card-title'>Average option cost</p>", unsafe_allow_html=True)
         st.caption(
