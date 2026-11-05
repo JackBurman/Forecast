@@ -194,6 +194,17 @@ def read_raw_data_folder(raw_data_dir: str | Path) -> tuple[dict[str, pd.DataFra
             ].copy()
             vendor_codes["Brand__r.Name"] = vendor_codes["Brand__r.Name"].fillna("").astype(str).str.strip()
 
+    # Use the vendor-code/brand sheet to make the options supplier field human-readable.
+    # The forecast tab takes its Supplier filter choices from this field via the sales join.
+    if not vendor_codes.empty and "Supplier" in options.columns:
+        vendor_brand_lookup = {
+            _key(code): str(brand).strip()
+            for code, brand in zip(vendor_codes["Options_ID__c"], vendor_codes["Brand__r.Name"])
+            if _key(code) and pd.notna(brand) and str(brand).strip()
+        }
+        mapped_brands = options["Supplier"].map(lambda value: vendor_brand_lookup.get(_key(value)))
+        options["Supplier"] = mapped_brands.where(mapped_brands.notna(), options["Supplier"])
+
     sales_frames = []
     for path in sales_files:
         frame = pd.read_excel(
