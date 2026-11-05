@@ -180,6 +180,20 @@ def read_raw_data_folder(raw_data_dir: str | Path) -> tuple[dict[str, pd.DataFra
         required_files[1], sheet_name=0, header=0, engine="calamine"
     )
 
+    vendor_file = raw_dir / "Vendor Code and Brand.xlsx"
+    vendor_codes = pd.DataFrame(columns=["Options_ID__c", "Brand__r.Name"])
+    if vendor_file.is_file():
+        vendor_frame = pd.read_excel(vendor_file, header=None)
+        if not vendor_frame.empty and vendor_frame.shape[1] >= 5:
+            vendor_codes = vendor_frame.iloc[:, [2, 4]].copy()
+            vendor_codes.columns = ["Options_ID__c", "Brand__r.Name"]
+            if vendor_codes.iloc[0].astype(str).str.contains("supplier|brand|code", case=False, na=False).any():
+                vendor_codes = vendor_codes.iloc[1:].reset_index(drop=True)
+            vendor_codes = vendor_codes.loc[
+                ~vendor_codes["Options_ID__c"].astype(str).str.strip().eq("")
+            ].copy()
+            vendor_codes["Brand__r.Name"] = vendor_codes["Brand__r.Name"].fillna("").astype(str).str.strip()
+
     sales_frames = []
     for path in sales_files:
         frame = pd.read_excel(
@@ -202,9 +216,13 @@ def read_raw_data_folder(raw_data_dir: str | Path) -> tuple[dict[str, pd.DataFra
         "Purchase Orders": purchase_orders,
         "Sales Raw": pd.concat(sales_frames, ignore_index=True, sort=False),
     }
+    if not vendor_codes.empty:
+        sources["Vendor Codes"] = vendor_codes
     source_names = [path.name for path in required_files] + [
         f"Sales Data/{path.name}" for path in sales_files
     ]
+    if vendor_file.is_file():
+        source_names.append(vendor_file.name)
     return sources, source_names
 
 
