@@ -66,6 +66,7 @@ csv_path = raw_data_path / "options_data.csv"
 inventory_folder_path = raw_data_path / "inventory"
 podash_folder_path = raw_data_path / "PODash"
 loan_folder_path = raw_data_path / "loan"
+targets_folder_path = raw_data_path / "targets"
 
 # Files forecast_engine.read_raw_data_folder expects to find. When the live
 # inventory / PO exports live in the sub-folders instead, zero-row
@@ -785,6 +786,18 @@ def load_raw_folder_data(
             notes.append(f"Could not read the loan file '{loan_file.name}': {e}")
     else:
         sheets["Loans"] = pd.DataFrame()
+
+    # Monthly targets (optional): newest file under Raw_data/targets.
+    targets_file = newest_file(targets_folder_path)
+    if targets_file is not None:
+        try:
+            sheets["Targets"] = read_tabular(targets_file)
+            source_names.append(str(targets_file.relative_to(raw_data_path)))
+        except Exception as e:
+            sheets["Targets"] = pd.DataFrame()
+            notes.append(f"Could not read the targets file '{targets_file.name}': {e}")
+    else:
+        sheets["Targets"] = pd.DataFrame()
     token = f"{len(manifest)}:{hash(manifest) & 0xFFFFFFFFFFFF:x}"
     return tag_frames(sheets, token), source_names, notes
 
@@ -1099,6 +1112,289 @@ def build_forecasts(
 
 def window_label(window: pd.PeriodIndex) -> str:
     return f"{window[0].strftime('%b %Y')} – {window[-1].strftime('%b %Y')}"
+
+
+# =============================================================================
+# Monthly targets
+#
+# Two sources, in order of preference:
+#   1. A targets file under Raw_data/targets: one row per month (and optionally
+#      per location / channel / supplier / classification / class / model / SKU)
+#      with a target per metric. The active filters pick the matching rows.
+#   2. The annual Sale Target in the sidebar, spread over the months by last
+#      year's seasonality and scaled to the selection's share of last year.
+# Either way, a filter the targets cannot express directly pro-rates the target
+# by the selection's share of the prior year's actuals, so the line always
+# follows the filters.
+# =============================================================================
+
+TARGET_DIMENSIONS: dict[str, list[str]] = {
+    "Location": ["location", "city", "site", "store", "showroom", "state"],
+    "Sales Channel": ["sales channel net", "sales channel", "channel"],
+    "Classification": ["classification", "fourth product group", "product group", "category"],
+    "Supplier": ["supplier brand", "supplier", "brand", "vendor"],
+    "Class": ["class"],
+    "Model": ["model"],
+    "SKU": ["sku key", "sku", "stock code", "product code", "item code"],
+}
+TARGET_METRIC_HEADERS: dict[str, list[str]] = {
+    "Sale": ["sale target", "sales target", "sale", "sales", "revenue", "target"],
+    "Qty": ["qty target", "units target", "qty", "units", "quantity"],
+    "Cost": ["cost target", "cost"],
+    "GP $": ["gp $", "gp$", "gp target", "gross profit", "gp dollars"],
+    "GP%": ["gp%", "gp %", "margin %", "margin"],
+}
+TARGET_PERIOD_HEADERS = ["period", "date", "month start", "month"]
+TARGET_YEAR_HEADERS = ["year", "calendar year", "cy"]
+TARGET_FY_HEADERS = ["financial year", "fiscal year", "fy"]
+TARGET_MONTH_HEADERS = ["month", "month name", "month no", "mth"]
+TARGET_WILDCARDS = {"", "all", "total", "*", "any", "nan", "none"}
+
+
+def _month_number(value) -> int | None:
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)) and 1 <= int(value) <= 12:
+        return int(value)
+    text = str(value).strip().lower()
+    if text.isdigit() and 1 <= int(text) <= 12:
+        return int(text)
+    for number, name in MONTH_NUMBER_TO_NAME.items():
+        if text == name.lower() or text == name.lower()[:3]:
+            return number
+    return None
+
+
+def _fy_end_year(value) -> float:
+    """FY27, FY2027, 2027, 2026/27, 2026-2027 → 2027 (the year the financial year ends)."""
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    span = re.search(r"(\d{2,4})\s*[/\-–]\s*(\d{2,4})", text)
+    if span:
+        end = int(span.group(2))
+        return float(end if end > 100 else 2000 + end)
+    digits = re.search(r"(\d{2,4})", text)
+    if not digits:
+        return np.nan
+    year = int(digits.group(1))
+    return float(year if year > 100 else 2000 + year)
+
+
+def parse_targets(targets: pd.DataFrame | None) -> tuple[pd.DataFrame, list[str]]:
+    """Normalise a targets file to long form: Period (month), Metric, <dimensions>, Target.
+
+    Accepts a date/period column, or Year (or FY) + Month columns; targets as
+    one numeric column per metric (wide) or a Metric + Target pair (long).
+    Dimension cells that are blank / ALL / TOTAL mean "every value".
+    Returns the long frame and the list of dimension columns the file carries.
+    """
+    empty = pd.DataFrame(columns=["Period", "Metric", "Target"])
+    if targets is None or targets.empty:
+        return empty, []
+    frame = targets.copy()
+    frame.columns = [str(col).strip() for col in frame.columns]
+    used: list[str] = []
+
+    # Period
+    period_col = detect_column(frame.columns, TARGET_PERIOD_HEADERS)
+    period = None
+    if period_col is not None and frame[period_col].map(_month_number).notna().mean() <= 0.5:
+        # A real date / period column (not a bare month number or name, which needs a year column).
+        parsed = parse_dates(frame[period_col])
+        if parsed.notna().mean() > 0.5:
+            period = parsed.dt.to_period("M")
+            used.append(period_col)
+    if period is None:
+        fy_col = detect_column(frame.columns, TARGET_FY_HEADERS)
+        year_col = detect_column(frame.columns, TARGET_YEAR_HEADERS, exclude=(fy_col or "",))
+        month_col = detect_column(frame.columns, TARGET_MONTH_HEADERS, exclude=tuple(c for c in (year_col, fy_col) if c))
+        if month_col is None or (year_col is None and fy_col is None):
+            return empty, []
+        months = frame[month_col].map(_month_number)
+        if year_col is not None:
+            years = pd.to_numeric(frame[year_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
+        else:
+            fy = frame[fy_col].map(_fy_end_year)
+            years = np.where(months <= 6, fy, fy - 1)
+        valid = months.notna() & pd.notna(years)
+        period = pd.Series(pd.NaT, index=frame.index, dtype="period[M]")
+        period.loc[valid] = pd.PeriodIndex(
+            [f"{int(y)}-{int(m):02d}" for y, m in zip(pd.Series(years)[valid], months[valid])], freq="M"
+        )
+        used += [c for c in (year_col, fy_col, month_col) if c]
+    frame["Period"] = period
+
+    # Dimensions
+    dimensions: list[str] = []
+    for name, candidates in TARGET_DIMENSIONS.items():
+        col = detect_column(frame.columns, candidates, exclude=tuple(used))
+        if col is not None:
+            frame[name] = frame[col].astype(str).str.strip().where(frame[col].notna(), "")
+            frame[name] = frame[name].where(~frame[name].str.lower().isin(TARGET_WILDCARDS), "")
+            dimensions.append(name)
+            used.append(col)
+
+    # Metrics: long (Metric + Target) or wide (one column per metric)
+    metric_col = detect_column(frame.columns, ["metric", "measure", "kpi"], exclude=tuple(used))
+    if metric_col is not None:
+        value_col = detect_column(frame.columns, ["target", "value", "amount", "goal", "budget"], exclude=tuple(used) + (metric_col,))
+        if value_col is None:
+            return empty, dimensions
+        aliases = {alias: metric for metric, heads in TARGET_METRIC_HEADERS.items() for alias in heads}
+        frame["Metric"] = frame[metric_col].astype(str).str.strip().str.lower().map(lambda v: aliases.get(v, v.title()))
+        frame["Target"] = to_number(frame[value_col])
+        long = frame[["Period", "Metric", *dimensions, "Target"]]
+    else:
+        pieces = []
+        for metric, heads in TARGET_METRIC_HEADERS.items():
+            col = detect_column(frame.columns, heads, exclude=tuple(used))
+            if col is None:
+                continue
+            used.append(col)
+            piece = frame[["Period", *dimensions]].copy()
+            piece["Metric"] = metric
+            piece["Target"] = to_number(frame[col])
+            pieces.append(piece)
+        if not pieces:
+            return empty, dimensions
+        long = pd.concat(pieces, ignore_index=True)[["Period", "Metric", *dimensions, "Target"]]
+    long = long.loc[long["Period"].notna() & long["Target"].notna()].reset_index(drop=True)
+    return long, dimensions
+
+
+def targets_from_file(
+    long: pd.DataFrame, dimensions: list[str], metric: str, filters: dict, periods: pd.PeriodIndex
+) -> tuple[pd.Series | None, list[str]]:
+    """Target per period for the metric under the filters the file can express.
+
+    For a dimension the file has: an active filter keeps rows equal to its
+    value; no filter keeps the file's company-level rows (blank / ALL) when it
+    has any, otherwise the sum of all rows. Returns (series, dimensions the
+    file could not express for the active filters).
+    """
+    rows = long.loc[long["Metric"].eq(metric)]
+    if rows.empty:
+        return None, []
+    for dim in dimensions:
+        value = filters.get(dim, "TOTAL")
+        column = rows[dim].str.lower()
+        if value != "TOTAL":
+            wanted = str(value).strip().lower()
+            exact = column.eq(wanted)
+            # Same semantics as the sales filter: exact value, else "contains" (typed partial values).
+            rows = rows.loc[exact] if exact.any() else rows.loc[column.str.contains(wanted, regex=False) & column.ne("")]
+        elif column.eq("").any():
+            rows = rows.loc[column.eq("")]
+    if rows.empty:
+        return None, []
+    grouped = rows.groupby("Period")["Target"]
+    series = (grouped.mean() if metric == "GP%" else grouped.sum()).reindex(periods)
+    unexpressed = [key for key, value in filters.items() if value != "TOTAL" and key not in dimensions]
+    return series, unexpressed
+
+
+def prior_year_total(sales: pd.DataFrame, metric: str, prior_periods: pd.PeriodIndex) -> float:
+    series = monthly_series(sales, metric)
+    if series.empty:
+        return 0.0
+    return float(series.reindex(prior_periods).fillna(0.0).sum())
+
+
+def derived_targets(
+    annual_target: float,
+    company_prior: pd.Series,
+    selection_share: float,
+    periods: pd.PeriodIndex,
+    prior_periods: pd.PeriodIndex,
+) -> pd.Series:
+    """Spread an annual target over the year's months by last year's seasonality, times the selection's share."""
+    prior = company_prior.reindex(prior_periods).fillna(0.0)
+    if prior.sum() > 0:
+        shares = (prior / prior.sum()).to_numpy()
+    else:
+        shares = np.full(len(periods), 1.0 / len(periods))
+    return pd.Series(annual_target * shares * selection_share, index=periods, dtype=float)
+
+
+@st.cache_data(show_spinner=False, max_entries=16, **BY_TOKEN)
+def company_monthly_series(sales: pd.DataFrame, metric: str, before: pd.Timestamp | None) -> pd.Series:
+    return monthly_series(sales, metric, before=before)
+
+
+def period_total(series: pd.Series, periods: pd.PeriodIndex) -> float:
+    return float(series.reindex(periods).fillna(0.0).sum()) if not series.empty else 0.0
+
+
+def resolve_monthly_targets(
+    targets_long: pd.DataFrame,
+    target_dimensions: list[str],
+    sales_data: pd.DataFrame,
+    company_series: pd.Series,
+    selection_series: pd.Series,
+    filters: dict,
+    metric: str,
+    periods: pd.PeriodIndex,
+    prior_periods: pd.PeriodIndex,
+    share_periods: pd.PeriodIndex,
+    annual_target: float,
+) -> tuple[pd.Series | None, str]:
+    """Monthly target for the selection over `periods`, plus a one-line description of how it was built.
+
+    Targets file first (rows matching the filters it can express, pro-rated by the
+    selection's share for the filters it cannot); otherwise the sidebar Sale Target
+    spread by the selection's prior-year months as a share of the company's prior year.
+    `company_series` / `selection_series` are the monthly series of all sales and of
+    the filtered selection for `metric` (complete months).
+    """
+    active = {key: value for key, value in filters.items() if value != "TOTAL"}
+    if not targets_long.empty:
+        series, unexpressed = targets_from_file(targets_long, target_dimensions, metric, filters, periods)
+        if series is not None and series.notna().any():
+            expressed = [key for key in active if key in target_dimensions]
+            basis = "Targets file"
+            if expressed:
+                basis += " · rows for " + ", ".join(f"{key} {active[key]}" for key in expressed)
+            if unexpressed:
+                if metric == "GP%":
+                    share = 1.0
+                elif expressed:
+                    base_filters = {key: (value if key in target_dimensions else "TOTAL") for key, value in filters.items()}
+                    base_sales, _ = engine_call("filter_sales", local_filter_sales, sales_data, base_filters)
+                    base_total = period_total(monthly_series(base_sales, metric), share_periods)
+                    share = min(max(period_total(selection_series, share_periods) / base_total, 0.0), 1.0) if base_total > 0 else None
+                else:
+                    base_total = period_total(company_series, share_periods)
+                    share = min(max(period_total(selection_series, share_periods) / base_total, 0.0), 1.0) if base_total > 0 else None
+                if share is None:
+                    return None, (
+                        "Targets file has no rows for " + ", ".join(unexpressed)
+                        + " and the selection has no sales in the last 12 months to pro-rate by."
+                    )
+                series = series * share
+                basis += f" · pro-rated to {share:.1%} for " + ", ".join(f"{key} {active[key]}" for key in unexpressed)
+            return series, basis
+        if series is None and active and any(key in target_dimensions for key in active):
+            return None, "Targets file has no rows matching " + ", ".join(f"{key} {active[key]}" for key in active if key in target_dimensions)
+        if metric != "Sale":
+            return None, f"Targets file carries no {metric} target."
+    if metric != "Sale":
+        return None, f"No target for {metric}: add a targets file under Raw_data/targets with a {metric} column."
+    if annual_target <= 0:
+        return None, "Sale Target is zero."
+    denominator = period_total(company_series, prior_periods)
+    if denominator <= 0:
+        return None, f"No sales in {prior_periods[0].strftime('%b %Y')}–{prior_periods[-1].strftime('%b %Y')} to spread the Sale Target over."
+    shares = (
+        selection_series.reindex(prior_periods).fillna(0.0).to_numpy() if not selection_series.empty else np.zeros(len(prior_periods))
+    ) / denominator
+    if shares.sum() <= 0:
+        return None, "Selection had no sales in the prior year to spread the Sale Target over."
+    series = pd.Series(annual_target * shares, index=periods, dtype=float)
+    basis = f"Sale Target ${annual_target:,.0f} spread by last year's months"
+    if active:
+        basis += f" · selection was {shares.sum():.1%} of last year"
+    return series, basis
 
 
 # =============================================================================
@@ -1979,6 +2275,14 @@ if selected_tab == "Forecast":
                 with st.expander("Target settings", expanded=False):
                     sale_target = st.number_input(
                         "Sale Target ($)", min_value=0.0, value=70000000.0, step=1000000.0,
+                        help="Company-wide annual Sale target for the year in view. Used when no targets file is loaded.",
+                    )
+                    show_target_line = st.toggle("Show target line", value=True, key="show_target_line")
+                    st.caption(
+                        "Monthly targets come from the newest file in Raw_data/targets when there is one "
+                        "(month plus optional location / channel / supplier / classification / class / model / SKU "
+                        "columns); otherwise the Sale Target is spread by last year's months. "
+                        "Either way the line follows the filters above."
                     )
 
             filters = {
@@ -2100,6 +2404,35 @@ if selected_tab == "Forecast":
                 else:
                     prior_fy_act = float(actual_series.reindex(prior_year_periods).sum())
 
+                # Monthly targets for the year in view (filter-aware)
+                targets_long, target_dimensions = parse_targets(sheets.get("Targets"))
+                share_periods = pd.period_range(end=last_complete, periods=SEASON, freq="M")
+                company_series = company_monthly_series(sales_data, metric, current_period.to_timestamp())
+                target_series, target_basis = resolve_monthly_targets(
+                    targets_long, target_dimensions, sales_data, company_series, actual_series, filters, metric,
+                    this_year_periods, prior_year_periods, share_periods, float(sale_target),
+                )
+                next_target_series = None
+                if not targets_long.empty:
+                    next_target_series, _ = resolve_monthly_targets(
+                        targets_long, target_dimensions, sales_data, company_series, actual_series, filters, metric,
+                        view_year_periods(view_this_year + 1, fiscal), this_year_periods, share_periods, 0.0,
+                    )
+                has_target = target_series is not None and target_series.notna().any()
+                if has_target:
+                    if metric == "GP%":
+                        ytd_target = float(target_series.reindex(ytd_periods).mean()) if ytd_periods else np.nan
+                        fy_target = float(target_series.mean())
+                    else:
+                        ytd_target = float(target_series.reindex(ytd_periods).fillna(0.0).sum()) if ytd_periods else 0.0
+                        fy_target = float(target_series.fillna(0.0).sum())
+                    ytd_target_diff = ytd_act - ytd_target if pd.notna(ytd_act) and pd.notna(ytd_target) else np.nan
+                    ytd_target_pct = (ytd_target_diff / ytd_target * 100) if pd.notna(ytd_target_diff) and ytd_target != 0 else np.nan
+                    fy_target_diff = fy_act_fc - fy_target if pd.notna(fy_act_fc) and pd.notna(fy_target) else np.nan
+                    fy_target_pct = (fy_target_diff / fy_target * 100) if pd.notna(fy_target_diff) and fy_target != 0 else np.nan
+                else:
+                    ytd_target = fy_target = ytd_target_diff = ytd_target_pct = fy_target_diff = fy_target_pct = np.nan
+
                 year_start_label = this_year_periods[0].strftime("%b %Y")
                 ytd_end_label = ytd_periods[-1].strftime("%b %Y") if ytd_periods else "n/a"
                 baseline_help = (
@@ -2165,7 +2498,19 @@ if selected_tab == "Forecast":
                             help="YTD Actuals + YTG Forecast vs full-year forecast baseline.",
                         ),
                         dict(label="Full Year Baseline Forecast", value=fmt_str(fy_fc), help=baseline_help),
-                    ],
+                    ]
+                    + (
+                        [
+                            dict(
+                                label="YTD Actual vs Target",
+                                value=fmt_str(ytd_target),
+                                delta=f"{ytd_target_diff:+,.0f} ({ytd_target_pct:+.1f}%)" if pd.notna(ytd_target_diff) else "n/a",
+                                help=f"Target for {year_start_label} to {ytd_end_label} for this selection · {target_basis}",
+                            )
+                        ]
+                        if has_target
+                        else []
+                    ),
                 )
 
                 profile_from = pd.Timestamp(f"{history_from_year - 1}-01-01") if fiscal else forecast_from
@@ -2226,14 +2571,43 @@ if selected_tab == "Forecast":
                         "Value": forecast_chart_data["Forecast"],
                     }
                 )
+                target_frames = []
+                if show_target_line:
+                    for year_number, series in ((view_this_year, target_series), (view_this_year + 1, next_target_series)):
+                        if series is None or not series.notna().any():
+                            continue
+                        clean = series.dropna()
+                        target_frames.append(
+                            pd.DataFrame(
+                                {
+                                    "Month": [MONTH_NUMBER_TO_NAME[p.month] for p in clean.index],
+                                    "Series": f"Target {view_label(year_number, fiscal)}",
+                                    "Line Type": "Target",
+                                    "Value": clean.to_numpy(),
+                                }
+                            )
+                        )
+                target_plot_data = (
+                    pd.concat(target_frames, ignore_index=True)
+                    if target_frames
+                    else pd.DataFrame(columns=["Month", "Series", "Line Type", "Value"])
+                )
                 chart_data = pd.concat(
-                    [actual_chart_data[["Month", "Series", "Line Type", "Value"]], forecast_plot_data],
+                    [
+                        frame
+                        for frame in (actual_chart_data[["Month", "Series", "Line Type", "Value"]], forecast_plot_data, target_plot_data)
+                        if not frame.empty
+                    ],
                     ignore_index=True,
                 )
                 forecast_series = sorted(forecast_plot_data["Series"].unique(), key=label_year_number)
+                target_series_labels = sorted(target_plot_data["Series"].unique(), key=label_year_number)
                 series_order = list(dict.fromkeys(year_labels + forecast_series))
                 palette = ["#0072b2", "#e69f00", "#009e73", "#d55e00", "#cc79a7", "#56b4e9", "#f0e442", "#000000"]
                 series_colors = [palette[index % len(palette)] for index in range(len(series_order))]
+                target_palette = ["#1f2937", "#6b7280"]
+                series_order += target_series_labels
+                series_colors += [target_palette[index % len(target_palette)] for index in range(len(target_series_labels))]
                 axis_format, value_format, y_title = chart_formats(metric)
 
                 legend_selection = alt.selection_point(
@@ -2275,7 +2649,7 @@ if selected_tab == "Forecast":
                         ),
                         strokeDash=alt.StrokeDash(
                             "Line Type:N",
-                            scale=alt.Scale(domain=["Actual", "Forecast"], range=[[1, 0], [7, 4]]),
+                            scale=alt.Scale(domain=["Actual", "Forecast", "Target"], range=[[1, 0], [7, 4], [2, 3]]),
                             legend=None,
                         ),
                         detail=alt.Detail("Series:N"),
@@ -2296,6 +2670,9 @@ if selected_tab == "Forecast":
                     for _, row in forecast_chart_data.iterrows()
                     if pd.notna(row["Forecast"])
                 }
+                target_lookup = {
+                    (row["Series"], row["Month"]): row["Value"] for _, row in target_plot_data.iterrows() if pd.notna(row["Value"])
+                }
                 profile_by_month = annual_profile.set_index("Month") if not annual_profile.empty else pd.DataFrame()
                 prefix, python_spec = ("$", value_format[1:]) if value_format.startswith("$") else ("", value_format)
                 hover_rows = []
@@ -2307,9 +2684,14 @@ if selected_tab == "Forecast":
                     for label in forecast_labels:
                         value = forecast_lookup.get((label.removeprefix("Forecast "), month))
                         row[label] = f"{prefix}{format(float(value), python_spec)}" if value is not None else ""
+                    for label in target_series_labels:
+                        value = target_lookup.get((label, month))
+                        row[label] = f"{prefix}{format(float(value), python_spec)}" if value is not None else ""
                     hover_rows.append(row)
                 hover_frame = pd.DataFrame(hover_rows)
-                hover_fields = [label for label in series_labels + forecast_labels if hover_frame[label].ne("").any()]
+                hover_fields = [
+                    label for label in series_labels + forecast_labels + target_series_labels if hover_frame[label].ne("").any()
+                ]
                 month_hover_selection = alt.selection_point(
                     name="hover_month", fields=["Month"], on="pointerover", clear="pointerout",
                 )
@@ -2331,9 +2713,15 @@ if selected_tab == "Forecast":
                     **FULL_WIDTH,
                 )
                 st.caption(
-                    f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · Solid lines: actual · Dashed lines: forecast · "
-                    "Click a legend entry to show or hide a series · Hover a month to compare every year."
+                    f"{'FY Jul–Jun' if fiscal else 'Calendar Jan–Dec'} · Solid lines: actual · Dashed lines: forecast"
+                    + (" · Dotted line: target" if target_series_labels else "")
+                    + " · Click a legend entry to show or hide a series · Hover a month to compare every year."
                 )
+                if show_target_line:
+                    if has_target:
+                        st.caption(f"🎯 Target {this_label} for this selection · {target_basis}")
+                    else:
+                        st.caption(f"🎯 No target line · {target_basis}")
 
                 with st.expander("📊 Monthly Data Table", expanded=True):
                     pivot_data = chart_data.pivot(index="Month", columns="Series", values="Value").reindex(month_sort_order)
@@ -2365,19 +2753,32 @@ if selected_tab == "Forecast":
                         key="download_monthly_forecast_table",
                     )
 
-                if metric == "Sale":
-                    target_80 = sale_target * 0.8
-                    target_diff = fy_act_fc - sale_target
-                    target_pct = (target_diff / sale_target) * 100 if sale_target > 0 else 0.0
+                if has_target and metric != "GP%":
+                    target_80 = fy_target * 0.8
                     target_80_diff = fy_act_fc - target_80
-                    target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else 0.0
+                    target_80_pct = (target_80_diff / target_80) * 100 if target_80 > 0 else np.nan
 
                     with st.expander(f"🎯 Target & performance comparison · {this_label}", expanded=False):
-                        t_col1, t_col2, t_col3, t_col4 = st.columns(4, gap="small")
-                        t_col1.metric("Full Year Outlook", fmt_str(fy_act_fc), delta=f"{target_diff:+,.0f} ({target_pct:+.1f}% vs Target)")
-                        t_col2.metric("100% Sale Target", f"${sale_target:,.0f}", delta=f"{target_pct:+.1f}% to Target")
-                        t_col3.metric("80% Sale Target", f"${target_80:,.0f}", delta=f"{target_80_pct:+.1f}% to 80% Target")
-                        t_col4.metric(f"{prior_label} Full Year Actuals", fmt_str(prior_fy_act))
+                        st.caption(f"Targets for this selection · {target_basis}")
+                        t_col1, t_col2, t_col3, t_col4, t_col5 = st.columns(5, gap="small")
+                        t_col1.metric(
+                            "Full Year Outlook", fmt_str(fy_act_fc),
+                            delta=f"{fy_target_diff:+,.0f} ({fy_target_pct:+.1f}% vs Target)" if pd.notna(fy_target_diff) else "n/a",
+                        )
+                        t_col2.metric(
+                            f"100% {metric} Target", fmt_str(fy_target),
+                            delta=f"{fy_target_pct:+.1f}% to Target" if pd.notna(fy_target_pct) else "n/a",
+                        )
+                        t_col3.metric(
+                            f"80% {metric} Target", fmt_str(target_80),
+                            delta=f"{target_80_pct:+.1f}% to 80% Target" if pd.notna(target_80_pct) else "n/a",
+                        )
+                        t_col4.metric(
+                            "YTD Actual vs Target", fmt_str(ytd_act),
+                            delta=f"{ytd_target_diff:+,.0f} ({ytd_target_pct:+.1f}%)" if pd.notna(ytd_target_diff) else "n/a",
+                            help=f"YTD target {fmt_str(ytd_target)} · {year_start_label} to {ytd_end_label}",
+                        )
+                        t_col5.metric(f"{prior_label} Full Year Actuals", fmt_str(prior_fy_act))
 
             for note in [n for n in engine_notes if n]:
                 st.warning(note)
@@ -3066,6 +3467,8 @@ elif selected_tab == "Document Status":
                 category = "PO Dash Folder"
             elif "loan" in path.parts:
                 category = "Loan Folder"
+            elif "targets" in path.parts:
+                category = "Targets Folder"
             elif "Sales Data" in path.parts:
                 category = "Sales Folder"
             elif path.name == "options_data.csv":
