@@ -149,6 +149,38 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     )
 
 
+def _vendor_code_key(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def load_vendor_brand_map(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        workbook = pd.ExcelFile(path)
+        frame = workbook.parse(header=None)
+    except Exception:
+        return {}
+    if frame.empty or frame.shape[1] < 5:
+        return {}
+    table = frame.iloc[:, [2, 4]].copy()
+    table.columns = ["Options_ID__c", "Brand__r.Name"]
+    if table.head(1).astype(str).stack().str.contains("supplier|brand|code", case=False, na=False).any():
+        table = table.iloc[1:].reset_index(drop=True)
+    lookup: dict[str, str] = {}
+    for code, brand in table.itertuples(index=False, name=None):
+        key = _vendor_code_key(code)
+        final = "" if pd.isna(brand) else str(brand).strip()
+        if key and final:
+            lookup[key] = final
+    return lookup
+
+
 def to_number(series: pd.Series) -> pd.Series:
     """Coerce '1,234.50', '$1,234', '45%', '(12)' or blanks to floats; junk becomes NaN."""
     text = (
@@ -619,6 +651,16 @@ def local_prepare_forecast_sheets(inputs: dict) -> dict:
     sales["SKU Key"] = sales["SKU"].astype("string")
     sales["Supplier Brand"] = sales.get("OptionsData.Supplier")
     sales["Model"] = sales.get("Description")
+    vendor_brand_map = load_vendor_brand_map(raw_data_path / "Vendor Code and Brand.xlsx")
+    if vendor_brand_map:
+        def map_vendor_brand(value):
+            if pd.isna(value):
+                return value
+            return vendor_brand_map.get(_vendor_code_key(value), value)
+        sales["Supplier Brand"] = sales["Supplier Brand"].map(map_vendor_brand) if "Supplier Brand" in sales.columns and "Supplier Brand" in sales.columns else sales.get("Supplier Brand")
+        if options is not None and not options.empty and "Supplier" in options.columns:
+            options = options.copy()
+            options["Supplier"] = options["Supplier"].map(map_vendor_brand)
     if options is not None and not options.empty:
         sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
         if sku_col:
@@ -697,6 +739,23 @@ def load_raw_folder_data(
             "No purchase order export was found under Raw_data/PODash (or Raw_data/PODashboard.xlsx), "
             "so open PO quantities are reported as zero."
         )
+
+    vendor_brand_map = load_vendor_brand_map(raw_data_path / "Vendor Code and Brand.xlsx")
+    if vendor_brand_map:
+        def map_vendor_brand(value):
+            if pd.isna(value):
+                return value
+            return vendor_brand_map.get(_vendor_code_key(value), value)
+        for frame_name in ("Options Data", "Current Inventory", "Purchase Orders"):
+            frame = sources.get(frame_name)
+            if frame is None or not isinstance(frame, pd.DataFrame):
+                continue
+            if "Supplier" in frame.columns:
+                frame["Supplier"] = frame["Supplier"].map(map_vendor_brand)
+        if "Sales Raw" in sources and isinstance(sources["Sales Raw"], pd.DataFrame):
+            sales_raw = sources["Sales Raw"]
+            if "Supplier" in sales_raw.columns:
+                sales_raw["Supplier"] = sales_raw["Supplier"].map(map_vendor_brand)
 
     formatted_sales = clean_sales_data(sources.pop("Sales Raw"), sources["Options Data"])
     forecast_inputs = {
@@ -2185,7 +2244,6 @@ if selected_tab == "Forecast":
                     clear=False,
                 )
 
-                # Reversing axis switch: X is Month, Y is Value
                 month_x_axis = alt.X(
                     "Month:N",
                     sort=month_sort_order,
@@ -2277,11 +2335,9 @@ if selected_tab == "Forecast":
                     "Click a legend entry to show or hide a series · Hover a month to compare every year."
                 )
 
-                # Data Table Underneath the Chart (with Transposed/Swapped Axes via .T)
                 with st.expander("📊 Monthly Data Table", expanded=True):
                     pivot_data = chart_data.pivot(index="Month", columns="Series", values="Value").reindex(month_sort_order)
                     pivot_data = pivot_data.reindex(columns=[col for col in series_order if col in pivot_data.columns])
-                    # Swap axes of the data table by transposing
                     pivot_data = pivot_data.T
 
                     column_config_table = {}
@@ -2291,7 +2347,7 @@ if selected_tab == "Forecast":
                         elif metric == "GP%":
                             column_config_table[col] = st.column_config.NumberColumn(col, format="%.1f%%")
                         else:
-                            column_config_table[col] = st.column_config.NumberColumn(col, format="%,.0f")
+                            column_config_table[col] = st.column_config.NumberColumn(col, format=",.0f")
 
                     st.dataframe(
                         pivot_data.reset_index().rename(columns={"index": "Series"}),
