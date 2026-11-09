@@ -67,6 +67,7 @@ inventory_folder_path = raw_data_path / "inventory"
 podash_folder_path = raw_data_path / "PODash"
 loan_folder_path = raw_data_path / "loan"
 targets_folder_path = raw_data_path / "targets"
+purchasing_folder_path = raw_data_path / "purchasing"
 
 # Files forecast_engine.read_raw_data_folder expects to find. When the live
 # inventory / PO exports live in the sub-folders instead, zero-row
@@ -96,6 +97,10 @@ INVENTORY_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "value": ["stock value", "inventory value", "on hand value", "total cost", "cost value", "extended cost", "value"],
     "cost": ["average option cost", "avg option cost", "average cost", "avg cost", "option cost", "unit cost", "cost per unit", "cost price", "standard cost", "cost"],
     "description": ["description", "item description", "product description", "product name", "name", "product"],
+    "allocated": ["qty alloc", "allocated", "qty allocated", "allocated qty", "alloc qty", "alloc"],
+    "damaged": ["qty d", "damaged", "qty damaged", "damaged qty"],
+    "floor": ["qty f", "floor stock", "qty floor", "floor qty", "floor"],
+    "loan": ["qty l", "qty loan", "loan qty", "on loan", "loan"],
 }
 INVENTORY_ROLE_LABELS = {
     "sku": "SKU column",
@@ -105,6 +110,10 @@ INVENTORY_ROLE_LABELS = {
     "value": "Stock value column",
     "cost": "Average option cost column",
     "description": "Description column",
+    "allocated": "Allocated quantity column (purchasing)",
+    "damaged": "Damaged quantity column (purchasing)",
+    "floor": "Floor stock quantity column (purchasing)",
+    "loan": "Loan quantity column (purchasing)",
 }
 
 
@@ -261,6 +270,10 @@ def tag_frames(sheets: dict, token: str) -> dict:
     for name, frame in sheets.items():
         if isinstance(frame, pd.DataFrame):
             frame.attrs["cache_token"] = f"{token}:{name}"
+        elif isinstance(frame, dict):
+            for sub_name, sub_frame in frame.items():
+                if isinstance(sub_frame, pd.DataFrame):
+                    sub_frame.attrs["cache_token"] = f"{token}:{name}:{sub_name}"
     return sheets
 
 
@@ -798,6 +811,18 @@ def load_raw_folder_data(
             notes.append(f"Could not read the targets file '{targets_file.name}': {e}")
     else:
         sheets["Targets"] = pd.DataFrame()
+
+    # Purchasing parameters (optional): workbooks under Raw_data/purchasing.
+    try:
+        sheets["Purchasing Files"] = read_purchasing_folder(purchasing_folder_path)
+    except Exception as e:
+        sheets["Purchasing Files"] = {}
+        notes.append(f"Could not read the purchasing parameter files: {e}")
+    if purchasing_folder_path.exists():
+        source_names.extend(
+            str(p.relative_to(raw_data_path)) for p in sorted(purchasing_folder_path.rglob("*"))
+            if p.is_file() and p.suffix.lower() in TABULAR_EXTENSIONS | {".xlsm"}
+        )
     token = f"{len(manifest)}:{hash(manifest) & 0xFFFFFFFFFFFF:x}"
     return tag_frames(sheets, token), source_names, notes
 
@@ -1482,7 +1507,7 @@ def category_for(code: str, site_mapping: dict) -> str:
 CATEGORY_ORDER = {category: index for index, category in enumerate(SITE_CATEGORIES)}
 DEFAULT_SITE_MAPPING = {
     "RSYD": "Showroom", "RMEL": "Showroom", "RPER": "Showroom", "RBRI": "Showroom", "ROXF": "Showroom",
-    "W1SY": "Warehouse", "W3ME": "Warehouse", "W4PE": "Warehouse", "W5BR": "Warehouse",
+    "W1SY": "Warehouse", "W3ME": "Warehouse", "W4PE": "Warehouse", "W5BR": "Warehouse", "W6AD": "Warehouse",
     "XITS": "Clearance", "XITM": "Clearance", "XITP": "Clearance", "XITB": "Clearance",
 }
 COST_SOURCES = {
@@ -2040,6 +2065,729 @@ def summarise_inventory(master: pd.DataFrame, group_column: str, window_months: 
 
 
 # =============================================================================
+# Purchasing — Forward Order Schedule (F.O.S.)
+#
+# Port of the Workings tab of Forward_Order_Schedule.xlsm. Per SKU:
+#   • sales history by city and channel for the last N complete months, each
+#     sales location allocated to a physical city (or split by %) and to
+#     Retail / Commercial via the Sales Locations parameters;
+#   • free stock = on hand − allocated − damaged/floor/loan at Warehouse sites;
+#   • open purchase orders by arrival month and city, linked (to a sales order)
+#     or free; a PO without an ETA is estimated as order date + lead time;
+#   • a rolling monthly projection of national and per-city free stock
+#     (opening + free arrivals + confirmed new order − average monthly sales,
+#     the current month pro-rated for the days left);
+#   • planned order qty = MOH required × average monthly sales − projected free
+#     stock in the month a new order would arrive (as-at date + lead time).
+# =============================================================================
+
+FOS_CITIES = ["SYD", "BNE", "MEL", "ADL", "PER"]
+FOS_CITY_NAMES = {"SYD": "Sydney", "BNE": "Brisbane", "MEL": "Melbourne", "ADL": "Adelaide", "PER": "Perth"}
+FOS_CITY_BY_NAME = {name.lower(): code for code, name in FOS_CITY_NAMES.items()} | {"oxford st": "SYD", "oxford street": "SYD", "paddington": "SYD"}
+FOS_CHANNELS = ["Retail", "Commercial"]
+FOS_LOCATION_COLUMNS = ["Code", "Location", "Channel", "City", "SYD", "BNE", "MEL", "ADL", "PER"]
+DEFAULT_SALES_LOCATIONS: list[dict] = [
+    {"Code": "1WAR", "Location": "Warranty Sales Orders", "Channel": "Retail", "City": "Split", "SYD": 0.35, "BNE": 0.20, "MEL": 0.25, "ADL": 0.0, "PER": 0.20},
+    {"Code": "ABRI", "Location": "A&D Brisbane", "Channel": "Retail", "City": "BNE"},
+    {"Code": "AMEL", "Location": "A&D Melbourne", "Channel": "Retail", "City": "MEL"},
+    {"Code": "APER", "Location": "A&D Perth", "Channel": "Retail", "City": "PER"},
+    {"Code": "ASYD", "Location": "A&D Sydney", "Channel": "Retail", "City": "SYD"},
+    {"Code": "CBRI", "Location": "Contract Brisbane", "Channel": "Commercial", "City": "BNE"},
+    {"Code": "CMEL", "Location": "Contract Melbourne", "Channel": "Commercial", "City": "MEL"},
+    {"Code": "CPER", "Location": "Contract Perth", "Channel": "Commercial", "City": "PER"},
+    {"Code": "CSYD", "Location": "Contract Sydney", "Channel": "Commercial", "City": "SYD"},
+    {"Code": "DEAL", "Location": "Sub Dealer Sales", "Channel": "Commercial", "City": "Split", "SYD": 0.60, "BNE": 0.02, "MEL": 0.33, "ADL": 0.0, "PER": 0.05},
+    {"Code": "EDIT", "Location": "Edition", "Channel": "Retail", "City": "SYD"},
+    {"Code": "ESTR", "Location": "ECOMMERCE SALES", "Channel": "Retail", "City": "Split", "SYD": 0.40, "BNE": 0.23, "MEL": 0.30, "ADL": 0.0, "PER": 0.07},
+    {"Code": "LEDS", "Location": "DESIGN STUDIO", "Channel": "Retail", "City": "Split", "SYD": 0.70, "BNE": 0.0, "MEL": 0.30, "ADL": 0.0, "PER": 0.0},
+    {"Code": "RBRI", "Location": "Retail Brisbane", "Channel": "Retail", "City": "BNE"},
+    {"Code": "RMEL", "Location": "Retail Melbourne", "Channel": "Retail", "City": "MEL"},
+    {"Code": "RPER", "Location": "Retail Perth", "Channel": "Retail", "City": "PER"},
+    {"Code": "RSYD", "Location": "Retail Sydney", "Channel": "Retail", "City": "SYD"},
+    {"Code": "ROXF", "Location": "Retail Oxford St", "Channel": "Retail", "City": "SYD"},
+    {"Code": "W1SY", "Location": "Living Edge Warehouse - Sydney", "Channel": "Retail", "City": "SYD"},
+    {"Code": "W3ME", "Location": "Pedemonts Melbourne", "Channel": "Retail", "City": "MEL"},
+    {"Code": "WARB", "Location": "Warranty Brisbane", "Channel": "Retail", "City": "BNE"},
+    {"Code": "WARM", "Location": "Warranty Melbourne", "Channel": "Retail", "City": "MEL"},
+    {"Code": "WARP", "Location": "Warranty Perth", "Channel": "Retail", "City": "PER"},
+    {"Code": "WARS", "Location": "Warranty Sydney", "Channel": "Retail", "City": "SYD"},
+    {"Code": "XITB", "Location": "Brisbane Clearance Sale", "Channel": "Retail", "City": "BNE"},
+    {"Code": "XITM", "Location": "Exit Product - Melbourne", "Channel": "Retail", "City": "MEL"},
+    {"Code": "XITP", "Location": "Perth Clearance Product", "Channel": "Retail", "City": "PER"},
+    {"Code": "XITS", "Location": "Exit Product - Sydney", "Channel": "Retail", "City": "SYD"},
+]
+DEFAULT_WAREHOUSE_CITIES = {"W1SY": "SYD", "W5BR": "BNE", "W3ME": "MEL", "W6AD": "ADL", "W4PE": "PER"}
+DEFAULT_PURCHASING_SETTINGS = {"moh_required": 2.0, "history_months": 5, "horizon_months": 11}
+FOS_PLANNING_HORIZON_MAX = 18
+
+OPTION_FIELD_CANDIDATES: dict[str, list[str]] = {
+    "lead_time": ["days supply", "lead time days", "lead time", "leadtime", "lead days"],
+    "rrp": ["retail ex gst sell", "rrp", "retail price", "sell price", "retail sell", "retail"],
+    "purchase_cost": ["purchase ex gst buy", "purchase cost", "purchase price", "buy price", "purchase"],
+    "store_cost": ["store ex gst buy", "store cost", "landed cost"],
+    "supplier_qty": ["supplier qty available", "supplier qty", "supplier stock", "supplier quantity"],
+    "supplier_qty_date": ["supplier qty updated date", "supplier qty updated", "supplier qty date"],
+    "discontinued": ["discontinued flag", "discontinued"],
+    "supplier_code": ["supplier code", "supp stock code"],
+}
+PO_FIELD_CANDIDATES: dict[str, list[str]] = {
+    "ordered": ["qty ordered", "ordered qty", "order qty", "quantity ordered", "ordered"] + OPEN_PO_HEADERS,
+    "received": ["received", "qty received", "received qty", "quantity received"],
+    "sales_order": ["sales order", "so number", "so no", "so #", "linked order", "customer order", "sales order number"],
+    "eta": ["eta date", "eta", "expected date", "expected arrival", "arrival date", "due date", "expected"],
+    "order_date": ["po order date", "order date", "po date", "ordered date", "date"],
+    "location": ["po location", "location", "site", "warehouse", "deliver to", "destination"],
+    "po_number": ["po order", "po number", "po no", "po #", "purchase order", "po"],
+    "supplier": ["supplier", "vendor", "brand"],
+    "unit_cost": ["unit $", "unit cost", "unit price", "cost"],
+}
+
+
+def normalise_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value if value is not None else "").replace(" ", " ").strip().lower())
+
+
+def sales_locations_frame(rows: list[dict] | None) -> pd.DataFrame:
+    frame = pd.DataFrame(rows if rows else DEFAULT_SALES_LOCATIONS)
+    for column in FOS_LOCATION_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = 0.0 if column in FOS_CITIES else ""
+    frame = frame[FOS_LOCATION_COLUMNS].copy()
+    for column in ("Code", "Location", "Channel", "City"):
+        frame[column] = frame[column].fillna("").astype(str).str.strip()
+    for city in FOS_CITIES:
+        frame[city] = pd.to_numeric(frame[city], errors="coerce").fillna(0.0)
+    return frame.reset_index(drop=True)
+
+
+def location_rules(frame: pd.DataFrame) -> dict[str, tuple[str, dict[str, float] | None]]:
+    """Normalised location name / code → (channel, city weights)."""
+    rules: dict[str, tuple[str, dict[str, float] | None]] = {}
+    for row in frame.itertuples(index=False):
+        channel = "Commercial" if str(row.Channel).strip().lower().startswith("com") else "Retail"
+        city = str(row.City).strip().upper()
+        if city in FOS_CITIES:
+            weights: dict[str, float] | None = {city: 1.0}
+        else:
+            raw = {c: float(getattr(row, c)) for c in FOS_CITIES}
+            total = sum(v for v in raw.values() if v > 0)
+            weights = {c: v / total for c, v in raw.items() if v > 0} if total > 0 else None
+        for key in (row.Code, row.Location):
+            if normalise_text(key):
+                rules[normalise_text(key)] = (channel, weights)
+    return rules
+
+
+def classify_sales_location(location: str, city_hint: str, rules: dict) -> tuple[str, dict[str, float] | None]:
+    key = normalise_text(location)
+    if key in rules:
+        return rules[key]
+    channel = "Commercial" if any(word in key for word in ("contract", "dealer", "commercial")) else "Retail"
+    hint = FOS_CITY_BY_NAME.get(normalise_text(city_hint))
+    if hint is None:
+        for name, code in FOS_CITY_BY_NAME.items():
+            if name in key:
+                hint = code
+                break
+    return channel, ({hint: 1.0} if hint else None)
+
+
+def warehouse_city(code: str, warehouse_cities: dict[str, str]) -> str:
+    code = normalise_site_code(code)
+    if code in warehouse_cities:
+        return warehouse_cities[code]
+    for suffix, city in (("SYD", "SYD"), ("SY", "SYD"), ("MEL", "MEL"), ("ME", "MEL"), ("PER", "PER"), ("PE", "PER"),
+                         ("BRI", "BNE"), ("BR", "BNE"), ("BNE", "BNE"), ("ADL", "ADL"), ("AD", "ADL")):
+        if code.endswith(suffix):
+            return city
+    return "OTH"
+
+
+def rules_signature(frame: pd.DataFrame) -> tuple:
+    return tuple(tuple(row) for row in frame.itertuples(index=False))
+
+
+@st.cache_data(show_spinner=False, max_entries=8, **BY_TOKEN)
+def fos_sales_history(sales: pd.DataFrame, start: str, end: str, rules_rows: tuple) -> pd.DataFrame:
+    """Unit sales per SKU × month × city × channel over the window, locations allocated per the rules."""
+    columns = ["SKU", "Period", "City", "Channel", "Qty"]
+    if sales.empty or "Date" not in sales.columns or "Qty" not in sales.columns:
+        return pd.DataFrame(columns=columns)
+    rules = location_rules(sales_locations_frame([dict(zip(FOS_LOCATION_COLUMNS, row)) for row in rules_rows]))
+    dated = sales.dropna(subset=["Date"])
+    period = dated["Date"].dt.to_period("M")
+    first, last = pd.Period(start, freq="M"), pd.Period(end, freq="M")
+    dated = dated.loc[(period >= first) & (period <= last)]
+    if dated.empty:
+        return pd.DataFrame(columns=columns)
+    key_column = "SKU Key" if "SKU Key" in dated.columns else "SKU"
+    frame = pd.DataFrame(
+        {
+            "SKU": map_unique(dated[key_column], sku_text),
+            "Period": dated["Date"].dt.to_period("M").astype(str),
+            "Location": dated["Location"].astype(object).fillna("").astype(str).to_numpy() if "Location" in dated.columns else "",
+            "CityHint": dated["City"].astype(object).fillna("").astype(str).to_numpy() if "City" in dated.columns else "",
+            "Qty": to_number(dated["Qty"]).fillna(0.0),
+        }
+    )
+    frame = frame.loc[frame["SKU"].ne("") & frame["Qty"].ne(0)]
+    grouped = frame.groupby(["SKU", "Period", "Location", "CityHint"], sort=False, observed=True)["Qty"].sum().reset_index()
+    pairs = grouped[["Location", "CityHint"]].drop_duplicates()
+    decisions = {
+        (loc, hint): classify_sales_location(loc, hint, rules) for loc, hint in zip(pairs["Location"], pairs["CityHint"])
+    }
+    known_mix: dict[str, float] = {}
+    for (loc, hint), (_channel, weights) in decisions.items():
+        if weights:
+            qty = float(grouped.loc[grouped["Location"].eq(loc) & grouped["CityHint"].eq(hint), "Qty"].sum())
+            for city, weight in weights.items():
+                known_mix[city] = known_mix.get(city, 0.0) + qty * weight
+    mix_total = sum(v for v in known_mix.values() if v > 0)
+    fallback = (
+        {city: v / mix_total for city, v in known_mix.items() if v > 0}
+        if mix_total > 0
+        else {city: 0.25 for city in ("SYD", "BNE", "MEL", "PER")}
+    )
+    pieces = []
+    for (loc, hint), (channel, weights) in decisions.items():
+        subset = grouped.loc[grouped["Location"].eq(loc) & grouped["CityHint"].eq(hint), ["SKU", "Period", "Qty"]]
+        for city, weight in (weights or fallback).items():
+            piece = subset.copy()
+            piece["City"] = city
+            piece["Channel"] = channel
+            piece["Qty"] = piece["Qty"] * weight
+            pieces.append(piece)
+    if not pieces:
+        return pd.DataFrame(columns=columns)
+    out = pd.concat(pieces, ignore_index=True)
+    return out.groupby(["SKU", "Period", "City", "Channel"], sort=False)["Qty"].sum().reset_index()[columns]
+
+
+def detect_option_fields(options: pd.DataFrame | None) -> dict[str, str | None]:
+    if options is None or options.empty:
+        return {role: None for role in OPTION_FIELD_CANDIDATES}
+    sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
+    used = [sku_col] if sku_col else []
+    found = {}
+    for role, candidates in OPTION_FIELD_CANDIDATES.items():
+        col = detect_column(options.columns, candidates, exclude=tuple(c for c in used if c))
+        found[role] = col
+        if col:
+            used.append(col)
+    return found
+
+
+@st.cache_data(show_spinner=False, max_entries=8, **BY_TOKEN)
+def fos_option_fields(options: pd.DataFrame | None) -> pd.DataFrame:
+    """SKU-level purchasing attributes from the options export (lead time, RRP, purchase cost, supplier stock)."""
+    columns = ["SKU", "Lead time (days)", "RRP", "Purchase cost", "Store cost", "Supplier qty", "Supplier qty updated", "Discontinued", "Supplier code"]
+    if options is None or options.empty:
+        return pd.DataFrame(columns=columns)
+    sku_col = detect_column(options.columns, ["stock code", "sku", "sku key"])
+    if sku_col is None:
+        return pd.DataFrame(columns=columns)
+    fields = detect_option_fields(options)
+    frame = pd.DataFrame({"SKU": map_unique(options[sku_col], sku_text)})
+    numeric = {"Lead time (days)": "lead_time", "RRP": "rrp", "Purchase cost": "purchase_cost", "Store cost": "store_cost", "Supplier qty": "supplier_qty"}
+    for label, role in numeric.items():
+        frame[label] = to_number(options[fields[role]]) if fields[role] else np.nan
+    frame["Supplier qty updated"] = parse_dates(options[fields["supplier_qty_date"]]) if fields["supplier_qty_date"] else pd.NaT
+    frame["Discontinued"] = (
+        options[fields["discontinued"]].astype(str).str.strip().str.upper().isin({"Y", "YES", "TRUE", "1"})
+        if fields["discontinued"] else False
+    )
+    frame["Supplier code"] = options[fields["supplier_code"]].astype(str).str.strip() if fields["supplier_code"] else ""
+    return frame.loc[frame["SKU"].ne("")].drop_duplicates(subset=["SKU"])[columns]
+
+
+def fos_stock_by_city(inventory: pd.DataFrame, mapping: dict, site_mapping: dict, warehouse_cities: dict[str, str]) -> pd.DataFrame:
+    """Warehouse stock per SKU × city: total, allocated, damaged/floor/loan, free (= total − allocated − D/F/L)."""
+    columns = ["SKU", "City", "Total", "Allocated", "DFL", "Free"]
+    if inventory is None or inventory.empty or not mapping.get("sku") or not mapping.get("on_hand"):
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame({"SKU": map_unique(inventory[mapping["sku"]], sku_text)})
+    frame["Total"] = to_number(inventory[mapping["on_hand"]]).fillna(0.0)
+    frame["Allocated"] = to_number(inventory[mapping["allocated"]]).fillna(0.0) if mapping.get("allocated") else np.nan
+    dfl = pd.Series(0.0, index=frame.index)
+    has_dfl = False
+    for role in ("damaged", "floor", "loan"):
+        if mapping.get(role):
+            dfl = dfl + to_number(inventory[mapping[role]]).fillna(0.0)
+            has_dfl = True
+    frame["DFL"] = dfl if has_dfl else np.nan
+    if mapping.get("allocated"):
+        frame["Free"] = frame["Total"] - frame["Allocated"] - frame["DFL"].fillna(0.0)
+    elif mapping.get("free"):
+        frame["Free"] = to_number(inventory[mapping["free"]]).fillna(0.0)
+        frame["Allocated"] = frame["Total"] - frame["Free"]
+    else:
+        frame["Free"] = frame["Total"]
+        frame["Allocated"] = 0.0
+    frame["Allocated"] = frame["Allocated"].fillna(0.0)
+    frame["DFL"] = frame["DFL"].fillna(0.0)
+    if mapping.get("site"):
+        sites = map_unique(inventory[mapping["site"]], normalise_site_code)
+        category = map_unique(sites, lambda code: category_for(code, site_mapping))
+        frame["City"] = map_unique(sites, lambda code: warehouse_city(code, warehouse_cities))
+        frame = frame.loc[category.eq("Warehouse")]
+    else:
+        frame["City"] = "SYD"
+    frame = frame.loc[frame["SKU"].ne("")]
+    return frame.groupby(["SKU", "City"], sort=False)[["Total", "Allocated", "DFL", "Free"]].sum().reset_index()[columns]
+
+
+def detect_po_fields(purchase_orders: pd.DataFrame | None) -> dict[str, str | None]:
+    if purchase_orders is None or purchase_orders.empty:
+        return {role: None for role in PO_FIELD_CANDIDATES} | {"sku": None}
+    sku_col = detect_column(purchase_orders.columns, ["stock code", "product code", "sku", "item code"])
+    used = [sku_col] if sku_col else []
+    found: dict[str, str | None] = {"sku": sku_col}
+    for role, candidates in PO_FIELD_CANDIDATES.items():
+        col = detect_column(purchase_orders.columns, candidates, exclude=tuple(c for c in used if c))
+        found[role] = col
+        if col:
+            used.append(col)
+    return found
+
+
+def fos_purchase_orders(
+    purchase_orders: pd.DataFrame | None,
+    lead_times: pd.Series,
+    asof: pd.Timestamp,
+    site_mapping: dict,
+    warehouse_cities: dict[str, str],
+    default_lead_days: float,
+) -> pd.DataFrame:
+    """Open PO lines with an arrival month and city. ETA blank → order date + lead time (flagged Estimated)."""
+    columns = ["SKU", "PO", "Supplier", "Open qty", "Linked", "Sales order", "Order date", "ETA", "Estimated", "Overdue",
+               "Site", "City", "Warehouse", "Period", "Unit cost"]
+    if purchase_orders is None or purchase_orders.empty:
+        return pd.DataFrame(columns=columns)
+    fields = detect_po_fields(purchase_orders)
+    if not fields["sku"] or not fields["ordered"]:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame({"SKU": map_unique(purchase_orders[fields["sku"]], sku_text)})
+    ordered = to_number(purchase_orders[fields["ordered"]]).fillna(0.0)
+    received = to_number(purchase_orders[fields["received"]]).fillna(0.0) if fields["received"] else 0.0
+    frame["Open qty"] = (ordered - received).clip(lower=0.0)
+    frame["PO"] = purchase_orders[fields["po_number"]].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip().to_numpy() if fields["po_number"] else ""
+    frame["Supplier"] = purchase_orders[fields["supplier"]].fillna("").astype(str).str.strip().to_numpy() if fields["supplier"] else ""
+    frame["Unit cost"] = to_number(purchase_orders[fields["unit_cost"]]) if fields["unit_cost"] else np.nan
+    so = purchase_orders[fields["sales_order"]] if fields["sales_order"] else pd.Series("", index=purchase_orders.index)
+    so_text = so.fillna("").astype(str).str.strip()
+    blank_so = so_text.str.lower().isin({"", "nan", "none", "0", "0.0", "/  /"}).fillna(True)
+    frame["Sales order"] = so_text.where(~blank_so, "").to_numpy()
+    frame["Linked"] = frame["Sales order"].ne("")
+    order_date = parse_dates(purchase_orders[fields["order_date"]]) if fields["order_date"] else pd.Series(pd.NaT, index=purchase_orders.index)
+    eta = parse_dates(purchase_orders[fields["eta"]]) if fields["eta"] else pd.Series(pd.NaT, index=purchase_orders.index)
+    frame["Order date"] = order_date.to_numpy()
+    lead = frame["SKU"].map(lead_times).astype(float)
+    lead = lead.where(lead.notna() & (lead > 0), default_lead_days)
+    estimated_eta = pd.to_datetime(order_date.to_numpy()) + pd.to_timedelta(lead.to_numpy(), unit="D")
+    frame["Estimated"] = eta.isna().to_numpy()
+    frame["ETA"] = np.where(frame["Estimated"], estimated_eta, eta.to_numpy())
+    frame["ETA"] = pd.to_datetime(frame["ETA"])
+    frame["ETA"] = frame["ETA"].fillna(asof)
+    frame["Overdue"] = frame["ETA"] < asof
+    frame["Period"] = frame["ETA"].clip(lower=asof).dt.to_period("M").astype(str)
+    if fields["location"]:
+        sites = map_unique(purchase_orders[fields["location"]], normalise_site_code)
+        frame["Site"] = sites.to_numpy()
+        frame["Warehouse"] = map_unique(sites, lambda code: category_for(code, site_mapping) == "Warehouse").to_numpy()
+        frame["City"] = map_unique(sites, lambda code: warehouse_city(code, warehouse_cities)).to_numpy()
+    else:
+        frame["Site"] = ""
+        frame["Warehouse"] = True
+        frame["City"] = "SYD"
+    frame = frame.loc[frame["SKU"].ne("") & (frame["Open qty"] > 0)]
+    return frame[columns].reset_index(drop=True)
+
+
+def fos_schedule(
+    skus: list[str],
+    history: pd.DataFrame,
+    history_periods: list[str],
+    stock: pd.DataFrame,
+    po_lines: pd.DataFrame,
+    lead_times: pd.Series,
+    confirmed: dict[str, float],
+    asof: pd.Timestamp,
+    moh_required: float,
+    horizon_months: int,
+) -> dict:
+    """Project free stock month by month and derive the planned order per SKU.
+
+    Returns {"summary": DataFrame, "national": DataFrame (SKU × month), "cities": {city: DataFrame},
+             "periods": [str], "arrivals": DataFrame (SKU × month free arrivals), "linked": DataFrame}.
+    """
+    index = pd.Index(skus, name="SKU")
+    cities = list(FOS_CITIES) + (["OTH"] if ("OTH" in set(stock["City"]) | set(po_lines["City"])) else [])
+    current = asof.to_period("M")
+    periods = [str(current + k) for k in range(horizon_months)]
+    n, m = len(index), horizon_months
+
+    # --- sales: monthly national totals (zeros for months without sales), averages
+    hist_pivot = (
+        history.pivot_table(index="SKU", columns="Period", values="Qty", aggfunc="sum", fill_value=0.0)
+        if not history.empty else pd.DataFrame(index=index)
+    ).reindex(index=index, columns=history_periods, fill_value=0.0).astype(float)
+    avg = hist_pivot.mean(axis=1) if history_periods else pd.Series(0.0, index=index)
+    by_channel = (
+        history.pivot_table(index="SKU", columns="Channel", values="Qty", aggfunc="sum", fill_value=0.0)
+        if not history.empty else pd.DataFrame(index=index)
+    ).reindex(index=index, columns=FOS_CHANNELS, fill_value=0.0).astype(float) / max(len(history_periods), 1)
+    city_avg = (
+        history.pivot_table(index="SKU", columns="City", values="Qty", aggfunc="sum", fill_value=0.0)
+        if not history.empty else pd.DataFrame(index=index)
+    ).reindex(index=index, columns=cities, fill_value=0.0).astype(float) / max(len(history_periods), 1)
+
+    # --- stock now
+    def stock_pivot(column: str) -> pd.DataFrame:
+        if stock.empty:
+            return pd.DataFrame(0.0, index=index, columns=cities)
+        return stock.pivot_table(index="SKU", columns="City", values=column, aggfunc="sum", fill_value=0.0).reindex(
+            index=index, columns=cities, fill_value=0.0
+        ).astype(float)
+
+    free_now = stock_pivot("Free")
+    total_now = stock_pivot("Total")
+    allocated_now = stock_pivot("Allocated")
+    dfl_now = stock_pivot("DFL")
+
+    # --- arrivals (warehouse POs only), by SKU × period (× city)
+    wh = po_lines.loc[po_lines["Warehouse"]] if not po_lines.empty else po_lines
+    beyond = wh.loc[~wh["Period"].isin(periods)] if not wh.empty else wh
+    wh_in = wh.loc[wh["Period"].isin(periods)] if not wh.empty else wh
+
+    def arrivals(subset: pd.DataFrame, by_city: bool) -> pd.DataFrame | dict:
+        if by_city:
+            out = {}
+            for city in cities:
+                part = subset.loc[subset["City"].eq(city)]
+                out[city] = (
+                    part.pivot_table(index="SKU", columns="Period", values="Open qty", aggfunc="sum", fill_value=0.0)
+                    if not part.empty else pd.DataFrame(index=index)
+                ).reindex(index=index, columns=periods, fill_value=0.0).astype(float)
+            return out
+        return (
+            subset.pivot_table(index="SKU", columns="Period", values="Open qty", aggfunc="sum", fill_value=0.0)
+            if not subset.empty else pd.DataFrame(index=index)
+        ).reindex(index=index, columns=periods, fill_value=0.0).astype(float)
+
+    free_arrivals = arrivals(wh_in.loc[~wh_in["Linked"]] if not wh_in.empty else wh_in, by_city=False)
+    linked_arrivals = arrivals(wh_in.loc[wh_in["Linked"]] if not wh_in.empty else wh_in, by_city=False)
+    free_arrivals_city = arrivals(wh_in.loc[~wh_in["Linked"]] if not wh_in.empty else wh_in, by_city=True)
+
+    # --- new (confirmed) orders land in the month of as-at + lead time
+    lead = pd.Series(index.map(lambda s: lead_times.get(s, np.nan)), index=index, dtype=float).fillna(0.0).clip(lower=0.0)
+    arrival_date = pd.Series([asof + pd.Timedelta(days=int(round(d))) for d in lead], index=index)
+    arrival_index = pd.Series([min((date.to_period("M") - current).n, m - 1) for date in arrival_date], index=index).clip(lower=0)
+    confirmed_qty = pd.Series(index.map(lambda s: float(confirmed.get(s, 0.0) or 0.0)), index=index, dtype=float)
+    new_orders = pd.DataFrame(0.0, index=index, columns=periods)
+    for sku, k, qty in zip(index, arrival_index, confirmed_qty):
+        if qty:
+            new_orders.loc[sku, periods[int(k)]] += qty
+
+    # --- projection
+    prorata = (asof.days_in_month - asof.day + 1) / asof.days_in_month
+    nat = np.zeros((n, m))
+    nat_no_new = np.zeros((n, m))
+    avg_values = avg.to_numpy()
+    opening_nat = free_now.sum(axis=1).to_numpy()
+    for k in range(m):
+        usage = avg_values * (prorata if k == 0 else 1.0)
+        prev = opening_nat if k == 0 else nat[:, k - 1]
+        prev_no_new = opening_nat if k == 0 else nat_no_new[:, k - 1]
+        nat[:, k] = prev + free_arrivals.iloc[:, k].to_numpy() + new_orders.iloc[:, k].to_numpy() - usage
+        nat_no_new[:, k] = prev_no_new + free_arrivals.iloc[:, k].to_numpy() - usage
+    national = pd.DataFrame(nat, index=index, columns=periods)
+    city_frames: dict[str, pd.DataFrame] = {}
+    for city in cities:
+        c = np.zeros((n, m))
+        usage_city = city_avg[city].to_numpy()
+        for k in range(m):
+            prev = free_now[city].to_numpy() if k == 0 else c[:, k - 1]
+            c[:, k] = prev + free_arrivals_city[city].iloc[:, k].to_numpy() - usage_city * (prorata if k == 0 else 1.0)
+        city_frames[city] = pd.DataFrame(c, index=index, columns=periods)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cover = np.where(avg_values[:, None] > 0, national.to_numpy() / avg_values[:, None], np.nan)
+    months_of_cover = pd.DataFrame(cover, index=index, columns=periods)
+
+    # --- planned order: bring free stock in the arrival month up to MOH × average monthly sales
+    at_arrival = np.array([nat[i, int(k)] for i, k in enumerate(arrival_index)])
+    planned_raw = moh_required * avg_values - at_arrival
+    planned = np.where((avg_values > 0) & (planned_raw > 0), np.ceil(planned_raw - 1e-9), 0.0)
+    first_negative = []
+    for i in range(n):
+        negatives = np.where(nat_no_new[i] < 0)[0]
+        first_negative.append(periods[int(negatives[0])] if len(negatives) else "")
+
+    summary = pd.DataFrame(index=index)
+    summary["Avg monthly sales"] = avg
+    summary["Retail avg"] = by_channel["Retail"]
+    summary["Commercial avg"] = by_channel["Commercial"]
+    for period in history_periods:
+        summary[f"Sales {pd.Period(period).strftime('%b %y')}"] = hist_pivot[period]
+    summary["Total SOH"] = total_now.sum(axis=1)
+    summary["Allocated SOH"] = allocated_now.sum(axis=1)
+    summary["Damaged/floor/loan"] = dfl_now.sum(axis=1)
+    summary["Free SOH"] = free_now.sum(axis=1)
+    for city in cities:
+        summary[f"Free {city}"] = free_now[city]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        summary["Months of cover now"] = np.where(avg_values > 0, summary["Free SOH"].to_numpy() / avg_values, np.nan)
+    summary["Open PO free"] = free_arrivals.sum(axis=1) + (
+        beyond.loc[~beyond["Linked"]].groupby("SKU")["Open qty"].sum().reindex(index).fillna(0.0) if not beyond.empty else 0.0
+    )
+    summary["Open PO linked"] = linked_arrivals.sum(axis=1) + (
+        beyond.loc[beyond["Linked"]].groupby("SKU")["Open qty"].sum().reindex(index).fillna(0.0) if not beyond.empty else 0.0
+    )
+    summary["Open PO beyond horizon"] = beyond.groupby("SKU")["Open qty"].sum().reindex(index).fillna(0.0) if not beyond.empty else 0.0
+    summary["Lead time (days)"] = lead
+    summary["Arrival date"] = arrival_date.dt.normalize()
+    summary["Arrival month"] = [periods[int(k)] for k in arrival_index]
+    summary["Free SOH at arrival"] = at_arrival
+    summary["Planned order qty"] = planned
+    summary["Confirmed order qty"] = confirmed_qty
+    summary["Stock-out month"] = first_negative
+    return {
+        "summary": summary.reset_index(),
+        "national": national,
+        "cover": months_of_cover,
+        "cities": city_frames,
+        "periods": periods,
+        "free_arrivals": free_arrivals,
+        "linked_arrivals": linked_arrivals,
+        "new_orders": new_orders,
+        "prorata": prorata,
+    }
+
+
+def read_purchasing_folder(folder: Path) -> dict[str, pd.DataFrame]:
+    """Optional parameter workbooks under Raw_data/purchasing (sheet names decide the role)."""
+    roles = {
+        "Sales Locations": ["sales locations", "sales location", "locations", "parameters"],
+        "Warehouses": ["warehouses", "warehouse cities", "sites"],
+        "Product Groups": ["product groups", "product group"],
+        "WEB Category": ["web category", "web categories", "categories"],
+        "Confirmed Orders": ["confirmed orders", "confirmed", "orders"],
+    }
+    found: dict[str, pd.DataFrame] = {}
+    if not folder.exists():
+        return found
+    files = sorted(
+        (p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in TABULAR_EXTENSIONS | {".xlsm"}),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for path in files:
+        if path.suffix.lower() == ".csv":
+            stem = normalise_text(path.stem)
+            for role, names in roles.items():
+                if any(name in stem for name in names):
+                    try:
+                        found[role] = read_tabular(path)
+                    except Exception:
+                        pass
+            continue
+        try:
+            book = pd.ExcelFile(path)
+        except Exception:
+            continue
+        for sheet in book.sheet_names:
+            key = normalise_text(sheet)
+            for role, names in roles.items():
+                if any(name == key or name in key for name in names):
+                    try:
+                        frame = book.parse(sheet, header=None)
+                    except Exception:
+                        continue
+                    header_row = detect_header_row(frame.head(20))
+                    if key == "parameters":
+                        # the workbook's Parameters tab: the header is the row holding "Sales Location"
+                        hits = [i for i in range(min(len(frame), 20)) if any(normalise_text(v) == "sales location" for v in frame.iloc[i])]
+                        header_row = hits[0] if hits else header_row
+                    frame.columns = [str(c).strip() for c in frame.iloc[header_row]]
+                    frame = frame.iloc[header_row + 1 :].dropna(how="all").reset_index(drop=True)
+                    if role == "Sales Locations" and key == "parameters":
+                        frame = parameters_sheet_to_locations(frame)
+                    found[role] = frame
+    return found
+
+
+def parameters_sheet_to_locations(frame: pd.DataFrame) -> pd.DataFrame:
+    """The workbook's Parameters tab (Sales Location / Physical location / SYD..PER columns) → Sales Locations table."""
+    headers = [normalise_text(c) for c in frame.columns]
+    if "sales location" not in headers:
+        return pd.DataFrame(columns=FOS_LOCATION_COLUMNS)
+    code_pos = headers.index("sales location")
+    category_pos = code_pos - 1 if code_pos >= 1 else None
+    name_pos = code_pos + 1 if code_pos + 1 < len(headers) else None
+    physical_pos = headers.index("physical location") if "physical location" in headers else None
+    share_pos = {city: headers.index(city.lower()) for city in FOS_CITIES if city.lower() in headers}
+
+    def cell(row, pos):
+        if pos is None:
+            return None
+        value = row.iloc[pos]
+        return None if pd.isna(value) or str(value).strip() in ("", "None", "nan") else value
+
+    rows = []
+    for _, row in frame.iterrows():
+        code = cell(row, code_pos)
+        if code is None:
+            continue
+        category = str(cell(row, category_pos) or "Retail")
+        physical = str(cell(row, physical_pos) or "").strip().upper()
+        record = {
+            "Code": str(code).strip(),
+            "Location": str(cell(row, name_pos) or code).strip(),
+            "Channel": "Commercial" if category.strip().lower().startswith("com") else "Retail",
+            "City": physical if physical in FOS_CITIES else "Split",
+        }
+        for city in FOS_CITIES:
+            value = cell(row, share_pos.get(city))
+            try:
+                record[city] = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                record[city] = 0.0
+        rows.append(record)
+    return pd.DataFrame(rows, columns=FOS_LOCATION_COLUMNS)
+
+
+def warehouses_from_frame(frame: pd.DataFrame | None) -> dict[str, str]:
+    if frame is None or frame.empty:
+        return {}
+    site_col = detect_column(frame.columns, ["site", "location", "warehouse", "code"])
+    city_col = detect_column(frame.columns, ["city", "physical location", "state"], exclude=(site_col or "",))
+    if not site_col or not city_col:
+        return {}
+    out = {}
+    for site, city in zip(frame[site_col], frame[city_col]):
+        code = normalise_site_code(site)
+        value = str(city).strip() if pd.notna(city) else ""
+        resolved = value.upper() if value.upper() in FOS_CITIES else FOS_CITY_BY_NAME.get(value.lower(), "")
+        if code and resolved:
+            out[code] = resolved
+    return out
+
+
+def lookup_frame(frame: pd.DataFrame | None, key_candidates: list[str], value_candidates: list[str]) -> pd.Series:
+    if frame is None or frame.empty:
+        return pd.Series(dtype=object)
+    key_col = detect_column(frame.columns, key_candidates)
+    value_col = detect_column(frame.columns, value_candidates, exclude=(key_col or "",))
+    if not key_col or not value_col:
+        return pd.Series(dtype=object)
+    keys = frame[key_col].map(sku_text)
+    values = frame[value_col].astype(str).str.strip()
+    series = pd.Series(values.to_numpy(), index=keys.to_numpy())
+    series = series.loc[series.index.astype(str) != ""]
+    return series[~series.index.duplicated(keep="first")]
+
+
+def confirmed_orders_from_frame(frame: pd.DataFrame | None) -> dict[str, float]:
+    if frame is None or frame.empty:
+        return {}
+    sku_col = detect_column(frame.columns, SKU_HEADERS)
+    qty_col = detect_column(frame.columns, ["confirmed qty", "confirmed order qty", "confirmed", "qty", "quantity"], exclude=(sku_col or "",))
+    if not sku_col or not qty_col:
+        return {}
+    out = {}
+    for sku, qty in zip(frame[sku_col].map(sku_text), to_number(frame[qty_col])):
+        if sku and pd.notna(qty) and qty > 0:
+            out[sku] = float(qty)
+    return out
+
+
+def purchasing_state() -> dict:
+    """Session-held purchasing parameters (sales locations, warehouse cities, settings), seeded from the mapping file."""
+    init_backend_state()
+    if "purchasing_locations" not in st.session_state:
+        saved = load_backend_mapping_file().get("purchasing", {})
+        st.session_state["purchasing_locations"] = saved.get("sales_locations") or [dict(r) for r in DEFAULT_SALES_LOCATIONS]
+        st.session_state["purchasing_warehouses"] = {
+            normalise_site_code(k): v for k, v in (saved.get("warehouse_cities") or DEFAULT_WAREHOUSE_CITIES).items() if v in FOS_CITIES
+        }
+        settings = dict(DEFAULT_PURCHASING_SETTINGS)
+        settings.update({k: v for k, v in (saved.get("settings") or {}).items() if k in settings})
+        st.session_state["purchasing_settings"] = settings
+        st.session_state["purchasing_confirmed"] = {}
+        st.session_state["purchasing_editor_version"] = 0
+        st.session_state["purchasing_file_defaults_applied"] = False
+    return {
+        "locations": st.session_state["purchasing_locations"],
+        "warehouses": st.session_state["purchasing_warehouses"],
+        "settings": st.session_state["purchasing_settings"],
+    }
+
+
+def apply_purchasing_files(files: dict[str, pd.DataFrame]) -> None:
+    """Parameter workbooks under Raw_data/purchasing seed the session once (the file wins over built-in defaults)."""
+    if st.session_state.get("purchasing_file_defaults_applied"):
+        return
+    st.session_state["purchasing_file_defaults_applied"] = True
+    saved = load_backend_mapping_file().get("purchasing", {})
+    if "Sales Locations" in files and not saved.get("sales_locations"):
+        frame = files["Sales Locations"]
+        if set(FOS_LOCATION_COLUMNS[:4]).issubset(set(frame.columns)):
+            st.session_state["purchasing_locations"] = sales_locations_frame(frame.to_dict("records")).to_dict("records")
+    if "Warehouses" in files and not saved.get("warehouse_cities"):
+        cities = warehouses_from_frame(files["Warehouses"])
+        if cities:
+            st.session_state["purchasing_warehouses"] = cities
+    if "Confirmed Orders" in files and not st.session_state.get("purchasing_confirmed"):
+        st.session_state["purchasing_confirmed"] = confirmed_orders_from_frame(files["Confirmed Orders"])
+
+
+def purchasing_payload() -> dict:
+    return {
+        "sales_locations": st.session_state.get("purchasing_locations", []),
+        "warehouse_cities": st.session_state.get("purchasing_warehouses", {}),
+        "settings": st.session_state.get("purchasing_settings", {}),
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=4, **BY_TOKEN)
+def sku_descriptions(sales: pd.DataFrame) -> pd.Series:
+    """Latest description seen in the sales lines, per SKU (the cleaned sales are sorted newest first)."""
+    if sales.empty or "Description" not in sales.columns:
+        return pd.Series(dtype=object)
+    key_column = "SKU Key" if "SKU Key" in sales.columns else "SKU"
+    keys = map_unique(sales[key_column], sku_text)
+    described = sales["Description"].astype(str).str.strip()
+    frame = pd.DataFrame({"SKU": keys, "Description": described}).loc[lambda f: f["SKU"].ne("") & f["Description"].ne("")]
+    return frame.groupby("SKU", sort=False)["Description"].first()
+
+
+def pinned_text_column():
+    try:
+        return st.column_config.TextColumn(pinned=True)
+    except TypeError:
+        return st.column_config.TextColumn()
+
+
+def fos_history_table(history: pd.DataFrame, sku: str, periods: list[str]) -> pd.DataFrame:
+    """The workbook's sales block for one SKU: month rows × city/channel columns with Nat and Total."""
+    part = history.loc[history["SKU"].eq(sku)]
+    columns = []
+    for city in FOS_CITIES:
+        for channel in FOS_CHANNELS:
+            columns.append(f"{city} {channel}")
+    table = pd.DataFrame(0.0, index=periods, columns=columns)
+    for row in part.itertuples(index=False):
+        column = f"{row.City} {row.Channel}"
+        if column in table.columns and row.Period in table.index:
+            table.loc[row.Period, column] += row.Qty
+    table["Nat Retail"] = table[[f"{c} Retail" for c in FOS_CITIES]].sum(axis=1)
+    table["Nat Commercial"] = table[[f"{c} Commercial" for c in FOS_CITIES]].sum(axis=1)
+    table["TOTAL"] = table["Nat Retail"] + table["Nat Commercial"]
+    table.index = [pd.Period(p).strftime("%b %Y") for p in table.index]
+    table.index.name = "Month"
+    return table
+
+
+# =============================================================================
 # Layout helpers
 # =============================================================================
 
@@ -2224,7 +2972,7 @@ def filter_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 selected_tab = st.radio(
     "View",
-    ["Forecast", "Inventory Analysis", "Backend Mapping", "Options Data", "Formatted Data", "Document Status"],
+    ["Forecast", "Inventory Analysis", "Purchasing", "Backend Mapping", "Options Data", "Formatted Data", "Document Status"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -3184,6 +3932,436 @@ elif selected_tab == "Inventory Analysis":
             st.error(f"Something went wrong while rendering inventory analysis: {e}")
 
 # =============================================================================
+# Purchasing tab — Forward Order Schedule
+# =============================================================================
+elif selected_tab == "Purchasing":
+    prepared_data, source_names = load_prepared_data()
+
+    if prepared_data is None:
+        st.info("Add the inventory, PO dashboard and sales exports under Raw_data to build the forward order schedule.")
+    else:
+        try:
+            sheets = prepared_data
+            sales_data = sheets["Sales Data"]
+            inventory_raw = sheets["Current Inventory"]
+            options_raw = sheets.get("OptionsData")
+            purchase_orders_raw = sheets.get("Purchase Orders")
+            purchasing_files = sheets.get("Purchasing Files", {}) or {}
+
+            state = purchasing_state()
+            apply_purchasing_files(purchasing_files)
+            settings = st.session_state["purchasing_settings"]
+            locations_frame = sales_locations_frame(st.session_state["purchasing_locations"])
+            warehouse_cities = dict(st.session_state["purchasing_warehouses"])
+
+            attributes = option_attributes(options_raw)
+            option_fields = fos_option_fields(options_raw)
+            mapping = resolve_inventory_mapping(inventory_raw)
+            site_mapping = current_site_mapping()
+
+            today = pd.Timestamp.today().normalize()
+            report_date_col = detect_column(inventory_raw.columns, ["report date", "as at date", "as at", "snapshot date", "extract date"]) if not inventory_raw.empty else None
+            default_asof = today
+            if report_date_col:
+                parsed = parse_dates(inventory_raw[report_date_col]).dropna()
+                if not parsed.empty and parsed.max() <= today + pd.Timedelta(days=1):
+                    default_asof = parsed.max().normalize()
+
+            with st.sidebar:
+                st.header("Purchasing settings")
+                asof_date = st.date_input(
+                    "As-at date (reports refreshed)", value=default_asof.date(), key="purchasing_asof",
+                    help="Date the inventory and PO exports were refreshed. Sales in the current month are pro-rated from this day; "
+                         "new orders arrive at this date plus the SKU's lead time.",
+                )
+                moh_required = float(st.number_input(
+                    "MOH required (months of holding)", min_value=0.0, max_value=24.0, value=float(settings["moh_required"]), step=0.5,
+                    key="purchasing_moh", help="Target months of average sales to hold when a new order arrives (the workbook used 2).",
+                ))
+                history_months = int(st.number_input(
+                    "Months of sales history", min_value=1, max_value=24, value=int(settings["history_months"]), step=1,
+                    key="purchasing_history", help="Complete months before the as-at month averaged for monthly sales (the workbook used 5).",
+                ))
+                horizon_months = int(st.number_input(
+                    "Months to project", min_value=3, max_value=FOS_PLANNING_HORIZON_MAX, value=int(settings["horizon_months"]), step=1,
+                    key="purchasing_horizon", help="Rolling calendar length, starting with the as-at month (the workbook used 11).",
+                ))
+                st.session_state["purchasing_settings"] = {"moh_required": moh_required, "history_months": history_months, "horizon_months": horizon_months}
+
+                st.markdown("**Scope**")
+                program_values = column_choices(attributes, "Product group")
+                default_program = ["CORE"] if "CORE" in program_values else []
+                scope_filters: dict[str, list[str]] = {}
+                scope_filters["Product group"] = st.multiselect(
+                    "Stock program / product group", program_values, default=default_program, key="purchasing_filter_program",
+                    help="Fourth Product Group from the options data. CORE is the stocked range the workbook planned.",
+                )
+                scope_filters["Supplier"] = st.multiselect("Supplier", column_choices(attributes, "Supplier"), default=[], key="purchasing_filter_supplier")
+                scope_filters["Class"] = st.multiselect("Group (class code)", column_choices(attributes, "Class"), default=[], key="purchasing_filter_class")
+                scope_filters["SKU type"] = st.multiselect("SKU type", SKU_TYPES, default=[], key="purchasing_filter_skutype")
+                purchasing_search = st.text_input("SKU or description contains", key="purchasing_filter_text").strip()
+                only_orders = st.toggle("Only SKUs needing an order", value=False, key="purchasing_only_orders")
+                include_discontinued = st.toggle("Include discontinued", value=False, key="purchasing_include_discontinued")
+                st.caption("Sales-location and warehouse mappings are on the **Backend Mapping** tab.")
+
+            asof = pd.Timestamp(asof_date)
+            current_period = asof.to_period("M")
+            history_periods = [str(current_period - k) for k in range(history_months, 0, -1)]
+
+            if not mapping["sku"] or not mapping["on_hand"]:
+                st.warning("The SKU and on-hand quantity columns of the inventory export could not be identified. Choose them on the **Backend Mapping** tab.")
+            else:
+                history = fos_sales_history(sales_data, history_periods[0], history_periods[-1], rules_signature(locations_frame))
+                stock = fos_stock_by_city(inventory_raw, mapping, site_mapping, warehouse_cities)
+                lead_times = option_fields.set_index("SKU")["Lead time (days)"] if not option_fields.empty else pd.Series(dtype=float)
+                positive_leads = lead_times[lead_times > 0]
+                default_lead = float(positive_leads.median()) if not positive_leads.empty else 60.0
+                po_lines = fos_purchase_orders(purchase_orders_raw, lead_times, asof, site_mapping, warehouse_cities, default_lead)
+
+                universe = sorted(
+                    set(stock["SKU"]) | set(po_lines.loc[po_lines["Warehouse"], "SKU"]) | set(history["SKU"])
+                )
+                confirmed = dict(st.session_state["purchasing_confirmed"])
+                result = fos_schedule(universe, history, history_periods, stock, po_lines, lead_times, confirmed, asof, moh_required, horizon_months)
+                summary = result["summary"]
+
+                # --- enrich with catalogue attributes and costs
+                summary = summary.merge(attributes, on="SKU", how="left").merge(option_fields, on="SKU", how="left", suffixes=("", "_opt"))
+                inventory_sku = inventory_by_sku(inventory_raw, mapping, site_mapping)
+                inventory_cost = inventory_sku.set_index("SKU")["Inventory unit cost"] if "Inventory unit cost" in inventory_sku.columns else pd.Series(dtype=float)
+                inventory_description = inventory_sku.set_index("SKU")["Inventory description"] if "Inventory description" in inventory_sku.columns else pd.Series(dtype=object)
+                summary["Avg option cost"] = summary["SKU"].map(inventory_cost)
+                summary["Avg option cost"] = summary["Avg option cost"].where(summary["Avg option cost"].gt(0), summary["Option unit cost"])
+                summary["Description"] = summary["Description"].where(summary["Description"].notna() & summary["Description"].astype(str).str.strip().ne(""), summary["SKU"].map(inventory_description))
+                missing_description = summary["Description"].isna() | summary["Description"].astype(str).str.strip().eq("")
+                if missing_description.any() and "Description" in sales_data.columns:
+                    summary["Description"] = summary["Description"].where(~missing_description, summary["SKU"].map(sku_descriptions(sales_data)))
+                summary["Description"] = summary["Description"].fillna("").astype(str).str.replace(r"_x000D_|\r", "", regex=True).str.split("\n").str[0].str.strip()
+                summary["SKU type"] = summary["SKU"].map(classify_sku)
+                group_class = lookup_frame(purchasing_files.get("Product Groups"), ["product group code", "group code", "code", "class"], ["product group description", "description", "group class", "name"])
+                summary["Group class"] = summary["Class"].map(lambda c: group_class.get(sku_text(c), "") if pd.notna(c) else "") if not group_class.empty else ""
+                web_category = lookup_frame(purchasing_files.get("WEB Category"), ["options id", "stock code", "sku"], ["category"])
+                web_subcategory = lookup_frame(purchasing_files.get("WEB Category"), ["options id", "stock code", "sku"], ["sub category", "subcategory"])
+                summary["Category"] = summary["SKU"].map(web_category).fillna("") if not web_category.empty else ""
+                summary["Sub category"] = summary["SKU"].map(web_subcategory).fillna("") if not web_subcategory.empty else ""
+                summary["Discontinued"] = summary["Discontinued"].fillna(False).astype(bool)
+
+                cost = pd.to_numeric(summary["Avg option cost"], errors="coerce")
+                summary["Free SOH value"] = summary["Free SOH"] * cost.fillna(0.0)
+                summary["Planned order value"] = summary["Planned order qty"] * cost.fillna(0.0)
+                summary["Confirmed order value"] = summary["Confirmed order qty"] * cost.fillna(0.0)
+                purchase_cost = pd.to_numeric(summary["Purchase cost"], errors="coerce")
+                summary["Total purchase AUD"] = summary["Confirmed order qty"] * purchase_cost.where(purchase_cost.gt(0), cost).fillna(0.0)
+                rrp = pd.to_numeric(summary["RRP"], errors="coerce")
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    summary["ROI"] = np.where(cost.gt(0) & rrp.notna(), (rrp - cost) / cost, np.nan)
+                summary["Lead time source"] = np.where(summary["Lead time (days)"].gt(0), "options data", f"default {default_lead:.0f} d")
+
+                # --- filters
+                view = summary
+                if not include_discontinued:
+                    view = view.loc[~view["Discontinued"]]
+                for label, chosen in scope_filters.items():
+                    if chosen and label in view.columns:
+                        view = view.loc[view[label].astype(str).isin(chosen)]
+                if purchasing_search:
+                    if purchasing_search.endswith("*"):
+                        pattern, is_regex = f"^{re.escape(purchasing_search[:-1])}", True
+                    else:
+                        pattern, is_regex = purchasing_search, False
+                    text_match = (
+                        view["SKU"].str.contains(pattern, case=False, regex=is_regex, na=False)
+                        | view["Description"].str.contains(pattern, case=False, regex=is_regex, na=False)
+                    )
+                    view = view.loc[text_match]
+                if only_orders:
+                    view = view.loc[view["Planned order qty"].gt(0)]
+                view = view.sort_values(["Planned order value", "Planned order qty", "SKU"], ascending=[False, False, True]).reset_index(drop=True)
+
+                periods = result["periods"]
+                period_labels = {p: pd.Period(p).strftime("%b %y") for p in periods}
+                scope_index = pd.Index(view["SKU"])
+
+                # --- headline
+                window_text = f"{pd.Period(history_periods[0]).strftime('%b %Y')} – {pd.Period(history_periods[-1]).strftime('%b %Y')}"
+                st.subheader("Forward order schedule")
+                st.caption(
+                    f"As at **{asof.strftime('%d %b %Y')}** · sales averaged over {history_months} complete months ({window_text}) · "
+                    f"MOH required {moh_required:g} · projecting {horizon_months} months from {pd.Period(periods[0]).strftime('%b %Y')} to {pd.Period(periods[-1]).strftime('%b %Y')} · "
+                    f"{len(view):,} of {len(summary):,} SKUs in scope"
+                )
+                stockouts = int(view["Stock-out month"].ne("").sum())
+                metric_card(
+                    "Schedule at a glance",
+                    [
+                        dict(label="SKUs needing an order", value=f"{int(view['Planned order qty'].gt(0).sum()):,}", help="Planned order qty above zero at the SKU's arrival month."),
+                        dict(label="Planned order value", value=f"${view['Planned order value'].sum():,.0f}", help="Planned qty × average option cost."),
+                        dict(label="Confirmed order value", value=f"${view['Confirmed order value'].sum():,.0f}", help="Confirmed qty × average option cost. Total purchase AUD uses the purchase price."),
+                        dict(label="Free SOH value", value=f"${view['Free SOH value'].sum():,.0f}", help="Warehouse free stock (on hand − allocated − damaged/floor/loan) × average option cost."),
+                        dict(label="Open PO units (free / linked)", value=f"{view['Open PO free'].sum():,.0f} / {view['Open PO linked'].sum():,.0f}", help="Open purchase orders to warehouses. Linked = tied to a sales order."),
+                        dict(label="Stock-outs in horizon", value=f"{stockouts:,}", help="SKUs whose projected national free stock goes negative before confirmed orders."),
+                    ],
+                )
+
+                # --- schedule table (confirmed order qty is editable)
+                st.markdown("<p class='card-title'>Schedule</p>", unsafe_allow_html=True)
+                st.caption(
+                    "Type a **Confirmed order qty** to see it land in the projection (arrival = as-at date + lead time) and reduce the planned quantity. "
+                    "Planned order qty = MOH × average monthly sales − projected free stock in the arrival month, rounded up; blank when stock already covers it."
+                )
+                decision_columns = [
+                    "SKU", "Description", "Supplier", "Lead time (days)", "Avg monthly sales", "Free SOH", "Months of cover now",
+                    "Open PO free", "Open PO linked", "Arrival date", "Free SOH at arrival", "Planned order qty", "Confirmed order qty",
+                    "Avg option cost", "Planned order value", "Confirmed order value", "Total purchase AUD", "RRP", "ROI", "Stock-out month",
+                ]
+                detail_columns = [
+                    "Retail avg", "Commercial avg", *[f"Sales {pd.Period(p).strftime('%b %y')}" for p in history_periods],
+                    "Total SOH", "Allocated SOH", "Damaged/floor/loan", *[f"Free {c}" for c in FOS_CITIES if f"Free {c}" in view.columns],
+                    "Supplier qty", "Supplier qty updated", "Class", "Group class", "Product group", "Category", "Sub category", "SKU type", "Lead time source",
+                ]
+                show_all_columns = st.toggle(
+                    "Show all columns (sales by month, stock by city, catalogue attributes)", value=False, key="purchasing_show_all_columns",
+                )
+                display_columns = decision_columns + (detail_columns if show_all_columns else [])
+                display_columns = [c for c in display_columns if c in view.columns]
+                editor_frame = view[display_columns].copy()
+                editor_frame["Stock-out month"] = editor_frame["Stock-out month"].map(lambda p: pd.Period(p).strftime("%b %Y") if p else "")
+                st.session_state["purchasing_editor_frame"] = editor_frame[["SKU", "Confirmed order qty"]].copy()
+                editor_key = f"purchasing_editor_{st.session_state['purchasing_editor_version']}"
+
+                def apply_confirmed_changes() -> None:
+                    changes = st.session_state.get(editor_key, {}).get("edited_rows", {})
+                    base = st.session_state["purchasing_editor_frame"]
+                    confirmed_now = dict(st.session_state["purchasing_confirmed"])
+                    for row, edits in changes.items():
+                        if "Confirmed order qty" in edits:
+                            sku = base.iloc[int(row)]["SKU"]
+                            value = edits["Confirmed order qty"]
+                            if value is None or pd.isna(value) or float(value) <= 0:
+                                confirmed_now.pop(sku, None)
+                            else:
+                                confirmed_now[sku] = float(value)
+                    st.session_state["purchasing_confirmed"] = confirmed_now
+                    st.session_state["purchasing_editor_version"] += 1
+
+                money = st.column_config.NumberColumn(format="$%,.0f")
+                units = st.column_config.NumberColumn(format="%,.0f")
+                decimal1 = st.column_config.NumberColumn(format="%.1f")
+                column_config = {
+                    "SKU": pinned_text_column(),
+                    "Lead time (days)": units, "Avg monthly sales": decimal1, "Retail avg": decimal1, "Commercial avg": decimal1,
+                    "Total SOH": units, "Allocated SOH": units, "Damaged/floor/loan": units, "Free SOH": units,
+                    "Months of cover now": decimal1, "Open PO free": units, "Open PO linked": units,
+                    "Arrival date": st.column_config.DateColumn(format="DD MMM YYYY"), "Free SOH at arrival": decimal1,
+                    "Planned order qty": st.column_config.NumberColumn(format="%,.0f", help="Rounded up; blank/0 = no order needed."),
+                    "Confirmed order qty": st.column_config.NumberColumn(format="%,.0f", min_value=0, step=1, help="Editable — the buyer's confirmed quantity."),
+                    "Avg option cost": money, "Planned order value": money, "Confirmed order value": money, "Total purchase AUD": money, "RRP": money,
+                    "ROI": st.column_config.NumberColumn(format="%.0f%%", help="(RRP − average option cost) ÷ cost"),
+                    "Supplier qty": units, "Supplier qty updated": st.column_config.DateColumn(format="DD MMM YYYY"),
+                }
+                for p in history_periods:
+                    column_config[f"Sales {pd.Period(p).strftime('%b %y')}"] = decimal1
+                for c in FOS_CITIES:
+                    column_config[f"Free {c}"] = units
+                editor_frame["ROI"] = editor_frame["ROI"] * 100 if "ROI" in editor_frame.columns else np.nan
+                st.data_editor(
+                    editor_frame,
+                    key=editor_key,
+                    on_change=apply_confirmed_changes,
+                    hide_index=True,
+                    disabled=[c for c in editor_frame.columns if c != "Confirmed order qty"],
+                    column_config=column_config,
+                    height=table_height(len(editor_frame), cap=560),
+                    **FULL_WIDTH,
+                )
+                download_a, download_b, download_c, _ = st.columns([1, 1, 1, 3], gap="small")
+                download_a.download_button(
+                    "Download schedule (CSV)", editor_frame.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"forward_order_schedule_{asof.strftime('%Y%m%d')}.csv", mime="text/csv", key="purchasing_download_schedule", **FULL_WIDTH,
+                )
+                confirmed_frame = pd.DataFrame(
+                    [{"Stock Code": sku, "Confirmed qty": qty} for sku, qty in sorted(st.session_state["purchasing_confirmed"].items()) if qty > 0]
+                )
+                download_b.download_button(
+                    "Download confirmed orders (CSV)", confirmed_frame.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="confirmed_orders.csv", mime="text/csv", key="purchasing_download_confirmed", **FULL_WIDTH,
+                    help="Save under Raw_data/purchasing (or into the Confirmed Orders sheet of purchasing_parameters.xlsx) to reload next time.",
+                )
+                if download_c.button("Clear confirmed quantities", key="purchasing_clear_confirmed", **FULL_WIDTH):
+                    st.session_state["purchasing_confirmed"] = {}
+                    st.session_state["purchasing_editor_version"] += 1
+                    st.rerun()
+
+                # --- monthly projection
+                with st.expander("📅 Monthly projection — national free stock", expanded=True):
+                    projection_measure = st.radio(
+                        "Show", ["Free SOH (units)", "Months of cover", "Free arrivals (units)"], horizontal=True,
+                        key="purchasing_projection_measure", label_visibility="collapsed",
+                    )
+                    source = {"Free SOH (units)": result["national"], "Months of cover": result["cover"], "Free arrivals (units)": result["free_arrivals"]}[projection_measure]
+                    projection = source.reindex(scope_index).copy()
+                    projection.columns = [period_labels[p] for p in projection.columns]
+                    projection.insert(0, "Description", view.set_index("SKU")["Description"].reindex(scope_index).to_numpy())
+                    projection.insert(1, "Avg monthly sales", view.set_index("SKU")["Avg monthly sales"].reindex(scope_index).to_numpy())
+                    projection = projection.reset_index()
+                    number_columns = [period_labels[p] for p in periods]
+                    fmt = "{:.1f}" if projection_measure == "Months of cover" else "{:,.0f}"
+
+                    def shade(value):
+                        if pd.isna(value):
+                            return ""
+                        if projection_measure == "Months of cover":
+                            if value < 0: return "background-color: #f8d7da; color: #7a1f1f"
+                            if value < moh_required: return "background-color: #fff3cd"
+                            return ""
+                        if value < 0: return "background-color: #f8d7da; color: #7a1f1f"
+                        return ""
+
+                    STYLE_LIMIT = 300
+                    if len(projection) <= STYLE_LIMIT:
+                        styled = projection.style.format({c: fmt for c in number_columns} | {"Avg monthly sales": "{:.1f}"}, na_rep="").map(shade, subset=number_columns)
+                        st.dataframe(styled, hide_index=True, height=table_height(len(projection), cap=520), **FULL_WIDTH)
+                    else:
+                        number_format = "%.1f" if projection_measure == "Months of cover" else "%,.0f"
+                        st.dataframe(
+                            projection, hide_index=True, height=table_height(len(projection), cap=520),
+                            column_config={c: st.column_config.NumberColumn(format=number_format) for c in number_columns} | {"Avg monthly sales": decimal1},
+                            **FULL_WIDTH,
+                        )
+                        st.caption(f"Cell shading is switched off above {STYLE_LIMIT} SKUs — narrow the scope in the sidebar to see stock-out months highlighted.")
+                    st.caption(
+                        f"Month 1 ({pd.Period(periods[0]).strftime('%b %Y')}) deducts {result['prorata']:.0%} of a month's average sales — the days left from the as-at date. "
+                        "Each later month: opening free stock + free PO arrivals + confirmed new order − average monthly sales. "
+                        "Red = projected stock-out; amber (months of cover) = below the MOH target."
+                    )
+                    st.download_button(
+                        "Download projection (CSV)", projection.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"fos_projection_{asof.strftime('%Y%m%d')}.csv", mime="text/csv", key="purchasing_download_projection",
+                    )
+
+                # --- SKU detail
+                with st.expander("🔎 SKU detail — projection by city, sales history and open POs", expanded=False):
+                    if view.empty:
+                        st.caption("No SKUs in scope.")
+                    else:
+                        sku_options = view["SKU"].tolist()
+                        sku_labels = {row.SKU: f"{row.SKU} · {row.Description}" for row in view.itertuples()}
+                        chosen_sku = st.selectbox("SKU", sku_options, format_func=lambda s: sku_labels.get(s, s), key="purchasing_detail_sku")
+                        row = view.loc[view["SKU"].eq(chosen_sku)].iloc[0]
+                        detail_tiles = [
+                            dict(label="Avg monthly sales", value=f"{row['Avg monthly sales']:.1f}", help=f"{window_text}"),
+                            dict(label="Free SOH now", value=f"{row['Free SOH']:,.0f}", help=f"Total {row['Total SOH']:,.0f} · allocated {row['Allocated SOH']:,.0f} · D/F/L {row['Damaged/floor/loan']:,.0f}"),
+                            dict(label="Lead time", value=f"{row['Lead time (days)']:.0f} d", help=f"Arrives {row['Arrival date'].strftime('%d %b %Y')} ({row['Lead time source']})"),
+                            dict(label="Free SOH at arrival", value=f"{row['Free SOH at arrival']:,.1f}", help=f"Projected national free stock at the end of {pd.Period(row['Arrival month']).strftime('%b %Y')}"),
+                            dict(label="Planned order qty", value=f"{row['Planned order qty']:,.0f}", help=f"MOH {moh_required:g} × {row['Avg monthly sales']:.1f} − {row['Free SOH at arrival']:,.1f}"),
+                            dict(label="Confirmed order qty", value=f"{row['Confirmed order qty']:,.0f}", help=f"Value ${row['Confirmed order value']:,.0f} at average option cost"),
+                        ]
+                        metric_card(sku_labels[chosen_sku], detail_tiles)
+
+                        chart_rows = []
+                        for p in periods:
+                            chart_rows.append({"Month": period_labels[p], "Series": "Free SOH (end of month)", "Value": float(result["national"].loc[chosen_sku, p])})
+                            chart_rows.append({"Month": period_labels[p], "Series": "Free PO arrivals", "Value": float(result["free_arrivals"].loc[chosen_sku, p])})
+                            chart_rows.append({"Month": period_labels[p], "Series": "Linked PO arrivals", "Value": float(result["linked_arrivals"].loc[chosen_sku, p])})
+                            chart_rows.append({"Month": period_labels[p], "Series": "Confirmed new order", "Value": float(result["new_orders"].loc[chosen_sku, p])})
+                        chart_frame = pd.DataFrame(chart_rows)
+                        month_order = [period_labels[p] for p in periods]
+                        target_value = float(moh_required * row["Avg monthly sales"])
+                        soh_layer = (
+                            alt.Chart(chart_frame.loc[chart_frame["Series"].eq("Free SOH (end of month)")])
+                            .mark_bar(size=22)
+                            .encode(
+                                x=alt.X("Month:N", sort=month_order, axis=quiet_axis(labelAngle=0, title=None)),
+                                y=alt.Y("Value:Q", title="Units", axis=value_axis(",.0f")),
+                                color=alt.condition(alt.datum.Value < 0, alt.value("#9F1D1D"), alt.value("#1C5CAB")),
+                                tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Value:Q", title="Free SOH", format=",.1f")],
+                            )
+                        )
+                        arrivals_layer = (
+                            alt.Chart(chart_frame.loc[chart_frame["Series"].isin(["Free PO arrivals", "Linked PO arrivals", "Confirmed new order"]) & chart_frame["Value"].gt(0)])
+                            .mark_point(filled=True, size=90)
+                            .encode(
+                                x=alt.X("Month:N", sort=month_order),
+                                y=alt.Y("Value:Q"),
+                                shape=alt.Shape("Series:N", scale=alt.Scale(domain=["Free PO arrivals", "Linked PO arrivals", "Confirmed new order"], range=["circle", "diamond", "triangle-up"]), legend=alt.Legend(title=None, orient="top")),
+                                color=alt.Color("Series:N", scale=alt.Scale(domain=["Free PO arrivals", "Linked PO arrivals", "Confirmed new order"], range=["#199E70", "#898781", "#D95926"]), legend=None),
+                                tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Series:N"), alt.Tooltip("Value:Q", format=",.0f")],
+                            )
+                        )
+                        target_layer = alt.Chart(pd.DataFrame({"y": [target_value]})).mark_rule(strokeDash=[6, 4], color="#0B0B0B").encode(y="y:Q")
+                        target_text = alt.Chart(pd.DataFrame({"y": [target_value], "label": [f"MOH target {target_value:,.0f}"]})).mark_text(align="left", dx=4, dy=-6, color="#0B0B0B").encode(y="y:Q", text="label:N", x=alt.value(0))
+                        zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#C3C2B7").encode(y="y:Q")
+                        st.altair_chart(
+                            alt.layer(zero_rule, soh_layer, arrivals_layer, target_layer, target_text).properties(height=260).configure_view(strokeWidth=0),
+                            **FULL_WIDTH,
+                        )
+                        st.caption("Bars: projected national free stock at month end (red = stock-out). Markers: PO arrivals (● free, ◆ linked to a sales order) and the confirmed new order (▲). Dashed line: MOH target.")
+
+                        city_table = pd.DataFrame(
+                            {period_labels[p]: [float(result["cities"][c].loc[chosen_sku, p]) for c in result["cities"]] for p in periods},
+                            index=[f"{c} free SOH" for c in result["cities"]],
+                        )
+                        city_table.insert(0, "Now", [float(view.set_index("SKU").loc[chosen_sku, f"Free {c}"]) if f"Free {c}" in view.columns else np.nan for c in result["cities"]])
+                        city_table.loc["NAT free SOH"] = [float(row["Free SOH"])] + [float(result["national"].loc[chosen_sku, p]) for p in periods]
+                        city_table.loc["Months of cover"] = [float(row["Months of cover now"]) if pd.notna(row["Months of cover now"]) else np.nan] + [float(result["cover"].loc[chosen_sku, p]) for p in periods]
+                        st.markdown("**Closing free stock by city**")
+                        st.dataframe(
+                            city_table.style.format("{:,.1f}", na_rep="").map(lambda v: "background-color: #f8d7da; color: #7a1f1f" if pd.notna(v) and v < 0 else ""),
+                            height=table_height(len(city_table)), **FULL_WIDTH,
+                        )
+                        st.caption("City rows deduct that city's own average sales and add its free PO arrivals; the confirmed new order is only known nationally, so it appears in the NAT row.")
+
+                        st.markdown("**Sales history (units)**")
+                        st.dataframe(
+                            fos_history_table(history, chosen_sku, history_periods).style.format("{:,.1f}"),
+                            height=table_height(len(history_periods) + 1), **FULL_WIDTH,
+                        )
+                        sku_pos = po_lines.loc[po_lines["SKU"].eq(chosen_sku)].copy()
+                        st.markdown("**Open purchase orders**")
+                        if sku_pos.empty:
+                            st.caption("No open purchase orders for this SKU.")
+                        else:
+                            sku_pos["Counted"] = np.where(sku_pos["Warehouse"], "Yes", "No — not a Warehouse site")
+                            sku_pos["ETA basis"] = np.where(sku_pos["Estimated"], "Estimated (order date + lead time)", "From export")
+                            show = sku_pos[["PO", "Supplier", "Site", "City", "Open qty", "Linked", "Sales order", "Order date", "ETA", "ETA basis", "Overdue", "Counted"]]
+                            st.dataframe(
+                                show, hide_index=True, height=table_height(len(show)),
+                                column_config={"Order date": st.column_config.DateColumn(format="DD MMM YYYY"), "ETA": st.column_config.DateColumn(format="DD MMM YYYY"), "Open qty": units},
+                                **FULL_WIDTH,
+                            )
+
+                # --- data checks
+                with st.expander("🧪 Data checks and method", expanded=False):
+                    rules = location_rules(locations_frame)
+                    seen_locations = (
+                        sales_data.dropna(subset=["Date"]).loc[lambda d: d["Date"].dt.to_period("M").astype(str).isin(history_periods), ["Location", "City"]]
+                        .astype(str).drop_duplicates()
+                        if "Location" in sales_data.columns else pd.DataFrame(columns=["Location", "City"])
+                    )
+                    unmapped_locations = sorted({loc for loc, hint in zip(seen_locations["Location"], seen_locations["City"]) if normalise_text(loc) not in rules})
+                    po_sites = po_lines.loc[~po_lines["Warehouse"], "Site"].value_counts() if not po_lines.empty else pd.Series(dtype=int)
+                    no_lead = view.loc[view["Lead time (days)"].le(0) | view["Lead time (days)"].isna(), "SKU"].tolist()
+                    checks = [
+                        f"Sales locations in the window without a rule (allocated by their city name, or by the observed city mix when none): {', '.join(unmapped_locations) if unmapped_locations else 'none'}.",
+                        f"Open PO lines to non-Warehouse sites (not counted as incoming stock): {int(po_sites.sum()) if not po_sites.empty else 0}"
+                        + (f" — {', '.join(f'{s} ({n})' for s, n in po_sites.head(8).items())}" if not po_sites.empty else "") + ".",
+                        f"PO lines with an estimated ETA (blank in the export): {int(po_lines['Estimated'].sum()) if not po_lines.empty else 0}; overdue ETAs counted in the as-at month: {int(po_lines['Overdue'].sum()) if not po_lines.empty else 0}.",
+                        f"SKUs in scope without a lead time in the options data (default {default_lead:.0f} days used): {len(no_lead)}" + (f" — {', '.join(no_lead[:12])}{'…' if len(no_lead) > 12 else ''}" if no_lead else "") + ".",
+                        f"Warehouse cities: {', '.join(f'{k} → {v}' for k, v in sorted(warehouse_cities.items()))}; other Warehouse-category codes are placed by their suffix (…SY → SYD, …ME → MEL, …PE → PER, …BR → BNE, …AD → ADL).",
+                        "Stock counted: sites in the Warehouse category only (as the workbook: W1SY, W5BR, W3ME, W6AD, W4PE). Free = on hand − allocated − damaged/floor/loan (Qty Alloc, Qty D, Qty F, Qty L in the export).",
+                        "Open PO quantity = ordered − received. A PO whose ETA has passed is counted in the as-at month rather than dropped.",
+                    ]
+                    for check in checks:
+                        st.markdown(f"- {check}")
+                    if purchasing_files:
+                        st.caption("Parameter files loaded from Raw_data/purchasing: " + ", ".join(sorted(purchasing_files)) + ".")
+                    else:
+                        st.caption("No parameter workbook under Raw_data/purchasing — built-in defaults from the workbook's Parameters tab are in use (editable on the Backend Mapping tab).")
+        except Exception as e:
+            st.error(f"Error building the purchasing schedule: {e}")
+            st.exception(e)
+
+# =============================================================================
 # Backend Mapping tab
 # =============================================================================
 elif selected_tab == "Backend Mapping":
@@ -3259,6 +4437,7 @@ elif selected_tab == "Backend Mapping":
                         "column_mapping": st.session_state["inventory_column_mapping"],
                         "loan_column_mapping": st.session_state["loan_column_mapping"],
                         "cost_source": st.session_state["cost_source"],
+                        "purchasing": purchasing_payload(),
                     }
                 )
                 st.success(f"Saved to {MAPPING_FILE.name}. Commit it to the repository to keep it across redeploys.")
@@ -3272,6 +4451,7 @@ elif selected_tab == "Backend Mapping":
                     "column_mapping": st.session_state["inventory_column_mapping"],
                     "loan_column_mapping": st.session_state["loan_column_mapping"],
                     "cost_source": st.session_state["cost_source"],
+                    "purchasing": purchasing_payload(),
                 },
                 indent=2,
             ).encode("utf-8"),
@@ -3280,6 +4460,108 @@ elif selected_tab == "Backend Mapping":
             key="backend_download",
             **FULL_WIDTH,
         )
+
+    with st.container(border=True):
+        st.markdown("<p class='card-title'>Purchasing parameters (forward order schedule)</p>", unsafe_allow_html=True)
+        st.caption(
+            "How the **Purchasing** tab reads the sales export and the stock sites. Each sales location is counted as Retail or "
+            "Commercial and in one city — or **Split** across cities by the shares (0–1, adding to 1). Warehouse sites need a city so "
+            "stock and PO arrivals land in the right column. Defaults come from the Parameters tab of Forward_Order_Schedule.xlsm; "
+            "a workbook under Raw_data/purchasing (purchasing_parameters.xlsx) seeds them instead, and edits here apply to this session."
+        )
+        purchasing_state()
+        if "purchasing_params_version" not in st.session_state:
+            st.session_state["purchasing_params_version"] = 0
+        locations_editor_frame = sales_locations_frame(st.session_state["purchasing_locations"])
+        st.session_state["purchasing_locations_frame"] = locations_editor_frame
+        locations_key = f"backend_purchasing_locations_{st.session_state['purchasing_params_version']}"
+
+        def apply_locations_changes() -> None:
+            state = st.session_state.get(locations_key, {})
+            frame = st.session_state["purchasing_locations_frame"].copy()
+            for row, changes in state.get("edited_rows", {}).items():
+                for column, value in changes.items():
+                    frame.loc[int(row), column] = value
+            if state.get("added_rows"):
+                frame = pd.concat([frame, pd.DataFrame(state["added_rows"])], ignore_index=True)
+            if state.get("deleted_rows"):
+                frame = frame.drop(index=[int(row) for row in state["deleted_rows"]])
+            frame = sales_locations_frame(frame.to_dict("records"))
+            frame = frame.loc[frame["Location"].ne("") | frame["Code"].ne("")]
+            st.session_state["purchasing_locations"] = frame.to_dict("records")
+            st.session_state["purchasing_params_version"] += 1
+
+        st.markdown("**Sales locations**")
+        st.data_editor(
+            locations_editor_frame,
+            key=locations_key,
+            on_change=apply_locations_changes,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "Code": st.column_config.TextColumn(max_chars=12, help="Location code (optional; matched as well as the name)."),
+                "Location": st.column_config.TextColumn(required=True, help="Exactly as it appears after LOCATION: in the sales export."),
+                "Channel": st.column_config.SelectboxColumn(options=FOS_CHANNELS, required=True),
+                "City": st.column_config.SelectboxColumn(options=FOS_CITIES + ["Split"], required=True, help="Split uses the share columns."),
+                **{city: st.column_config.NumberColumn(format="%.2f", min_value=0.0, max_value=1.0, step=0.05, help=f"Share of a Split location's sales going to {FOS_CITY_NAMES[city]}.") for city in FOS_CITIES},
+            },
+            height=table_height(len(locations_editor_frame), cap=420),
+            **FULL_WIDTH,
+        )
+        split_rows = locations_editor_frame.loc[locations_editor_frame["City"].str.upper().eq("SPLIT")]
+        bad_splits = [row.Location for row in split_rows.itertuples() if abs(sum(getattr(row, c) for c in FOS_CITIES) - 1.0) > 0.01]
+        if bad_splits:
+            st.warning("Split shares do not add to 1 for: " + ", ".join(bad_splits) + ". They are normalised when used.")
+
+        warehouses_editor_frame = pd.DataFrame(
+            [{"Site": code, "City": city} for code, city in sorted(st.session_state["purchasing_warehouses"].items())],
+            columns=["Site", "City"],
+        )
+        st.session_state["purchasing_warehouses_frame"] = warehouses_editor_frame
+        warehouses_key = f"backend_purchasing_warehouses_{st.session_state['purchasing_params_version']}"
+
+        def apply_warehouse_changes() -> None:
+            state = st.session_state.get(warehouses_key, {})
+            frame = st.session_state["purchasing_warehouses_frame"].copy()
+            for row, changes in state.get("edited_rows", {}).items():
+                for column, value in changes.items():
+                    frame.loc[int(row), column] = value
+            if state.get("added_rows"):
+                frame = pd.concat([frame, pd.DataFrame(state["added_rows"])], ignore_index=True)
+            if state.get("deleted_rows"):
+                frame = frame.drop(index=[int(row) for row in state["deleted_rows"]])
+            mapping_out = {}
+            for site, city in zip(frame.get("Site", []), frame.get("City", [])):
+                code = normalise_site_code(site)
+                if code and str(city).upper() in FOS_CITIES:
+                    mapping_out[code] = str(city).upper()
+            st.session_state["purchasing_warehouses"] = mapping_out
+            st.session_state["purchasing_params_version"] += 1
+
+        st.markdown("**Warehouse cities**")
+        st.data_editor(
+            warehouses_editor_frame,
+            key=warehouses_key,
+            on_change=apply_warehouse_changes,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "Site": st.column_config.TextColumn(required=True, max_chars=12, validate=r"^\s*[A-Za-z0-9_-]+\s*$"),
+                "City": st.column_config.SelectboxColumn(options=FOS_CITIES, required=True),
+            },
+            height=table_height(len(warehouses_editor_frame), cap=260),
+            **FULL_WIDTH,
+        )
+        st.caption(
+            "Only sites in the **Warehouse** category above count as stock and as PO destinations in the schedule. "
+            "A Warehouse site without a row here is placed by its code suffix (…SY → SYD, …ME → MEL, …PE → PER, …BR → BNE, …AD → ADL)."
+        )
+        if st.button("Reset purchasing parameters to workbook defaults", key="backend_purchasing_reset"):
+            st.session_state["purchasing_locations"] = [dict(r) for r in DEFAULT_SALES_LOCATIONS]
+            st.session_state["purchasing_warehouses"] = dict(DEFAULT_WAREHOUSE_CITIES)
+            st.session_state["purchasing_settings"] = dict(DEFAULT_PURCHASING_SETTINGS)
+            st.session_state["purchasing_params_version"] += 1
+            st.rerun()
 
     with st.container(border=True):
         st.markdown("<p class='card-title'>SKU type rules</p>", unsafe_allow_html=True)
@@ -3469,6 +4751,8 @@ elif selected_tab == "Document Status":
                 category = "Loan Folder"
             elif "targets" in path.parts:
                 category = "Targets Folder"
+            elif "purchasing" in path.parts:
+                category = "Purchasing Folder"
             elif "Sales Data" in path.parts:
                 category = "Sales Folder"
             elif path.name == "options_data.csv":
